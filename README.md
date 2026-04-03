@@ -14,7 +14,7 @@ git clone <repo-url> ~/dotfiles
 
 # 4. Create symlinks
 cd ~/dotfiles
-stow zsh git vim
+stow zsh git vim vscode
 ```
 
 ## Adding new dotfiles
