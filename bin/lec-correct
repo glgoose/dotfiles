@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# lec-correct — post-process whisper transcriptions using the Anthropic API
+# Usage: lec-correct [--context "string"]
+# Run from inside the lecture folder containing .txt/.srt file pairs.
+#
+# For each pair, sends the SRT text (one line per block) to the API, gets back
+# a corrected version with the same line structure, then rewrites both files.
+# One API call per pair. No separate call for .srt reconstruction.
+set -euo pipefail
+
+# ── Defaults ───────────────────────────────────────────────────────────────────
+CONTEXT_STR=""
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --context)
+      [[ $# -lt 2 ]] && { echo "Error: --context requires a string argument"; exit 1; }
+      CONTEXT_STR="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: lec-correct [--context \"string\"]"
+      exit 1
+      ;;
+  esac
+done
+
+# ── Dependency checks ──────────────────────────────────────────────────────────
+if ! command -v curl &>/dev/null; then
+  echo "Error: curl not found."
+  exit 1
+fi
+if ! command -v jq &>/dev/null; then
+  echo "Error: jq not found. Install with: brew install jq"
+  exit 1
+fi
+
+# ── API key check ──────────────────────────────────────────────────────────────
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  echo "Error: ANTHROPIC_API_KEY is not set."
+  echo "Hint: Add to ~/.zshrc: export ANTHROPIC_API_KEY=\$(security find-generic-password -a \"\$USER\" -s \"anthropic-api-key\" -w)"
+  exit 1
+fi
+
+# ── Determine context ──────────────────────────────────────────────────────────
+# Priority: --context flag > context.txt in current dir > generic fallback
+if [[ -z "$CONTEXT_STR" && -f "context.txt" ]]; then
+  CONTEXT_STR="$(cat context.txt)"
+fi
+[[ -z "$CONTEXT_STR" ]] && CONTEXT_STR="general lecture transcription"
+
+SYSTEM_PROMPT="You are correcting an automatic speech recognition transcript. Fix transcription errors: misheard words, wrong proper nouns, garbled technical terms. Do not paraphrase or summarize — preserve the speaker's words exactly except where clearly wrong. Return only the corrected text with the same number of lines as the input — one corrected line per input line. No commentary. Domain context: ${CONTEXT_STR}"
+
+# ── Collect .txt/.srt file pairs ───────────────────────────────────────────────
+PAIRS=()
+while IFS= read -r txt; do
+  base="${txt%.txt}"
+  [[ -f "${base}.srt" ]] && PAIRS+=("$base")
+done < <(find . -maxdepth 1 -name "*.txt" -not -name "context.txt" | sed 's|^\./||' | sort)
+
+if [[ ${#PAIRS[@]} -eq 0 ]]; then
+  echo "Error: no .txt/.srt file pairs found in the current directory."
+  exit 1
+fi
+
+SCRIPT_START=$(date +%s)
+
+# ── Helper: extract one text line per SRT block ────────────────────────────────
+# Multi-line blocks are joined with a space into a single line.
+extract_srt_text_lines() {
+  awk '
+    /^[0-9]+$/ { in_block=1; text=""; next }
+    /-->/       { next }
+    in_block && /^[[:space:]]*$/ {
+      if (text != "") print text
+      in_block=0; text=""
+      next
+    }
+    in_block { text=(text == "") ? $0 : text " " $0 }
+    END      { if (text != "") print text }
+  ' "$1"
+}
+
+# ── Helper: call Anthropic API ─────────────────────────────────────────────────
+# Accepts multi-line text on stdin (one segment per line), prints corrected text.
+call_api() {
+  local content="$1"
+  local payload response
+
+  payload=$(jq -n \
+    --arg model  "claude-sonnet-4-5" \
+    --arg system "$SYSTEM_PROMPT" \
+    --arg text   "$content" \
+    '{model: $model, max_tokens: 8192, system: $system,
+      messages: [{role: "user", content: $text}]}')
+
+  response=$(curl -sf https://api.anthropic.com/v1/messages \
+    -H "x-api-key: $ANTHROPIC_API_KEY"      \
+    -H "anthropic-version: 2023-06-01"      \
+    -H "content-type: application/json"     \
+    -d "$payload")
+
+  if echo "$response" | jq -e '.error' &>/dev/null; then
+    echo "API error: $(echo "$response" | jq -r '.error.message')" >&2
+    exit 1
+  fi
+
+  echo "$response" | jq -r '.content[0].text'
+}
+
+# ── Helper: rebuild SRT substituting corrected text lines ─────────────────────
+# $1 = original .srt path   $2 = file with corrected lines (one per block)
+# Multi-line original blocks are collapsed to one corrected line.
+rebuild_srt() {
+  local srt_file="$1" corr_file="$2"
+  awk -v corr_file="$corr_file" '
+    BEGIN {
+      i=0
+      while ((getline ln < corr_file) > 0) corrected[i++] = ln
+      block_idx=-1; in_text=0
+    }
+    /^[0-9]+$/ { block_idx++; in_text=0; print; next }
+    /-->/       { in_text=0;              print; next }
+    /^[[:space:]]*$/ { in_text=0; print ""; next }
+    {
+      # Print corrected text on the first text line; skip any further lines in
+      # the same block (collapses multi-line blocks to one line).
+      if (!in_text) {
+        in_text=1
+        print (block_idx in corrected) ? corrected[block_idx] : $0
+      }
+    }
+  ' "$srt_file"
+}
+
+# ── Process each pair ──────────────────────────────────────────────────────────
+PAIRS_PROCESSED=0
+
+for BASE in "${PAIRS[@]}"; do
+  TXT="${BASE}.txt"
+  SRT="${BASE}.srt"
+
+  echo "  Correcting ${BASE}..."
+  PAIR_START=$(date +%s)
+
+  # Build the line-per-block input from the SRT (source of truth for structure)
+  SRT_LINES=$(mktemp)
+  extract_srt_text_lines "$SRT" > "$SRT_LINES"
+  TOTAL_BLOCKS=$(wc -l < "$SRT_LINES" | tr -d ' ')
+
+  WORD_COUNT=$(wc -w < "$TXT" | tr -d ' ')
+  CHUNK_LIMIT=15000
+
+  CORRECTED=$(mktemp)
+
+  if [[ $WORD_COUNT -le $CHUNK_LIMIT ]]; then
+    # ── Single API call ────────────────────────────────────────────────────────
+    call_api "$(cat "$SRT_LINES")" > "$CORRECTED"
+  else
+    # ── Chunked: split by block count, 2-block overlap between chunks ──────────
+    WORDS_PER_BLOCK=$(( (WORD_COUNT / TOTAL_BLOCKS) + 1 ))
+    BLOCKS_PER_CHUNK=$(( CHUNK_LIMIT / WORDS_PER_BLOCK ))
+    [[ $BLOCKS_PER_CHUNK -lt 10 ]] && BLOCKS_PER_CHUNK=10
+    OVERLAP=2
+
+    START=0
+    FIRST=true
+    while [[ $START -lt $TOTAL_BLOCKS ]]; do
+      END=$(( START + BLOCKS_PER_CHUNK ))
+      [[ $END -gt $TOTAL_BLOCKS ]] && END=$TOTAL_BLOCKS
+
+      CHUNK=$(sed -n "$((START + 1)),${END}p" "$SRT_LINES")
+      CORRECTED_CHUNK=$(call_api "$CHUNK")
+
+      if [[ "$FIRST" == true ]]; then
+        echo "$CORRECTED_CHUNK" >> "$CORRECTED"
+        FIRST=false
+      else
+        # Drop the overlapping lines already written from the previous chunk
+        echo "$CORRECTED_CHUNK" | tail -n +$(( OVERLAP + 1 )) >> "$CORRECTED"
+      fi
+
+      [[ $END -eq $TOTAL_BLOCKS ]] && break
+      START=$(( END - OVERLAP ))
+    done
+  fi
+
+  # Rewrite .srt with corrected text, timestamps untouched
+  rebuild_srt "$SRT" "$CORRECTED" > "${SRT}.tmp" && mv "${SRT}.tmp" "$SRT"
+
+  # Rewrite .txt as corrected lines joined into continuous text
+  tr '\n' ' ' < "$CORRECTED" | sed 's/  */ /g; s/^ //; s/ $//' > "$TXT"
+
+  rm "$SRT_LINES" "$CORRECTED"
+
+  PAIR_END=$(date +%s)
+  echo "  Done in $((PAIR_END - PAIR_START))s"
+  PAIRS_PROCESSED=$(( PAIRS_PROCESSED + 1 ))
+done
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+SCRIPT_END=$(date +%s)
+TOTAL=$(( SCRIPT_END - SCRIPT_START ))
+
+echo ""
+echo "── Summary ─────────────────────────────────────────────────────────────────"
+printf "  %-18s %s\n" "Pairs corrected:" "$PAIRS_PROCESSED"
+printf "  %-18s %s\n" "Total time:"      "${TOTAL}s"

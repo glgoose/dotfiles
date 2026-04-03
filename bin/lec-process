@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# lec-process — transcribe lecture WAV files, optionally renaming them first
-# Usage: lec-process [--rename|-r] [--lang LANGCODE]
+# lec-process — transcribe lecture WAV files, optionally renaming and correcting
+# Usage: lec-process [--rename|-r] [--lang|-l LANGCODE] [--correct|-c] [--context "string"]
 # Run from inside the lecture folder (e.g. "260402 feminism")
 set -euo pipefail
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ── Defaults ───────────────────────────────────────────────────────────────────
 RENAME=false
 LANG_CODE="en"
+CORRECT=false
+CONTEXT_STR=""
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -20,9 +24,18 @@ while [[ $# -gt 0 ]]; do
       LANG_CODE="$2"
       shift 2
       ;;
+    --correct|-c)
+      CORRECT=true
+      shift
+      ;;
+    --context)
+      [[ $# -lt 2 ]] && { echo "Error: --context requires a string argument"; exit 1; }
+      CONTEXT_STR="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: lec-process [--rename|-r] [--lang|-l LANGCODE]"
+      echo "Usage: lec-process [--rename|-r] [--lang|-l LANGCODE] [--correct|-c] [--context \"string\"]"
       exit 1
       ;;
   esac
@@ -117,15 +130,26 @@ for FILE in "${WAV_FILES[@]}"; do
   FILES_PROCESSED=$((FILES_PROCESSED + 1))
 done
 
+# ── Step 3: Correct (optional) ────────────────────────────────────────────────
+if [[ "$CORRECT" == true ]]; then
+  echo ""
+  echo "── Step 3: Correct ─────────────────────────────────────────────────────────"
+  CORRECT_ARGS=()
+  [[ -n "$CONTEXT_STR" ]] && CORRECT_ARGS+=(--context "$CONTEXT_STR")
+  "$SCRIPT_DIR/lec-correct" "${CORRECT_ARGS[@]}"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 SCRIPT_END=$(date +%s)
 TOTAL=$((SCRIPT_END - SCRIPT_START))
 
+STEPS="transcribe"
+[[ "$RENAME"   == true ]] && STEPS="rename, $STEPS"
+[[ "$CORRECT"  == true ]] && STEPS="$STEPS, correct"
+
 echo ""
 echo "── Summary ─────────────────────────────────────────────────────────────────"
 printf "  %-18s %s\n" "Files processed:" "$FILES_PROCESSED"
-STEPS="transcribe"
-[[ "$RENAME" == true ]] && STEPS="rename, transcribe"
 printf "  %-18s %s\n" "Steps run:"       "$STEPS"
 printf "  %-18s %s\n" "Language:"        "$LANG_CODE  (model: $MODEL)"
 printf "  %-18s %s\n" "Total time:"      "${TOTAL}s"
