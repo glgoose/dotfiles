@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
 # lec-archive — normalize and encode lecture WAV files to Opus or FLAC
-# Usage: lec-archive [--flac] [--keep] [--skip-normalize]
+# Usage: lec-archive [--flac] [--skip-normalize]
 # Run from inside the lecture folder (e.g. "260402 feminism")
+# WAV files are never deleted — remove them manually once lec-process is done.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 USE_FLAC=false
-KEEP_WAV=false
 SKIP_NORMALIZE=false
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --flac)           USE_FLAC=true;       shift ;;
-    --keep)           KEEP_WAV=true;       shift ;;
     --skip-normalize) SKIP_NORMALIZE=true; shift ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: lec-archive [--flac] [--keep] [--skip-normalize]"
+      echo "Usage: lec-archive [--flac] [--skip-normalize]"
       exit 1
       ;;
   esac
@@ -96,12 +95,6 @@ for FILE in "${WAV_FILES[@]}"; do
   TOTAL_SAVED=$((TOTAL_SAVED + SAVED))
 
   echo "    $(human_size "$SIZE_BEFORE") → $(human_size "$SIZE_AFTER")  (saved $(human_size "$SAVED"))"
-
-  # Remove source WAV unless --keep was passed
-  if [[ "$KEEP_WAV" == false ]]; then
-    rm "$FILE"
-    echo "    Removed $FILE"
-  fi
 
   FILES_PROCESSED=$((FILES_PROCESSED + 1))
 done
