@@ -1,5 +1,5 @@
 export PATH=/opt/homebrew/bin:/opt/homebrew/sbin:$PATH
-export PATH="$HOME/.dotfiles/bin:$PATH"
+export PATH="$HOME/dotfiles/bin:$PATH"
 export ZSH=$HOME/.oh-my-zsh
 export PATH=$PATH:/Library/TeX/texbin
 export JAVA_HOME=/opt/homebrew/opt/openjdk

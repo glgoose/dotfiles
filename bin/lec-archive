@@ -4,6 +4,8 @@
 # Run from inside the lecture folder (e.g. "260402 feminism")
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 # ── Defaults ───────────────────────────────────────────────────────────────────
 USE_FLAC=false
 KEEP_WAV=false
@@ -54,45 +56,12 @@ human_size() {
   }'
 }
 
-# Two-pass loudnorm: measure in pass 1, apply linear correction in pass 2.
-normalize_file() {
-  local FILE="$1"
-  echo "  Analyzing $FILE..."
-
-  # Pass 1 — capture loudness measurements from ffmpeg stderr
-  local STATS
-  STATS=$(ffmpeg -i "$FILE" \
-    -af "loudnorm=I=-16:TP=-1:LRA=9:print_format=json" \
-    -f null - 2>&1)
-
-  local input_i input_tp input_lra input_thresh target_offset
-  input_i=$(      echo "$STATS" | awk -F'"' '/"input_i"/      {print $4}')
-  input_tp=$(     echo "$STATS" | awk -F'"' '/"input_tp"/     {print $4}')
-  input_lra=$(    echo "$STATS" | awk -F'"' '/"input_lra"/    {print $4}')
-  input_thresh=$( echo "$STATS" | awk -F'"' '/"input_thresh"/ {print $4}')
-  target_offset=$(echo "$STATS" | awk -F'"' '/"target_offset"/{print $4}')
-
-  echo "  Applying normalization to $FILE..."
-  local TMPFILE="${FILE%.wav}_loudnorm_tmp.wav"
-
-  # Pass 2 — apply measured correction with linear mode
-  ffmpeg -y -i "$FILE" \
-    -af "loudnorm=I=-16:TP=-1:LRA=9:\
-measured_I=${input_i}:measured_TP=${input_tp}:measured_LRA=${input_lra}:\
-measured_thresh=${input_thresh}:offset=${target_offset}:\
-linear=true:print_format=summary" \
-    "$TMPFILE" 2>/dev/null
-
-  mv "$TMPFILE" "$FILE"
-  echo "  Done: $FILE"
-}
-
 # ── Step 1: Normalize ─────────────────────────────────────────────────────────
 if [[ "$SKIP_NORMALIZE" == false ]]; then
   echo ""
   echo "── Step 1: Normalize (-16 LUFS / -1 dBTP / LRA 9) ─────────────────────────"
   for FILE in "${WAV_FILES[@]}"; do
-    normalize_file "$FILE"
+    "$SCRIPT_DIR/lec-normalize" "$FILE"
   done
 fi
 
