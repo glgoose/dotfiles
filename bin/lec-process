@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# lec-process — rename and transcribe lecture WAV files
-# Usage: lec-process [--lang LANGCODE]
+# lec-process — transcribe lecture WAV files, optionally renaming them first
+# Usage: lec-process [--rename|-r] [--lang LANGCODE]
 # Run from inside the lecture folder (e.g. "260402 feminism")
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
+RENAME=false
 LANG_CODE="en"
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --rename|-r)
+      RENAME=true
+      shift
+      ;;
     --lang)
       [[ $# -lt 2 ]] && { echo "Error: --lang requires a language code (e.g. --lang nl)"; exit 1; }
       LANG_CODE="$2"
@@ -17,7 +22,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: lec-process [--lang LANGCODE]"
+      echo "Usage: lec-process [--rename|-r] [--lang LANGCODE]"
       exit 1
       ;;
   esac
@@ -40,32 +45,34 @@ if [[ ${#WAV_FILES[@]} -eq 0 ]]; then
   exit 1
 fi
 
-FOLDER_NAME="$(basename "$PWD")"
 SCRIPT_START=$(date +%s)
 
-# ── Step 1: Rename ────────────────────────────────────────────────────────────
-echo ""
-echo "── Step 1: Rename ──────────────────────────────────────────────────────────"
+# ── Step 1: Rename (optional) ─────────────────────────────────────────────────
+if [[ "$RENAME" == true ]]; then
+  FOLDER_NAME="$(basename "$PWD")"
+  echo ""
+  echo "── Step 1: Rename ──────────────────────────────────────────────────────────"
 
-INDEX=1
-RENAMED=()
-for FILE in "${WAV_FILES[@]}"; do
-  TARGET="${FOLDER_NAME}_${INDEX}.wav"
-  if [[ "$FILE" == "$TARGET" ]]; then
-    echo "  [skip] $FILE"
-  else
-    mv "$FILE" "$TARGET"
-    echo "  $FILE → $TARGET"
-  fi
-  RENAMED+=("$TARGET")
-  INDEX=$((INDEX + 1))
-done
+  INDEX=1
+  RENAMED=()
+  for FILE in "${WAV_FILES[@]}"; do
+    TARGET="${FOLDER_NAME}_${INDEX}.wav"
+    if [[ "$FILE" == "$TARGET" ]]; then
+      echo "  [skip] $FILE"
+    else
+      mv "$FILE" "$TARGET"
+      echo "  $FILE → $TARGET"
+    fi
+    RENAMED+=("$TARGET")
+    INDEX=$((INDEX + 1))
+  done
 
-# Re-sort after rename (names are now deterministic)
-SORTED=()
-while IFS= read -r f; do
-  SORTED+=("$f")
-done < <(printf '%s\n' "${RENAMED[@]}" | sort)
+  # Re-sort after rename (names are now deterministic)
+  WAV_FILES=()
+  while IFS= read -r f; do
+    WAV_FILES+=("$f")
+  done < <(printf '%s\n' "${RENAMED[@]}" | sort)
+fi
 
 # ── Step 2: Transcribe ────────────────────────────────────────────────────────
 echo ""
@@ -90,7 +97,7 @@ if [[ ! -f "$MODEL_PATH" ]]; then
 fi
 
 FILES_PROCESSED=0
-for FILE in "${SORTED[@]}"; do
+for FILE in "${WAV_FILES[@]}"; do
   NAME="${FILE%.wav}"
   echo "  Transcribing $FILE..."
   FILE_START=$(date +%s)
@@ -117,6 +124,8 @@ TOTAL=$((SCRIPT_END - SCRIPT_START))
 echo ""
 echo "── Summary ─────────────────────────────────────────────────────────────────"
 printf "  %-18s %s\n" "Files processed:" "$FILES_PROCESSED"
-printf "  %-18s %s\n" "Steps run:"       "rename, transcribe"
+STEPS="transcribe"
+[[ "$RENAME" == true ]] && STEPS="rename, transcribe"
+printf "  %-18s %s\n" "Steps run:"       "$STEPS"
 printf "  %-18s %s\n" "Language:"        "$LANG_CODE  (model: $MODEL)"
 printf "  %-18s %s\n" "Total time:"      "${TOTAL}s"
