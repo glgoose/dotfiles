@@ -3,6 +3,7 @@ brew "stow"
 
 # Shell
 brew "fzf"
+brew "jq"
 
 # Git
 brew "git-delta"

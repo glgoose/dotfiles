@@ -20,6 +20,10 @@ if ! command -v ffmpeg &>/dev/null; then
   echo "Error: ffmpeg not found. Install with: brew install ffmpeg"
   exit 1
 fi
+if ! command -v jq &>/dev/null; then
+  echo "Error: jq not found. Install with: brew install jq"
+  exit 1
+fi
 
 echo "  Analyzing $FILE..."
 
@@ -28,11 +32,14 @@ STATS=$(ffmpeg -i "$FILE" \
   -af "loudnorm=I=-16:TP=-1:LRA=9:print_format=json" \
   -f null - 2>&1)
 
-input_i=$(      echo "$STATS" | awk -F'"' '/"input_i"/      {print $4}')
-input_tp=$(     echo "$STATS" | awk -F'"' '/"input_tp"/     {print $4}')
-input_lra=$(    echo "$STATS" | awk -F'"' '/"input_lra"/    {print $4}')
-input_thresh=$( echo "$STATS" | awk -F'"' '/"input_thresh"/ {print $4}')
-target_offset=$(echo "$STATS" | awk -F'"' '/"target_offset"/{print $4}')
+# Extract the JSON block that ffmpeg prints after "Parsed_loudnorm" and parse with jq
+JSON=$(echo "$STATS" | grep -A20 'Parsed_loudnorm' | tail -n +2 | jq -s '.[0]')
+
+input_i=$(     echo "$JSON" | jq -r '.input_i')
+input_tp=$(    echo "$JSON" | jq -r '.input_tp')
+input_lra=$(   echo "$JSON" | jq -r '.input_lra')
+input_thresh=$(echo "$JSON" | jq -r '.input_thresh')
+target_offset=$(echo "$JSON" | jq -r '.target_offset')
 
 echo "  Applying normalization to $FILE..."
 
