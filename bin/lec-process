@@ -91,7 +91,7 @@ fi
 echo ""
 echo "── Step 3: Transcribe ──────────────────────────────────────────────────────"
 
-MODELS_DIR="$(brew --prefix)/share/whisper-cpp/models"
+MODELS_DIR="$(brew --prefix)/share/whisper-cpp"
 
 # English-only model is smaller and more accurate for English
 if [[ "$LANG_CODE" == "en" ]]; then
@@ -104,7 +104,8 @@ MODEL_PATH="${MODELS_DIR}/${MODEL}"
 
 if [[ ! -f "$MODEL_PATH" ]]; then
   echo "Error: model not found at $MODEL_PATH"
-  echo "Download with: whisper-cpp-download-ggml-model medium${LANG_CODE:+"."}${LANG_CODE/#en/}"
+  echo "Download with:"
+  echo "  curl -L -o \"$MODEL_PATH\" \"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$MODEL\""
   exit 1
 fi
 
