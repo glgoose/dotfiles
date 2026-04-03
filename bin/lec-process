@@ -15,14 +15,14 @@ while [[ $# -gt 0 ]]; do
       RENAME=true
       shift
       ;;
-    --lang)
+    --lang|-l)
       [[ $# -lt 2 ]] && { echo "Error: --lang requires a language code (e.g. --lang nl)"; exit 1; }
       LANG_CODE="$2"
       shift 2
       ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: lec-process [--rename|-r] [--lang LANGCODE]"
+      echo "Usage: lec-process [--rename|-r] [--lang|-l LANGCODE]"
       exit 1
       ;;
   esac
