@@ -1,0 +1,33 @@
+[user]
+	name = Glenn Goossens
+	email = glgoose@pm.me
+	signingkey = 9A2743456A90FFC8B3EB32064444BD34EFE79F4E
+
+[core]
+    pager = delta
+    
+[pager]
+    diff = delta
+    log = delta
+    reflog = delta
+    show = delta
+	branch = false
+
+[delta]
+	syntax-theme = Coldark-Dark
+    navigate = true  # use n and N to move between diff sections
+
+[interactive]
+    diffFilter = delta --color-only
+
+[merge]
+    conflictstyle = diff3
+
+[alias]
+	conflicts = diff --name-only --diff-filter=U
+	logline = log --abbrev-commit --pretty=format:'%Cred%h %Creset%C(yellow)%d%Creset %s  %C(dim cyan)<%an>%C(dim magenta) (%cr)'
+
+[pull]
+	rebase = false
+[credential "https://dev.azure.com"]
+	useHttpPath = true
