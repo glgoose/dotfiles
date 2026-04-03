@@ -1,22 +1,15 @@
 #!/usr/bin/env bash
-# lec-process — rename, optionally normalize, and transcribe lecture WAV files
-# Usage: lec-process [--normalize|-n] [--lang LANGCODE]
+# lec-process — rename and transcribe lecture WAV files
+# Usage: lec-process [--lang LANGCODE]
 # Run from inside the lecture folder (e.g. "260402 feminism")
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-# ── Defaults ───────────────────────────────────────────────────────────────────
-NORMALIZE=false
+# ── Defaults ──────────────────────────────────────────────────────────────────
 LANG_CODE="en"
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --normalize|-n)
-      NORMALIZE=true
-      shift
-      ;;
     --lang)
       [[ $# -lt 2 ]] && { echo "Error: --lang requires a language code (e.g. --lang nl)"; exit 1; }
       LANG_CODE="$2"
@@ -24,17 +17,13 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: lec-process [--normalize|-n] [--lang LANGCODE]"
+      echo "Usage: lec-process [--lang LANGCODE]"
       exit 1
       ;;
   esac
 done
 
 # ── Dependency checks ──────────────────────────────────────────────────────────
-if ! command -v ffmpeg &>/dev/null; then
-  echo "Error: ffmpeg not found. Install with: brew install ffmpeg"
-  exit 1
-fi
 if ! command -v whisper-cli &>/dev/null; then
   echo "Error: whisper-cli not found. Install with: brew install whisper-cpp"
   exit 1
@@ -78,18 +67,9 @@ while IFS= read -r f; do
   SORTED+=("$f")
 done < <(printf '%s\n' "${RENAMED[@]}" | sort)
 
-# ── Step 2: Normalize (optional) ──────────────────────────────────────────────
-if [[ "$NORMALIZE" == true ]]; then
-  echo ""
-  echo "── Step 2: Normalize (-16 LUFS / -1 dBTP / LRA 9) ─────────────────────────"
-  for FILE in "${SORTED[@]}"; do
-    "$SCRIPT_DIR/lec-normalize" "$FILE"
-  done
-fi
-
-# ── Step 3: Transcribe ────────────────────────────────────────────────────────
+# ── Step 2: Transcribe ────────────────────────────────────────────────────────
 echo ""
-echo "── Step 3: Transcribe ──────────────────────────────────────────────────────"
+echo "── Step 2: Transcribe ──────────────────────────────────────────────────────"
 
 MODELS_DIR="$(brew --prefix)/share/whisper-cpp"
 
@@ -134,12 +114,9 @@ done
 SCRIPT_END=$(date +%s)
 TOTAL=$((SCRIPT_END - SCRIPT_START))
 
-STEPS="rename, transcribe"
-[[ "$NORMALIZE" == true ]] && STEPS="rename, normalize, transcribe"
-
 echo ""
 echo "── Summary ─────────────────────────────────────────────────────────────────"
 printf "  %-18s %s\n" "Files processed:" "$FILES_PROCESSED"
-printf "  %-18s %s\n" "Steps run:"       "$STEPS"
+printf "  %-18s %s\n" "Steps run:"       "rename, transcribe"
 printf "  %-18s %s\n" "Language:"        "$LANG_CODE  (model: $MODEL)"
 printf "  %-18s %s\n" "Total time:"      "${TOTAL}s"
