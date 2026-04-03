@@ -19,4 +19,4 @@ Move the file into the appropriate package dir (mirroring its path from `~`), th
 
 ## Adding packages to Brewfile
 
-Edit `Brewfile` and add a `brew "tool-name"` line. Run `brew bundle` to apply.
+Edit `Brewfile` and add a `brew "tool-name"` line.
