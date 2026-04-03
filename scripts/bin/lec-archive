@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# lec-archive — normalize and encode lecture WAV files to Opus or FLAC
+# Usage: lec-archive [--flac] [--keep] [--skip-normalize]
+# Run from inside the lecture folder (e.g. "260402 feminism")
+set -euo pipefail
+
+# ── Defaults ───────────────────────────────────────────────────────────────────
+USE_FLAC=false
+KEEP_WAV=false
+SKIP_NORMALIZE=false
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --flac)           USE_FLAC=true;       shift ;;
+    --keep)           KEEP_WAV=true;       shift ;;
+    --skip-normalize) SKIP_NORMALIZE=true; shift ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: lec-archive [--flac] [--keep] [--skip-normalize]"
+      exit 1
+      ;;
+  esac
+done
+
+# ── Dependency check ───────────────────────────────────────────────────────────
+if ! command -v ffmpeg &>/dev/null; then
+  echo "Error: ffmpeg not found. Install with: brew install ffmpeg"
+  exit 1
+fi
+
+# ── Collect WAV files, sorted alphabetically ──────────────────────────────────
+WAV_FILES=()
+while IFS= read -r f; do
+  WAV_FILES+=("$f")
+done < <(find . -maxdepth 1 -iname "*.wav" | sed 's|^\./||' | sort)
+
+if [[ ${#WAV_FILES[@]} -eq 0 ]]; then
+  echo "Error: no .wav files found in the current directory."
+  exit 1
+fi
+
+SCRIPT_START=$(date +%s)
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+file_bytes() { wc -c < "$1" | tr -d ' '; }
+
+human_size() {
+  awk -v b="$1" 'BEGIN {
+    if      (b >= 1073741824) printf "%.1f GB", b/1073741824
+    else if (b >= 1048576)    printf "%.1f MB", b/1048576
+    else if (b >= 1024)       printf "%.1f KB", b/1024
+    else                      printf "%d B",    b
+  }'
+}
+
+# Two-pass loudnorm: measure in pass 1, apply linear correction in pass 2.
+normalize_file() {
+  local FILE="$1"
+  echo "  Analyzing $FILE..."
+
+  # Pass 1 — capture loudness measurements from ffmpeg stderr
+  local STATS
+  STATS=$(ffmpeg -i "$FILE" \
+    -af "loudnorm=I=-16:TP=-1:LRA=9:print_format=json" \
+    -f null - 2>&1)
+
+  local input_i input_tp input_lra input_thresh target_offset
+  input_i=$(      echo "$STATS" | awk -F'"' '/"input_i"/      {print $4}')
+  input_tp=$(     echo "$STATS" | awk -F'"' '/"input_tp"/     {print $4}')
+  input_lra=$(    echo "$STATS" | awk -F'"' '/"input_lra"/    {print $4}')
+  input_thresh=$( echo "$STATS" | awk -F'"' '/"input_thresh"/ {print $4}')
+  target_offset=$(echo "$STATS" | awk -F'"' '/"target_offset"/{print $4}')
+
+  echo "  Applying normalization to $FILE..."
+  local TMPFILE="${FILE%.wav}_loudnorm_tmp.wav"
+
+  # Pass 2 — apply measured correction with linear mode
+  ffmpeg -y -i "$FILE" \
+    -af "loudnorm=I=-16:TP=-1:LRA=9:\
+measured_I=${input_i}:measured_TP=${input_tp}:measured_LRA=${input_lra}:\
+measured_thresh=${input_thresh}:offset=${target_offset}:\
+linear=true:print_format=summary" \
+    "$TMPFILE" 2>/dev/null
+
+  mv "$TMPFILE" "$FILE"
+  echo "  Done: $FILE"
+}
+
+# ── Step 1: Normalize ─────────────────────────────────────────────────────────
+if [[ "$SKIP_NORMALIZE" == false ]]; then
+  echo ""
+  echo "── Step 1: Normalize (-16 LUFS / -1 dBTP / LRA 9) ─────────────────────────"
+  for FILE in "${WAV_FILES[@]}"; do
+    normalize_file "$FILE"
+  done
+fi
+
+# ── Step 2: Encode ────────────────────────────────────────────────────────────
+echo ""
+if [[ "$USE_FLAC" == true ]]; then
+  EXT="flac"
+  echo "── Step 2: Encode to FLAC (compression level 8) ────────────────────────────"
+else
+  EXT="opus"
+  echo "── Step 2: Encode to Opus (96 kbps) ────────────────────────────────────────"
+fi
+
+FILES_PROCESSED=0
+TOTAL_SAVED=0
+
+for FILE in "${WAV_FILES[@]}"; do
+  NAME="${FILE%.wav}"
+  OUTPUT="${NAME}.${EXT}"
+
+  SIZE_BEFORE=$(file_bytes "$FILE")
+  echo "  $FILE → $OUTPUT  ($(human_size "$SIZE_BEFORE"))"
+
+  if [[ "$USE_FLAC" == true ]]; then
+    ffmpeg -y -i "$FILE" -compression_level 8 "$OUTPUT" 2>/dev/null
+  else
+    ffmpeg -y -i "$FILE" -c:a libopus -b:a 96k "$OUTPUT" 2>/dev/null
+  fi
+
+  SIZE_AFTER=$(file_bytes "$OUTPUT")
+  SAVED=$((SIZE_BEFORE - SIZE_AFTER))
+  TOTAL_SAVED=$((TOTAL_SAVED + SAVED))
+
+  echo "    $(human_size "$SIZE_BEFORE") → $(human_size "$SIZE_AFTER")  (saved $(human_size "$SAVED"))"
+
+  # Remove source WAV unless --keep was passed
+  if [[ "$KEEP_WAV" == false ]]; then
+    rm "$FILE"
+    echo "    Removed $FILE"
+  fi
+
+  FILES_PROCESSED=$((FILES_PROCESSED + 1))
+done
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+SCRIPT_END=$(date +%s)
+TOTAL=$((SCRIPT_END - SCRIPT_START))
+
+STEPS="encode"
+[[ "$SKIP_NORMALIZE" == false ]] && STEPS="normalize, encode"
+
+echo ""
+echo "── Summary ─────────────────────────────────────────────────────────────────"
+printf "  %-18s %s\n" "Files processed:" "$FILES_PROCESSED"
+printf "  %-18s %s\n" "Steps run:"       "$STEPS"
+printf "  %-18s %s\n" "Output format:"   "$EXT"
+printf "  %-18s %s\n" "Total saved:"     "$(human_size "$TOTAL_SAVED")"
+printf "  %-18s %s\n" "Total time:"      "${TOTAL}s"
