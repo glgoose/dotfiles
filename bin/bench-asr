@@ -96,18 +96,18 @@ rss_tree() {
   echo "$total"
 }
 
-# Start background memory sampler for PID; echoes sampler PID
+# Start background memory sampler — sets global SAMPLER (avoids $() subshell blocking)
+SAMPLER=0
 mem_start() {
   local pid="$1" outfile="$2"
   rm -f "$outfile"
-  (while kill -0 "$pid" 2>/dev/null; do
-    rss_tree "$pid" >> "$outfile"
-    sleep 1
-  done) &
-  echo $!
+  ( while kill -0 "$pid" 2>/dev/null; do
+      rss_tree "$pid" >> "$outfile"; sleep 1
+    done ) &
+  SAMPLER=$!  # set in current shell, not a subshell
 }
 
-# Stop sampler, compute peak MB, clean up; echoes "NNNmb" or "-"
+# Wait for sampler, compute peak MB, clean up; echoes "NNNmb" or "-"
 mem_stop() {
   local sampler_pid="$1" memfile="$2"
   wait "$sampler_pid" 2>/dev/null
@@ -150,8 +150,8 @@ elif command -v mlx_whisper &>/dev/null; then
     --language "$LANG_CODE" --output-format all \
     --output-name "$NAME" --output-dir "$TMPDIR" \
     --condition-on-previous-text False --verbose False >> "$LOG" 2>&1 &
-  CMD_PID=$!; MEMFILE=$(mktemp); SAMPLER=$(mem_start "$CMD_PID" "$MEMFILE"); tick
-  wait "$CMD_PID"; EXIT=$?; ELAPSED=$(tock); PEAK=$(mem_stop "$SAMPLER" "$MEMFILE")
+  CMD_PID=$!; MEMFILE=$(mktemp); tick; mem_start "$CMD_PID" "$MEMFILE"
+  wait "$CMD_PID"; EXIT=$?; ELAPSED=$(tock); PEAK=$(mem_stop "$SAMPLER" "$MEMFILE"); SAMPLER=0
   if [[ $EXIT -eq 0 ]]; then
     mv "$TMPDIR/${NAME}.txt" "$TXT"
     [[ -f "$TMPDIR/${NAME}.srt" ]] && mv "$TMPDIR/${NAME}.srt" "$TRANS/${NAME}.${SLUG}.srt"
@@ -194,8 +194,8 @@ else
   echo "# whisper-cli -m $CPP_MODEL -f $FILE -l $LANG_CODE --output-srt --output-txt" > "$LOG"
   whisper-cli -m "$CPP_MODEL" -f "$FILE" -l "$LANG_CODE" \
     --output-srt --output-txt --output-file "$TMPBASE" >> "$LOG" 2>&1 &
-  CMD_PID=$!; MEMFILE=$(mktemp); SAMPLER=$(mem_start "$CMD_PID" "$MEMFILE"); tick
-  wait "$CMD_PID"; EXIT=$?; ELAPSED=$(tock); PEAK=$(mem_stop "$SAMPLER" "$MEMFILE")
+  CMD_PID=$!; MEMFILE=$(mktemp); tick; mem_start "$CMD_PID" "$MEMFILE"
+  wait "$CMD_PID"; EXIT=$?; ELAPSED=$(tock); PEAK=$(mem_stop "$SAMPLER" "$MEMFILE"); SAMPLER=0
   if [[ $EXIT -eq 0 ]]; then
     mv "${TMPBASE}.txt" "$TXT"
     [[ -f "${TMPBASE}.srt" ]] && mv "${TMPBASE}.srt" "$TRANS/${NAME}.${SLUG}.srt"
@@ -227,8 +227,8 @@ else
   cp "$FILE" "$TMPWORK/$NAME.wav"
   echo "# uvx parakeet-mlx $NAME.wav --output-format all" > "$LOG"
   (cd "$TMPWORK" && uvx parakeet-mlx "$NAME.wav" --output-format all >> "$LOG" 2>&1) &
-  CMD_PID=$!; MEMFILE=$(mktemp); SAMPLER=$(mem_start "$CMD_PID" "$MEMFILE"); tick
-  wait "$CMD_PID"; EXIT=$?; ELAPSED=$(tock); PEAK=$(mem_stop "$SAMPLER" "$MEMFILE")
+  CMD_PID=$!; MEMFILE=$(mktemp); tick; mem_start "$CMD_PID" "$MEMFILE"
+  wait "$CMD_PID"; EXIT=$?; ELAPSED=$(tock); PEAK=$(mem_stop "$SAMPLER" "$MEMFILE"); SAMPLER=0
   if [[ $EXIT -eq 0 ]]; then
     mv "$TMPWORK/${NAME}.txt" "$TXT"
     [[ -f "$TMPWORK/${NAME}.srt" ]] && mv "$TMPWORK/${NAME}.srt" "$TRANS/${NAME}.${SLUG}.srt"
@@ -272,8 +272,8 @@ run_audio() {
 
   echo "# audio transcribe ${ARGS[*]}" > "$LOG"
   audio transcribe "${ARGS[@]}" >> "$LOG" 2>&1 &
-  CMD_PID=$!; MEMFILE=$(mktemp); SAMPLER=$(mem_start "$CMD_PID" "$MEMFILE"); tick
-  wait "$CMD_PID"; EXIT=$?; ELAPSED=$(tock); PEAK=$(mem_stop "$SAMPLER" "$MEMFILE")
+  CMD_PID=$!; MEMFILE=$(mktemp); tick; mem_start "$CMD_PID" "$MEMFILE"
+  wait "$CMD_PID"; EXIT=$?; ELAPSED=$(tock); PEAK=$(mem_stop "$SAMPLER" "$MEMFILE"); SAMPLER=0
 
   if [[ $EXIT -eq 0 ]]; then
     grep "^Result: " "$LOG" | sed 's/^Result: //' > "$TXT"
