@@ -152,7 +152,7 @@ else
   TMPWORK=$(mktemp -d)
   cp "$FILE" "$TMPWORK/$NAME.wav"
   tick
-  (cd "$TMPWORK" && uvx parakeet-mlx "$NAME.wav" --output-format srt,txt 2>/dev/null)
+  (cd "$TMPWORK" && uvx parakeet-mlx "$NAME.wav" --output-format all 2>/dev/null)
   ELAPSED=$(tock)
   [[ -f "$TMPWORK/${NAME}.srt" ]] && mv "$TMPWORK/${NAME}.srt" "$PAR_OUT/${NAME}.srt"
   [[ -f "$TMPWORK/${NAME}.txt" ]] && mv "$TMPWORK/${NAME}.txt" "$PAR_OUT/${NAME}.txt"
