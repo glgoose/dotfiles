@@ -8,8 +8,6 @@
 #   audio-qwen3-0.6B       Qwen3-ASR-0.6B
 #   audio-qwen3-0.6B-8b    Qwen3-ASR-0.6B-8bit
 #   audio-qwen3-1.7B-4b    Qwen3-ASR-1.7B-4bit
-#   audio-qwen3-coreml     Qwen3-ASR CoreML
-#   audio-qwen3-coreml-full
 #
 # Usage: bench-asr [-c] [--lang CODE] <audio.wav>
 #   -c / --cache   skip engines that already have output files
@@ -291,11 +289,9 @@ run_audio() {
   fi
 }
 
-run_audio "qwen3-0.6B"        "qwen3"             "0.6B"
-run_audio "qwen3-0.6B-8b"     "qwen3"             "0.6B-8bit"
-run_audio "qwen3-1.7B-4b"     "qwen3"             "1.7B-4bit"
-run_audio "qwen3-coreml"      "qwen3-coreml"      ""
-run_audio "qwen3-coreml-full" "qwen3-coreml-full" ""
+run_audio "qwen3-0.6B"    "qwen3" "0.6B"
+run_audio "qwen3-0.6B-8b" "qwen3" "0.6B-8bit"
+run_audio "qwen3-1.7B-4b" "qwen3" "1.7B-4bit"
 
 # ── Summary table ──────────────────────────────────────────────────────────────
 echo ""
