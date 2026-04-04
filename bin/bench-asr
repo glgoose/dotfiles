@@ -13,7 +13,7 @@
 # Usage: bench-asr [--lang CODE] <audio.wav>
 # Outputs: ./bench-<name>/<engine>/{name}.srt, {name}.txt
 # Summary: time taken, word count, dup% (hallucination proxy)
-set -euo pipefail
+set -uo pipefail
 
 LANG_CODE="en"
 FILE=""
@@ -82,19 +82,27 @@ mkdir -p "$MLX_OUT"
 
 echo ""
 echo "── whisper-mlx (large-v3-turbo-4bit) ────────────────────────────────────────"
-if command -v mlx_whisper &>/dev/null; then
+if [[ -f "$MLX_OUT/${NAME}.txt" ]]; then
+  echo "  CACHED — using existing output"
+  record "whisper-mlx" "large-v3-turbo-4bit" "(cached)" "$MLX_OUT/${NAME}.txt" ""
+elif command -v mlx_whisper &>/dev/null; then
   tick
-  mlx_whisper "$FILE" \
+  if mlx_whisper "$FILE" \
     --model "$MLX_MODEL" \
     --language "$LANG_CODE" \
     --output-format all \
     --output-name "$NAME" \
     --output-dir "$MLX_OUT" \
     --condition-on-previous-text False \
-    --verbose False
-  ELAPSED=$(tock)
-  echo "  Done in ${ELAPSED}s"
-  record "whisper-mlx" "large-v3-turbo-4bit" "${ELAPSED}s" "$MLX_OUT/${NAME}.txt" ""
+    --verbose False; then
+    ELAPSED=$(tock)
+    echo "  Done in ${ELAPSED}s"
+    record "whisper-mlx" "large-v3-turbo-4bit" "${ELAPSED}s" "$MLX_OUT/${NAME}.txt" ""
+  else
+    ELAPSED=$(tock)
+    echo "  FAILED after ${ELAPSED}s"
+    record "whisper-mlx" "large-v3-turbo-4bit" "${ELAPSED}s" "-" "failed"
+  fi
 else
   echo "  SKIP — mlx_whisper not found (uv tool install mlx-whisper)"
   record "whisper-mlx" "large-v3-turbo-4bit" "-" "-" "not installed"
@@ -109,7 +117,10 @@ mkdir -p "$CPP_OUT"
 
 echo ""
 echo "── whisper.cpp + Metal (large-v3-turbo-q5_0) ────────────────────────────────"
-if ! command -v whisper-cli &>/dev/null; then
+if [[ -f "$CPP_OUT/${NAME}.txt" ]]; then
+  echo "  CACHED — using existing output"
+  record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "(cached)" "$CPP_OUT/${NAME}.txt" ""
+elif ! command -v whisper-cli &>/dev/null; then
   echo "  SKIP — whisper-cli not found (brew install whisper-cpp)"
   record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "-" "-" "not installed"
 elif [[ ! -f "$CPP_MODEL" ]]; then
@@ -119,17 +130,22 @@ elif [[ ! -f "$CPP_MODEL" ]]; then
   record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "-" "-" "model missing"
 else
   tick
-  whisper-cli \
+  if whisper-cli \
     -m "$CPP_MODEL" \
     -f "$FILE" \
     -l "$LANG_CODE" \
     --output-srt \
     --output-txt \
     --output-file "$CPP_OUT/$NAME" \
-    2>/dev/null
-  ELAPSED=$(tock)
-  echo "  Done in ${ELAPSED}s"
-  record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "${ELAPSED}s" "$CPP_OUT/${NAME}.txt" ""
+    2>/dev/null; then
+    ELAPSED=$(tock)
+    echo "  Done in ${ELAPSED}s"
+    record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "${ELAPSED}s" "$CPP_OUT/${NAME}.txt" ""
+  else
+    ELAPSED=$(tock)
+    echo "  FAILED after ${ELAPSED}s"
+    record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "${ELAPSED}s" "-" "failed"
+  fi
 fi
 
 # ── Engine 3: parakeet-mlx (uvx) ──────────────────────────────────────────────
@@ -139,20 +155,29 @@ mkdir -p "$PAR_OUT"
 
 echo ""
 echo "── parakeet-mlx (parakeet-tdt-0.6b-v2) ─────────────────────────────────────"
-if ! command -v uvx &>/dev/null; then
+if [[ -f "$PAR_OUT/${NAME}.txt" ]]; then
+  echo "  CACHED — using existing output"
+  record "parakeet-mlx" "$PAR_MODEL" "(cached)" "$PAR_OUT/${NAME}.txt" ""
+elif ! command -v uvx &>/dev/null; then
   echo "  SKIP — uvx not found (brew install uv)"
   record "parakeet-mlx" "$PAR_MODEL" "-" "-" "not installed"
 else
   TMPWORK=$(mktemp -d)
   cp "$FILE" "$TMPWORK/$NAME.wav"
   tick
-  (cd "$TMPWORK" && uvx parakeet-mlx "$NAME.wav" --output-format all 2>/dev/null)
-  ELAPSED=$(tock)
-  [[ -f "$TMPWORK/${NAME}.srt" ]] && mv "$TMPWORK/${NAME}.srt" "$PAR_OUT/${NAME}.srt"
-  [[ -f "$TMPWORK/${NAME}.txt" ]] && mv "$TMPWORK/${NAME}.txt" "$PAR_OUT/${NAME}.txt"
-  rm -rf "$TMPWORK"
-  echo "  Done in ${ELAPSED}s"
-  record "parakeet-mlx" "$PAR_MODEL" "${ELAPSED}s" "$PAR_OUT/${NAME}.txt" ""
+  if (cd "$TMPWORK" && uvx parakeet-mlx "$NAME.wav" --output-format all 2>/dev/null); then
+    ELAPSED=$(tock)
+    [[ -f "$TMPWORK/${NAME}.srt" ]] && mv "$TMPWORK/${NAME}.srt" "$PAR_OUT/${NAME}.srt"
+    [[ -f "$TMPWORK/${NAME}.txt" ]] && mv "$TMPWORK/${NAME}.txt" "$PAR_OUT/${NAME}.txt"
+    rm -rf "$TMPWORK"
+    echo "  Done in ${ELAPSED}s"
+    record "parakeet-mlx" "$PAR_MODEL" "${ELAPSED}s" "$PAR_OUT/${NAME}.txt" ""
+  else
+    ELAPSED=$(tock)
+    rm -rf "$TMPWORK"
+    echo "  FAILED after ${ELAPSED}s"
+    record "parakeet-mlx" "$PAR_MODEL" "${ELAPSED}s" "-" "failed"
+  fi
 fi
 
 # ── Engines 4–7: audio transcribe (Qwen3-ASR + parakeet via audio CLI) ────────
@@ -171,6 +196,12 @@ run_audio() {
     echo "── audio/${label} (engine=${engine}) $(printf '─%.0s' {1..40})"
   fi
 
+  if [[ -f "$ENGINE_OUT/${NAME}.txt" ]]; then
+    echo "  CACHED — using existing output"
+    record "audio/${label}" "${engine}${model:+/}${model}" "(cached)" "$ENGINE_OUT/${NAME}.txt" ""
+    return
+  fi
+
   if ! command -v audio &>/dev/null; then
     echo "  SKIP — audio CLI not found"
     record "audio/${label}" "${engine}${model:+/}${model}" "-" "-" "not installed"
@@ -182,10 +213,16 @@ run_audio() {
   [[ -n "$LANG_CODE" && "$LANG_CODE" != "en" ]] && ARGS+=(--language "$LANG_CODE")
 
   tick
-  audio transcribe "${ARGS[@]}" > "$ENGINE_OUT/${NAME}.txt" 2>/dev/null
-  ELAPSED=$(tock)
-  echo "  Done in ${ELAPSED}s"
-  record "audio/${label}" "${engine}${model:+/}${model}" "${ELAPSED}s" "$ENGINE_OUT/${NAME}.txt" ""
+  if audio transcribe "${ARGS[@]}" > "$ENGINE_OUT/${NAME}.txt" 2>/dev/null; then
+    ELAPSED=$(tock)
+    echo "  Done in ${ELAPSED}s"
+    record "audio/${label}" "${engine}${model:+/}${model}" "${ELAPSED}s" "$ENGINE_OUT/${NAME}.txt" ""
+  else
+    ELAPSED=$(tock)
+    rm -f "$ENGINE_OUT/${NAME}.txt"
+    echo "  FAILED after ${ELAPSED}s"
+    record "audio/${label}" "${engine}${model:+/}${model}" "${ELAPSED}s" "-" "failed"
+  fi
 }
 
 run_audio "qwen3-0.6B"     "qwen3"    "0.6B"
