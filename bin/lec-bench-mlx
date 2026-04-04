@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# lec-benchmark — compare mlx-whisper vs lightning-whisper-mlx on a single WAV file
-# Usage: lec-benchmark <file.wav> [--lang LANGCODE] [--batch-size N]
+# lec-bench-mlx — compare mlx-whisper vs lightning-whisper-mlx on a single WAV file
+# Usage: lec-bench-mlx <file.wav> [--lang LANGCODE] [--batch-size N]
 #
 # Runs both engines, times them, and diffs their transcripts.
 # Outputs go to ./benchmark-mlx/ and ./benchmark-lightning/ in the current directory.

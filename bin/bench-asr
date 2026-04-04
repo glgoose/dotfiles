@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# bench-asr — compare ASR engines on a single WAV file
+#
+# Engines tested:
+#   whisper-mlx    mlx-community/whisper-large-v3-turbo-4bit  (mlx_whisper)
+#   whisper.cpp    ggml-large-v3-turbo-q5_0  (Metal GPU, brew install whisper-cpp)
+#   parakeet-mlx   parakeet-tdt-0.6b-v2  (uvx parakeet-mlx)
+#   swift-speech   system default model  (swift-speech CLI)
+#
+# Usage: bench-asr [--lang CODE] <audio.wav>
+# Outputs: ./bench-<name>/<engine>/{name}.srt, {name}.txt
+# Summary: time taken, word count, dup% (hallucination proxy)
+set -euo pipefail
+
+LANG_CODE="en"
+FILE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --lang) [[ $# -lt 2 ]] && { echo "Error: --lang requires a language code"; exit 1; }
+            LANG_CODE="$2"; shift 2 ;;
+    -*) echo "Unknown option: $1"; echo "Usage: bench-asr [--lang CODE] <audio.wav>"; exit 1 ;;
+    *)  FILE="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$FILE" || ! -f "$FILE" ]]; then
+  echo "Usage: bench-asr [--lang CODE] <audio.wav>"
+  exit 1
+fi
+
+NAME="$(basename "${FILE%.*}")"
+FILE="$(cd "$(dirname "$FILE")" && pwd)/$(basename "$FILE")"  # absolute path
+OUT="$(pwd)/bench-${NAME}"
+mkdir -p "$OUT"
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+# Word count from a plain-text file
+words() { wc -w < "$1" | tr -d ' '; }
+
+# Duplicate-line % (hallucination proxy): 0% = clean, high = repetition loop
+dup_pct() {
+  python3 - "$1" <<'PY'
+import sys, collections
+lines = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+total = len(lines)
+if total == 0: print("0%"); sys.exit()
+c = collections.Counter(lines)
+dups = sum(v - 1 for v in c.values() if v > 1)
+print(f"{round(100 * dups / total)}%")
+PY
+}
+
+T_START=0
+tick() { T_START=$(date +%s); }
+tock() { echo $(( $(date +%s) - T_START )); }
+
+# Results arrays
+declare -a RES_ENGINE RES_MODEL RES_TIME RES_WORDS RES_DUP RES_NOTE
+
+record() {
+  # record <engine> <model> <elapsed_or_-> <txt_path_or_-> <note>
+  local engine="$1" model="$2" elapsed="$3" txt="$4" note="$5"
+  RES_ENGINE+=("$engine")
+  RES_MODEL+=("$model")
+  RES_TIME+=("$elapsed")
+  if [[ -f "$txt" ]]; then
+    RES_WORDS+=("$(words "$txt")")
+    RES_DUP+=("$(dup_pct "$txt")")
+  else
+    RES_WORDS+=("-")
+    RES_DUP+=("-")
+  fi
+  RES_NOTE+=("$note")
+}
+
+# ── Engine 1: whisper-mlx ──────────────────────────────────────────────────────
+MLX_MODEL="mlx-community/whisper-large-v3-turbo-4bit"
+MLX_OUT="$OUT/whisper-mlx"
+mkdir -p "$MLX_OUT"
+
+echo ""
+echo "── whisper-mlx ($MLX_MODEL) ──────────────────────────────────────────────────"
+if command -v mlx_whisper &>/dev/null; then
+  tick
+  mlx_whisper "$FILE" \
+    --model "$MLX_MODEL" \
+    --language "$LANG_CODE" \
+    --output-format all \
+    --output-name "$NAME" \
+    --output-dir "$MLX_OUT" \
+    --condition-on-previous-text False \
+    --verbose False
+  ELAPSED=$(tock)
+  echo "  Done in ${ELAPSED}s"
+  record "whisper-mlx" "large-v3-turbo-4bit" "${ELAPSED}s" "$MLX_OUT/${NAME}.txt" ""
+else
+  echo "  SKIP — mlx_whisper not found"
+  echo "  Install: uv tool install mlx-whisper"
+  record "whisper-mlx" "large-v3-turbo-4bit" "-" "-" "not installed"
+fi
+
+# ── Engine 2: whisper.cpp + Metal ──────────────────────────────────────────────
+CPP_MODEL_FILE="ggml-large-v3-turbo-q5_0.bin"
+CPP_MODELS_DIR="$(brew --prefix)/share/whisper-cpp"
+CPP_MODEL="$CPP_MODELS_DIR/$CPP_MODEL_FILE"
+CPP_OUT="$OUT/whisper-cpp"
+mkdir -p "$CPP_OUT"
+
+echo ""
+echo "── whisper.cpp + Metal ($CPP_MODEL_FILE) ─────────────────────────────────────"
+if ! command -v whisper-cli &>/dev/null; then
+  echo "  SKIP — whisper-cli not found"
+  echo "  Install: brew install whisper-cpp"
+  record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "-" "-" "not installed"
+elif [[ ! -f "$CPP_MODEL" ]]; then
+  echo "  SKIP — model not found at $CPP_MODEL"
+  echo "  Download:"
+  echo "    mkdir -p $CPP_MODELS_DIR"
+  printf '    curl -L -o "%s" \\\n      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/%s"\n' \
+    "$CPP_MODEL" "$CPP_MODEL_FILE"
+  record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "-" "-" "model missing"
+else
+  tick
+  whisper-cli \
+    -m "$CPP_MODEL" \
+    -f "$FILE" \
+    -l "$LANG_CODE" \
+    --output-srt \
+    --output-txt \
+    --output-file "$CPP_OUT/$NAME" \
+    2>/dev/null
+  ELAPSED=$(tock)
+  echo "  Done in ${ELAPSED}s"
+  record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "${ELAPSED}s" "$CPP_OUT/${NAME}.txt" ""
+fi
+
+# ── Engine 3: parakeet-mlx ─────────────────────────────────────────────────────
+PAR_MODEL="parakeet-tdt-0.6b-v2"
+PAR_OUT="$OUT/parakeet-mlx"
+mkdir -p "$PAR_OUT"
+
+echo ""
+echo "── parakeet-mlx ($PAR_MODEL) ─────────────────────────────────────────────────"
+if ! command -v uvx &>/dev/null; then
+  echo "  SKIP — uvx not found"
+  echo "  Install: brew install uv"
+  record "parakeet-mlx" "$PAR_MODEL" "-" "-" "not installed"
+else
+  # parakeet-mlx writes output alongside the input file; run from a temp dir
+  TMPWORK=$(mktemp -d)
+  cp "$FILE" "$TMPWORK/$NAME.wav"
+  tick
+  (cd "$TMPWORK" && uvx parakeet-mlx "$NAME.wav" --output-format srt,txt 2>/dev/null)
+  ELAPSED=$(tock)
+  [[ -f "$TMPWORK/${NAME}.srt" ]] && mv "$TMPWORK/${NAME}.srt" "$PAR_OUT/${NAME}.srt"
+  [[ -f "$TMPWORK/${NAME}.txt" ]] && mv "$TMPWORK/${NAME}.txt" "$PAR_OUT/${NAME}.txt"
+  rm -rf "$TMPWORK"
+  echo "  Done in ${ELAPSED}s"
+  record "parakeet-mlx" "$PAR_MODEL" "${ELAPSED}s" "$PAR_OUT/${NAME}.txt" ""
+fi
+
+# ── Engine 4: swift-speech ─────────────────────────────────────────────────────
+# swift-speech is a macOS CLI / app. Adjust the command below if your install differs.
+# Expected: swift-speech transcribe <file> --output-dir <dir>
+SWIFT_OUT="$OUT/swift-speech"
+mkdir -p "$SWIFT_OUT"
+
+echo ""
+echo "── swift-speech ──────────────────────────────────────────────────────────────"
+if ! command -v swift-speech &>/dev/null; then
+  echo "  SKIP — swift-speech not found in PATH"
+  echo "  Add the CLI to PATH and adjust the command in this script if needed"
+  record "swift-speech" "default" "-" "-" "not in PATH"
+else
+  tick
+  swift-speech transcribe "$FILE" --output-dir "$SWIFT_OUT" 2>/dev/null || \
+    swift-speech "$FILE" --output-dir "$SWIFT_OUT" 2>/dev/null
+  ELAPSED=$(tock)
+  echo "  Done in ${ELAPSED}s"
+  record "swift-speech" "default" "${ELAPSED}s" "$SWIFT_OUT/${NAME}.txt" ""
+fi
+
+# ── Summary table ──────────────────────────────────────────────────────────────
+echo ""
+echo "── Results ───────────────────────────────────────────────────────────────────"
+printf "  %-20s %-24s %6s %6s %6s  %s\n" "Engine" "Model" "Time" "Words" "Dup%" "Note"
+printf "  %s\n" "$(python3 -c "print('─' * 84)")"
+for i in "${!RES_ENGINE[@]}"; do
+  printf "  %-20s %-24s %6s %6s %6s  %s\n" \
+    "${RES_ENGINE[$i]}" "${RES_MODEL[$i]}" "${RES_TIME[$i]}" \
+    "${RES_WORDS[$i]}" "${RES_DUP[$i]}" "${RES_NOTE[$i]}"
+done
+echo ""
+echo "  Dup% = duplicate lines as % of total — 0% is clean, high % = hallucination loop"
+echo "  Language: $LANG_CODE"
+echo ""
+echo "  Review outputs:"
+echo "    open $OUT"
