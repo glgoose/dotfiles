@@ -46,8 +46,8 @@ if ! command -v mlx_whisper &>/dev/null; then
   echo "Error: mlx_whisper not found. Install with: uv tool install mlx-whisper"
   exit 1
 fi
-if ! python3 -c "import lightning_whisper_mlx" &>/dev/null; then
-  echo "Error: lightning-whisper-mlx not found. Install with: pip install lightning-whisper-mlx"
+if ! command -v uv &>/dev/null; then
+  echo "Error: uv not found. Install with: brew install uv"
   exit 1
 fi
 
@@ -85,7 +85,8 @@ echo ""
 echo "── lightning-whisper-mlx ($MODEL_LIGHTNING, batch_size=$BATCH_SIZE) ─────────"
 LIG_START=$(date +%s)
 
-python3 "$SCRIPT_DIR/lec-lightning-transcribe" \
+uv run --with lightning-whisper-mlx \
+  python3 "$SCRIPT_DIR/lec-lightning-transcribe" \
   "$FILE" "$MODEL_LIGHTNING" "$BATCH_SIZE" \
   > "$OUT_LIGHTNING/${NAME}.txt"
 
