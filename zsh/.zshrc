@@ -10,6 +10,10 @@ export HOMEBREW_AUTO_UPDATE_SECS=86400
 export ZSH=$HOME/.oh-my-zsh
 export NVM_DIR="$HOME/.nvm"
 
+export ANTHROPIC_API_KEY=$(security find-generic-password -a "$USER" -s "anthropic-api-key" -w)
+export OPENAI_API_KEY=$(security find-generic-password -a "$USER" -s "openai-api-key" -w)
+export HF_TOKEN=$(security find-generic-password -a "$USER" -s "huggingface-token" -w)
+
 source ~/.aliases.zsh
 
 EDITOR=/usr/bin/vim
@@ -164,8 +168,6 @@ source $ZSH/oh-my-zsh.sh
 # alias ohmyzsh="mate ~/.oh-my-zsh"
 
 setopt HIST_IGNORE_SPACE
-
-export ANTHROPIC_API_KEY=$(security find-generic-password -a "$USER" -s "anthropic-api-key" -w)
 
 if [[ $- == *i* ]]; then
   [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
