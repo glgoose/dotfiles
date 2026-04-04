@@ -15,19 +15,21 @@
 set -uo pipefail
 
 LANG_CODE="en"
+USE_CACHE=false
 FILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --lang) [[ $# -lt 2 ]] && { echo "Error: --lang requires a language code"; exit 1; }
             LANG_CODE="$2"; shift 2 ;;
-    -*) echo "Unknown option: $1"; echo "Usage: bench-asr [--lang CODE] <audio.wav>"; exit 1 ;;
+    -c|--cache) USE_CACHE=true; shift ;;
+    -*) echo "Unknown option: $1"; echo "Usage: bench-asr [-c] [--lang CODE] <audio.wav>"; exit 1 ;;
     *)  FILE="$1"; shift ;;
   esac
 done
 
 if [[ -z "$FILE" || ! -f "$FILE" ]]; then
-  echo "Usage: bench-asr [--lang CODE] <audio.wav>"
+  echo "Usage: bench-asr [-c] [--lang CODE] <audio.wav>"
   exit 1
 fi
 
@@ -84,7 +86,7 @@ mkdir -p "$MLX_OUT"
 
 echo ""
 echo "── whisper-mlx (large-v3-turbo-4bit) ────────────────────────────────────────"
-if [[ -f "$MLX_OUT/${NAME}.txt" ]]; then
+if [[ "$USE_CACHE" == true && -f "$MLX_OUT/${NAME}.txt" ]]; then
   echo "  cached"
   record "whisper-mlx" "large-v3-turbo-4bit" "$(load_time "$MLX_OUT/${NAME}.time")" "$MLX_OUT/${NAME}.txt" ""
 elif command -v mlx_whisper &>/dev/null; then
@@ -120,7 +122,7 @@ mkdir -p "$CPP_OUT"
 
 echo ""
 echo "── whisper.cpp + Metal (large-v3-turbo-q5_0) ────────────────────────────────"
-if [[ -f "$CPP_OUT/${NAME}.txt" ]]; then
+if [[ "$USE_CACHE" == true && -f "$CPP_OUT/${NAME}.txt" ]]; then
   echo "  cached"
   record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "$(load_time "$CPP_OUT/${NAME}.time")" "$CPP_OUT/${NAME}.txt" ""
 elif ! command -v whisper-cli &>/dev/null; then
@@ -159,7 +161,7 @@ mkdir -p "$PAR_OUT"
 
 echo ""
 echo "── parakeet-mlx (parakeet-tdt-0.6b-v2) ─────────────────────────────────────"
-if [[ -f "$PAR_OUT/${NAME}.txt" ]]; then
+if [[ "$USE_CACHE" == true && -f "$PAR_OUT/${NAME}.txt" ]]; then
   echo "  cached"
   record "parakeet-mlx" "$PAR_MODEL" "$(load_time "$PAR_OUT/${NAME}.time")" "$PAR_OUT/${NAME}.txt" ""
 elif ! command -v uvx &>/dev/null; then
@@ -201,7 +203,7 @@ run_audio() {
     echo "── audio/${label} (engine=${engine}) $(printf '─%.0s' {1..40})"
   fi
 
-  if [[ -f "$ENGINE_OUT/${NAME}.txt" ]]; then
+  if [[ "$USE_CACHE" == true && -f "$ENGINE_OUT/${NAME}.txt" ]]; then
     echo "  cached"
     record "audio/${label}" "${engine}${model:+/}${model}" "$(load_time "$ENGINE_OUT/${NAME}.time")" "$ENGINE_OUT/${NAME}.txt" ""
     return
