@@ -57,6 +57,9 @@ T_START=0
 tick() { T_START=$(date +%s); }
 tock() { echo $(( $(date +%s) - T_START )); }
 
+save_time() { echo "${1}s" > "$2"; }
+load_time() { cat "$1" 2>/dev/null || echo "?"; }
+
 declare -a RES_ENGINE RES_MODEL RES_TIME RES_WORDS RES_DUP RES_NOTE
 
 record() {
@@ -82,8 +85,8 @@ mkdir -p "$MLX_OUT"
 echo ""
 echo "── whisper-mlx (large-v3-turbo-4bit) ────────────────────────────────────────"
 if [[ -f "$MLX_OUT/${NAME}.txt" ]]; then
-  echo "  CACHED — using existing output"
-  record "whisper-mlx" "large-v3-turbo-4bit" "(cached)" "$MLX_OUT/${NAME}.txt" ""
+  echo "  cached"
+  record "whisper-mlx" "large-v3-turbo-4bit" "$(load_time "$MLX_OUT/${NAME}.time")" "$MLX_OUT/${NAME}.txt" ""
 elif command -v mlx_whisper &>/dev/null; then
   tick
   if mlx_whisper "$FILE" \
@@ -95,6 +98,7 @@ elif command -v mlx_whisper &>/dev/null; then
     --condition-on-previous-text False \
     --verbose False; then
     ELAPSED=$(tock)
+    save_time "$ELAPSED" "$MLX_OUT/${NAME}.time"
     echo "  Done in ${ELAPSED}s"
     record "whisper-mlx" "large-v3-turbo-4bit" "${ELAPSED}s" "$MLX_OUT/${NAME}.txt" ""
   else
@@ -117,8 +121,8 @@ mkdir -p "$CPP_OUT"
 echo ""
 echo "── whisper.cpp + Metal (large-v3-turbo-q5_0) ────────────────────────────────"
 if [[ -f "$CPP_OUT/${NAME}.txt" ]]; then
-  echo "  CACHED — using existing output"
-  record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "(cached)" "$CPP_OUT/${NAME}.txt" ""
+  echo "  cached"
+  record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "$(load_time "$CPP_OUT/${NAME}.time")" "$CPP_OUT/${NAME}.txt" ""
 elif ! command -v whisper-cli &>/dev/null; then
   echo "  SKIP — whisper-cli not found (brew install whisper-cpp)"
   record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "-" "-" "not installed"
@@ -138,6 +142,7 @@ else
     --output-file "$CPP_OUT/$NAME" \
     2>/dev/null; then
     ELAPSED=$(tock)
+    save_time "$ELAPSED" "$CPP_OUT/${NAME}.time"
     echo "  Done in ${ELAPSED}s"
     record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "${ELAPSED}s" "$CPP_OUT/${NAME}.txt" ""
   else
@@ -155,8 +160,8 @@ mkdir -p "$PAR_OUT"
 echo ""
 echo "── parakeet-mlx (parakeet-tdt-0.6b-v2) ─────────────────────────────────────"
 if [[ -f "$PAR_OUT/${NAME}.txt" ]]; then
-  echo "  CACHED — using existing output"
-  record "parakeet-mlx" "$PAR_MODEL" "(cached)" "$PAR_OUT/${NAME}.txt" ""
+  echo "  cached"
+  record "parakeet-mlx" "$PAR_MODEL" "$(load_time "$PAR_OUT/${NAME}.time")" "$PAR_OUT/${NAME}.txt" ""
 elif ! command -v uvx &>/dev/null; then
   echo "  SKIP — uvx not found (brew install uv)"
   record "parakeet-mlx" "$PAR_MODEL" "-" "-" "not installed"
@@ -169,6 +174,7 @@ else
     [[ -f "$TMPWORK/${NAME}.srt" ]] && mv "$TMPWORK/${NAME}.srt" "$PAR_OUT/${NAME}.srt"
     [[ -f "$TMPWORK/${NAME}.txt" ]] && mv "$TMPWORK/${NAME}.txt" "$PAR_OUT/${NAME}.txt"
     rm -rf "$TMPWORK"
+    save_time "$ELAPSED" "$PAR_OUT/${NAME}.time"
     echo "  Done in ${ELAPSED}s"
     record "parakeet-mlx" "$PAR_MODEL" "${ELAPSED}s" "$PAR_OUT/${NAME}.txt" ""
   else
@@ -196,8 +202,8 @@ run_audio() {
   fi
 
   if [[ -f "$ENGINE_OUT/${NAME}.txt" ]]; then
-    echo "  CACHED — using existing output"
-    record "audio/${label}" "${engine}${model:+/}${model}" "(cached)" "$ENGINE_OUT/${NAME}.txt" ""
+    echo "  cached"
+    record "audio/${label}" "${engine}${model:+/}${model}" "$(load_time "$ENGINE_OUT/${NAME}.time")" "$ENGINE_OUT/${NAME}.txt" ""
     return
   fi
 
@@ -214,6 +220,7 @@ run_audio() {
   tick
   if audio transcribe "${ARGS[@]}" > "$ENGINE_OUT/${NAME}.txt" 2>/dev/null; then
     ELAPSED=$(tock)
+    save_time "$ELAPSED" "$ENGINE_OUT/${NAME}.time"
     echo "  Done in ${ELAPSED}s"
     record "audio/${label}" "${engine}${model:+/}${model}" "${ELAPSED}s" "$ENGINE_OUT/${NAME}.txt" ""
   else
