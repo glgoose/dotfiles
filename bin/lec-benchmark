@@ -3,7 +3,8 @@
 # Usage: lec-benchmark <file.wav> [--lang LANGCODE] [--batch-size N]
 #
 # Runs both engines, times them, and diffs their transcripts.
-# Outputs are saved to named temp dirs printed at the end.
+# Outputs go to ./benchmark-mlx/ and ./benchmark-lightning/ in the current directory.
+# Note: lightning-whisper-mlx produces .txt only; mlx-whisper produces .srt + .txt.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -55,8 +56,9 @@ MODEL_MLX="mlx-community/whisper-large-v3-turbo"
 MODEL_LIGHTNING="distil-large-v3"
 NAME="$(basename "${FILE%.*}")"
 
-OUT_MLX=$(mktemp -d -t lec-benchmark-mlx)
-OUT_LIGHTNING=$(mktemp -d -t lec-benchmark-lightning)
+OUT_MLX="$(pwd)/benchmark-mlx"
+OUT_LIGHTNING="$(pwd)/benchmark-lightning"
+mkdir -p "$OUT_MLX" "$OUT_LIGHTNING"
 
 SCRIPT_START=$(date +%s)
 
@@ -126,6 +128,9 @@ printf "  %-26s %ss  (%s words)\n" "mlx-whisper:"         "$MLX_TIME" "$MLX_WORD
 printf "  %-26s %ss  (%s words)\n" "lightning-whisper-mlx:" "$LIG_TIME" "$LIG_WORDS"
 printf "  %-26s %s faster by %ss (%s)\n" "Faster:" "$FASTER" "$DELTA" "$RATIO"
 echo ""
-printf "  %-26s %s\n" "mlx-whisper output:"         "$OUT_MLX"
-printf "  %-26s %s\n" "lightning-whisper output:" "$OUT_LIGHTNING"
-printf "  %-26s %ss\n" "Total wall time:"           "$TOTAL"
+printf "  %-26s %ss\n" "Total wall time:" "$TOTAL"
+echo ""
+echo "  To use the mlx-whisper result:"
+echo "    cp benchmark-mlx/${NAME}.srt benchmark-mlx/${NAME}.txt ."
+echo "  To use the lightning result (.txt only, no SRT):"
+echo "    cp benchmark-lightning/${NAME}.txt ."
