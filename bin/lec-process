@@ -109,6 +109,7 @@ for FILE in "${WAV_FILES[@]}"; do
     --output-format all \
     --output-name "$NAME" \
     --output-dir "$TMPDIR" \
+    --condition-on-previous-text False \
     --verbose False
 
   mv "$TMPDIR/${NAME}.srt" "./${NAME}.srt"
