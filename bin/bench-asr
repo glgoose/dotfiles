@@ -4,7 +4,7 @@
 # Engines:
 #   whisper-mlx        mlx-community/whisper-large-v3-turbo-4bit
 #   whisper-cpp        ggml-large-v3-turbo-q5_0  (brew install whisper-cpp)
-#   parakeet-mlx       parakeet-tdt-0.6b-v2  (uvx parakeet-mlx)
+#   parakeet-mlx       parakeet-tdt-0.6b-v3  (uvx parakeet-mlx)
 #   audio-qwen3-0.6B   Qwen3-ASR-0.6B  (audio transcribe)
 #   audio-qwen3-0.6B-8b
 #   audio-qwen3-1.7B-4b
@@ -157,13 +157,13 @@ PAR_TXT="$OUT/${NAME}.parakeet-mlx.txt"
 PAR_TIME="$OUT/${NAME}.parakeet-mlx.time"
 
 echo ""
-echo "── parakeet-mlx (parakeet-tdt-0.6b-v2) ─────────────────────────────────────"
+echo "── parakeet-mlx (parakeet-tdt-0.6b-v3) ─────────────────────────────────────"
 if [[ "$USE_CACHE" == true && -f "$PAR_TXT" ]]; then
   echo "  cached"
-  record "parakeet-mlx" "parakeet-tdt-0.6b-v2" "$(load_time "$PAR_TIME")" "$PAR_TXT" ""
+  record "parakeet-mlx" "parakeet-tdt-0.6b-v3" "$(load_time "$PAR_TIME")" "$PAR_TXT" ""
 elif ! command -v uvx &>/dev/null; then
   echo "  SKIP — uvx not found (brew install uv)"
-  record "parakeet-mlx" "parakeet-tdt-0.6b-v2" "-" "-" "not installed"
+  record "parakeet-mlx" "parakeet-tdt-0.6b-v3" "-" "-" "not installed"
 else
   TMPWORK=$(mktemp -d)
   cp "$FILE" "$TMPWORK/$NAME.wav"
@@ -174,10 +174,10 @@ else
     [[ -f "$TMPWORK/${NAME}.srt" ]] && mv "$TMPWORK/${NAME}.srt" "$OUT/${NAME}.parakeet-mlx.srt"
     save_time "$ELAPSED" "$PAR_TIME"
     echo "  Done in ${ELAPSED}s"
-    record "parakeet-mlx" "parakeet-tdt-0.6b-v2" "${ELAPSED}s" "$PAR_TXT" ""
+    record "parakeet-mlx" "parakeet-tdt-0.6b-v3" "${ELAPSED}s" "$PAR_TXT" ""
   else
     ELAPSED=$(tock); echo "  FAILED after ${ELAPSED}s"
-    record "parakeet-mlx" "parakeet-tdt-0.6b-v2" "${ELAPSED}s" "-" "failed"
+    record "parakeet-mlx" "parakeet-tdt-0.6b-v3" "${ELAPSED}s" "-" "failed"
   fi
   rm -rf "$TMPWORK"
 fi
