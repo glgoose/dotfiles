@@ -20,4 +20,7 @@ echo "Stowing dotfiles..."
 cd "$DOTFILES"
 stow zsh git vim vscode
 
+# Configure Bitwarden server
+bw config server https://vault.bitwarden.eu
+
 echo "Done."

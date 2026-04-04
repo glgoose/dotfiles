@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# lec-benchmark — compare mlx-whisper vs lightning-whisper-mlx on a single WAV file
+# Usage: lec-benchmark <file.wav> [--lang LANGCODE] [--batch-size N]
+#
+# Runs both engines, times them, and diffs their transcripts.
+# Outputs are saved to named temp dirs printed at the end.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ── Defaults ───────────────────────────────────────────────────────────────────
+LANG_CODE="en"
+BATCH_SIZE=6   # conservative for M1 8GB with a large model
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+if [[ $# -lt 1 ]]; then
+  echo "Usage: lec-benchmark <file.wav> [--lang LANGCODE] [--batch-size N]"
+  exit 1
+fi
+
+FILE="$1"; shift
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --lang)
+      [[ $# -lt 2 ]] && { echo "Error: --lang requires a language code"; exit 1; }
+      LANG_CODE="$2"; shift 2 ;;
+    --batch-size)
+      [[ $# -lt 2 ]] && { echo "Error: --batch-size requires a number"; exit 1; }
+      BATCH_SIZE="$2"; shift 2 ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: lec-benchmark <file.wav> [--lang LANGCODE] [--batch-size N]"
+      exit 1 ;;
+  esac
+done
+
+if [[ ! -f "$FILE" ]]; then
+  echo "Error: file not found: $FILE"
+  exit 1
+fi
+
+# ── Dependency checks ──────────────────────────────────────────────────────────
+if ! command -v mlx_whisper &>/dev/null; then
+  echo "Error: mlx_whisper not found. Install with: uv tool install mlx-whisper"
+  exit 1
+fi
+if ! python3 -c "import lightning_whisper_mlx" &>/dev/null; then
+  echo "Error: lightning-whisper-mlx not found. Install with: pip install lightning-whisper-mlx"
+  exit 1
+fi
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+MODEL_MLX="mlx-community/whisper-large-v3-turbo"
+MODEL_LIGHTNING="distil-large-v3"
+NAME="$(basename "${FILE%.*}")"
+
+OUT_MLX=$(mktemp -d -t lec-benchmark-mlx)
+OUT_LIGHTNING=$(mktemp -d -t lec-benchmark-lightning)
+
+SCRIPT_START=$(date +%s)
+
+# ── Run mlx-whisper ────────────────────────────────────────────────────────────
+echo ""
+echo "── mlx-whisper ($MODEL_MLX) ─────────────────────────────────────────────────"
+MLX_START=$(date +%s)
+
+mlx_whisper "$FILE" \
+  --model "$MODEL_MLX" \
+  --language "$LANG_CODE" \
+  --output-format all \
+  --output-name "$NAME" \
+  --output-dir "$OUT_MLX" \
+  --verbose False
+
+MLX_END=$(date +%s)
+MLX_TIME=$(( MLX_END - MLX_START ))
+MLX_WORDS=$(wc -w < "$OUT_MLX/${NAME}.txt" | tr -d ' ')
+echo "  Done in ${MLX_TIME}s  (${MLX_WORDS} words)"
+
+# ── Run lightning-whisper-mlx ──────────────────────────────────────────────────
+echo ""
+echo "── lightning-whisper-mlx ($MODEL_LIGHTNING, batch_size=$BATCH_SIZE) ─────────"
+LIG_START=$(date +%s)
+
+python3 "$SCRIPT_DIR/lec-lightning-transcribe" \
+  "$FILE" "$MODEL_LIGHTNING" "$BATCH_SIZE" \
+  > "$OUT_LIGHTNING/${NAME}.txt"
+
+LIG_END=$(date +%s)
+LIG_TIME=$(( LIG_END - LIG_START ))
+LIG_WORDS=$(wc -w < "$OUT_LIGHTNING/${NAME}.txt" | tr -d ' ')
+echo "  Done in ${LIG_TIME}s  (${LIG_WORDS} words)"
+
+# ── Output comparison ──────────────────────────────────────────────────────────
+echo ""
+echo "── Transcript diff (mlx-whisper vs lightning-whisper-mlx) ───────────────────"
+DIFF_OUT=$(diff "$OUT_MLX/${NAME}.txt" "$OUT_LIGHTNING/${NAME}.txt" || true)
+if [[ -z "$DIFF_OUT" ]]; then
+  echo "  Outputs are identical."
+else
+  # Show a truncated unified diff so the terminal doesn't flood
+  echo "$DIFF_OUT" | head -60
+  DIFF_LINES=$(echo "$DIFF_OUT" | wc -l | tr -d ' ')
+  [[ $DIFF_LINES -gt 60 ]] && echo "  ... (diff truncated at 60 lines, full diff in output dirs)"
+fi
+
+# ── Summary ────────────────────────────────────────────────────────────────────
+SCRIPT_END=$(date +%s)
+TOTAL=$(( SCRIPT_END - SCRIPT_START ))
+
+if [[ $MLX_TIME -lt $LIG_TIME ]]; then
+  FASTER="mlx-whisper"
+  DELTA=$(( LIG_TIME - MLX_TIME ))
+  RATIO=$(awk "BEGIN { printf \"%.1fx\", $LIG_TIME / ($MLX_TIME == 0 ? 1 : $MLX_TIME) }")
+else
+  FASTER="lightning-whisper-mlx"
+  DELTA=$(( MLX_TIME - LIG_TIME ))
+  RATIO=$(awk "BEGIN { printf \"%.1fx\", $MLX_TIME / ($LIG_TIME == 0 ? 1 : $LIG_TIME) }")
+fi
+
+echo ""
+echo "── Summary ──────────────────────────────────────────────────────────────────"
+printf "  %-26s %s\n" "File:"                "$FILE"
+printf "  %-26s %ss  (%s words)\n" "mlx-whisper:"         "$MLX_TIME" "$MLX_WORDS"
+printf "  %-26s %ss  (%s words)\n" "lightning-whisper-mlx:" "$LIG_TIME" "$LIG_WORDS"
+printf "  %-26s %s faster by %ss (%s)\n" "Faster:" "$FASTER" "$DELTA" "$RATIO"
+echo ""
+printf "  %-26s %s\n" "mlx-whisper output:"         "$OUT_MLX"
+printf "  %-26s %s\n" "lightning-whisper output:" "$OUT_LIGHTNING"
+printf "  %-26s %ss\n" "Total wall time:"           "$TOTAL"

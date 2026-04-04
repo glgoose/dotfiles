@@ -42,8 +42,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Dependency checks ──────────────────────────────────────────────────────────
-if ! command -v whisper-cli &>/dev/null; then
-  echo "Error: whisper-cli not found. Install with: brew install whisper-cpp"
+if ! command -v mlx_whisper &>/dev/null; then
+  echo "Error: mlx_whisper not found. Install with: uv tool install mlx-whisper"
   exit 1
 fi
 
@@ -91,23 +91,8 @@ fi
 echo ""
 echo "── Step 2: Transcribe ──────────────────────────────────────────────────────"
 
-MODELS_DIR="$(brew --prefix)/share/whisper-cpp"
-
-# English-only model is smaller and more accurate for English
-if [[ "$LANG_CODE" == "en" ]]; then
-  MODEL="ggml-medium.en.bin"
-else
-  MODEL="ggml-medium.bin"
-fi
-
-MODEL_PATH="${MODELS_DIR}/${MODEL}"
-
-if [[ ! -f "$MODEL_PATH" ]]; then
-  echo "Error: model not found at $MODEL_PATH"
-  echo "Download with:"
-  echo "  curl -L -o \"$MODEL_PATH\" \"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$MODEL\""
-  exit 1
-fi
+# Model is downloaded automatically from HuggingFace on first use
+MLX_MODEL="mlx-community/whisper-large-v3-turbo"
 
 FILES_PROCESSED=0
 for FILE in "${WAV_FILES[@]}"; do
@@ -115,15 +100,19 @@ for FILE in "${WAV_FILES[@]}"; do
   echo "  Transcribing $FILE..."
   FILE_START=$(date +%s)
 
-  # Metal GPU is enabled by default on Apple Silicon; -t sets CPU thread count
-  whisper-cli \
-    -m "$MODEL_PATH" \
-    -f "$FILE" \
-    -l "$LANG_CODE" \
-    -t 4 \
-    --output-srt \
-    --output-txt \
-    --output-file "$NAME"
+  # Output to a temp dir so we can pick only .srt and .txt
+  TMPDIR=$(mktemp -d)
+  mlx_whisper "$FILE" \
+    --model "$MLX_MODEL" \
+    --language "$LANG_CODE" \
+    --output-format all \
+    --output-name "$NAME" \
+    --output-dir "$TMPDIR" \
+    --verbose False
+
+  mv "$TMPDIR/${NAME}.srt" "./${NAME}.srt"
+  mv "$TMPDIR/${NAME}.txt" "./${NAME}.txt"
+  rm -rf "$TMPDIR"
 
   FILE_END=$(date +%s)
   echo "  Done in $((FILE_END - FILE_START))s → ${NAME}.srt, ${NAME}.txt"
@@ -151,5 +140,5 @@ echo ""
 echo "── Summary ─────────────────────────────────────────────────────────────────"
 printf "  %-18s %s\n" "Files processed:" "$FILES_PROCESSED"
 printf "  %-18s %s\n" "Steps run:"       "$STEPS"
-printf "  %-18s %s\n" "Language:"        "$LANG_CODE  (model: $MODEL)"
+printf "  %-18s %s\n" "Language:"        "$LANG_CODE  (model: $MLX_MODEL)"
 printf "  %-18s %s\n" "Total time:"      "${TOTAL}s"

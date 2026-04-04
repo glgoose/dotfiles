@@ -163,6 +163,10 @@ source $ZSH/oh-my-zsh.sh
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
 
+setopt HIST_IGNORE_SPACE
+
+export ANTHROPIC_API_KEY=$(security find-generic-password -a "$USER" -s "anthropic-api-key" -w)
+
 if [[ $- == *i* ]]; then
   [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
 fi
