@@ -52,7 +52,7 @@ if ! command -v uv &>/dev/null; then
 fi
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-MODEL_MLX="mlx-community/whisper-large-v3-turbo"
+MODEL_MLX="mlx-community/whisper-large-v3-turbo-4bit"
 MODEL_LIGHTNING="distil-large-v3"
 NAME="$(basename "${FILE%.*}")"
 

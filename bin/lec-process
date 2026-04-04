@@ -91,8 +91,9 @@ fi
 echo ""
 echo "── Step 2: Transcribe ──────────────────────────────────────────────────────"
 
-# Model is downloaded automatically from HuggingFace on first use
-MLX_MODEL="mlx-community/whisper-large-v3-turbo"
+# 4-bit quantized: ~463 MB on disk, much lower memory than the full model (~1.6 GB),
+# negligible accuracy loss. Better fit for 8 GB unified memory.
+MLX_MODEL="mlx-community/whisper-large-v3-turbo-4bit"
 
 FILES_PROCESSED=0
 for FILE in "${WAV_FILES[@]}"; do
