@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 LANG_CODE="en"
-BATCH_SIZE=6   # conservative for M1 8GB with a large model
+BATCH_SIZE=""  # empty = use lightning's default (12); override with --batch-size if OOM
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 if [[ $# -lt 1 ]]; then
@@ -82,12 +82,13 @@ echo "  Done in ${MLX_TIME}s  (${MLX_WORDS} words)"
 
 # ── Run lightning-whisper-mlx ──────────────────────────────────────────────────
 echo ""
-echo "── lightning-whisper-mlx ($MODEL_LIGHTNING, batch_size=$BATCH_SIZE) ─────────"
+BATCH_LABEL="${BATCH_SIZE:-default}"
+echo "── lightning-whisper-mlx ($MODEL_LIGHTNING, batch_size=$BATCH_LABEL) ──────────"
 LIG_START=$(date +%s)
 
 uv run --with lightning-whisper-mlx \
   python3 "$SCRIPT_DIR/lec-lightning-transcribe" \
-  "$FILE" "$MODEL_LIGHTNING" "$BATCH_SIZE" \
+  "$FILE" "$MODEL_LIGHTNING" "${BATCH_SIZE:-}" \
   > "$OUT_LIGHTNING/${NAME}.txt"
 
 LIG_END=$(date +%s)
