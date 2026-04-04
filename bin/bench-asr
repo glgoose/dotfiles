@@ -2,10 +2,13 @@
 # bench-asr — compare ASR engines on a single WAV file
 #
 # Engines tested:
-#   whisper-mlx    mlx-community/whisper-large-v3-turbo-4bit  (mlx_whisper)
-#   whisper.cpp    ggml-large-v3-turbo-q5_0  (Metal GPU, brew install whisper-cpp)
-#   parakeet-mlx   parakeet-tdt-0.6b-v2  (uvx parakeet-mlx)
-#   swift-speech   system default model  (swift-speech CLI)
+#   whisper-mlx          mlx-community/whisper-large-v3-turbo-4bit
+#   whisper.cpp+Metal    ggml-large-v3-turbo-q5_0  (brew install whisper-cpp)
+#   parakeet-mlx         parakeet-tdt-0.6b-v2  (uvx parakeet-mlx)
+#   audio/qwen3-0.6B     Qwen3-ASR-0.6B  (audio transcribe)
+#   audio/qwen3-0.6B-8b  Qwen3-ASR-0.6B-8bit
+#   audio/qwen3-1.7B-4b  Qwen3-ASR-1.7B-4bit  (~850 MB, fits 8 GB)
+#   audio/parakeet       parakeet-tdt via audio CLI
 #
 # Usage: bench-asr [--lang CODE] <audio.wav>
 # Outputs: ./bench-<name>/<engine>/{name}.srt, {name}.txt
@@ -36,7 +39,6 @@ mkdir -p "$OUT"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-# Word count from a plain-text file
 words() { wc -w < "$1" | tr -d ' '; }
 
 # Duplicate-line % (hallucination proxy): 0% = clean, high = repetition loop
@@ -56,11 +58,9 @@ T_START=0
 tick() { T_START=$(date +%s); }
 tock() { echo $(( $(date +%s) - T_START )); }
 
-# Results arrays
 declare -a RES_ENGINE RES_MODEL RES_TIME RES_WORDS RES_DUP RES_NOTE
 
 record() {
-  # record <engine> <model> <elapsed_or_-> <txt_path_or_-> <note>
   local engine="$1" model="$2" elapsed="$3" txt="$4" note="$5"
   RES_ENGINE+=("$engine")
   RES_MODEL+=("$model")
@@ -81,7 +81,7 @@ MLX_OUT="$OUT/whisper-mlx"
 mkdir -p "$MLX_OUT"
 
 echo ""
-echo "── whisper-mlx ($MLX_MODEL) ──────────────────────────────────────────────────"
+echo "── whisper-mlx (large-v3-turbo-4bit) ────────────────────────────────────────"
 if command -v mlx_whisper &>/dev/null; then
   tick
   mlx_whisper "$FILE" \
@@ -96,8 +96,7 @@ if command -v mlx_whisper &>/dev/null; then
   echo "  Done in ${ELAPSED}s"
   record "whisper-mlx" "large-v3-turbo-4bit" "${ELAPSED}s" "$MLX_OUT/${NAME}.txt" ""
 else
-  echo "  SKIP — mlx_whisper not found"
-  echo "  Install: uv tool install mlx-whisper"
+  echo "  SKIP — mlx_whisper not found (uv tool install mlx-whisper)"
   record "whisper-mlx" "large-v3-turbo-4bit" "-" "-" "not installed"
 fi
 
@@ -109,16 +108,13 @@ CPP_OUT="$OUT/whisper-cpp"
 mkdir -p "$CPP_OUT"
 
 echo ""
-echo "── whisper.cpp + Metal ($CPP_MODEL_FILE) ─────────────────────────────────────"
+echo "── whisper.cpp + Metal (large-v3-turbo-q5_0) ────────────────────────────────"
 if ! command -v whisper-cli &>/dev/null; then
-  echo "  SKIP — whisper-cli not found"
-  echo "  Install: brew install whisper-cpp"
+  echo "  SKIP — whisper-cli not found (brew install whisper-cpp)"
   record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "-" "-" "not installed"
 elif [[ ! -f "$CPP_MODEL" ]]; then
-  echo "  SKIP — model not found at $CPP_MODEL"
-  echo "  Download:"
-  echo "    mkdir -p $CPP_MODELS_DIR"
-  printf '    curl -L -o "%s" \\\n      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/%s"\n' \
+  echo "  SKIP — model not found: $CPP_MODEL"
+  printf '  Download: curl -L -o "%s" \\\n    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/%s"\n' \
     "$CPP_MODEL" "$CPP_MODEL_FILE"
   record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "-" "-" "model missing"
 else
@@ -136,19 +132,17 @@ else
   record "whisper.cpp+Metal" "large-v3-turbo-q5_0" "${ELAPSED}s" "$CPP_OUT/${NAME}.txt" ""
 fi
 
-# ── Engine 3: parakeet-mlx ─────────────────────────────────────────────────────
+# ── Engine 3: parakeet-mlx (uvx) ──────────────────────────────────────────────
 PAR_MODEL="parakeet-tdt-0.6b-v2"
 PAR_OUT="$OUT/parakeet-mlx"
 mkdir -p "$PAR_OUT"
 
 echo ""
-echo "── parakeet-mlx ($PAR_MODEL) ─────────────────────────────────────────────────"
+echo "── parakeet-mlx (parakeet-tdt-0.6b-v2) ─────────────────────────────────────"
 if ! command -v uvx &>/dev/null; then
-  echo "  SKIP — uvx not found"
-  echo "  Install: brew install uv"
+  echo "  SKIP — uvx not found (brew install uv)"
   record "parakeet-mlx" "$PAR_MODEL" "-" "-" "not installed"
 else
-  # parakeet-mlx writes output alongside the input file; run from a temp dir
   TMPWORK=$(mktemp -d)
   cp "$FILE" "$TMPWORK/$NAME.wav"
   tick
@@ -161,40 +155,57 @@ else
   record "parakeet-mlx" "$PAR_MODEL" "${ELAPSED}s" "$PAR_OUT/${NAME}.txt" ""
 fi
 
-# ── Engine 4: swift-speech ─────────────────────────────────────────────────────
-# swift-speech is a macOS CLI / app. Adjust the command below if your install differs.
-# Expected: swift-speech transcribe <file> --output-dir <dir>
-SWIFT_OUT="$OUT/swift-speech"
-mkdir -p "$SWIFT_OUT"
+# ── Engines 4–7: audio transcribe (Qwen3-ASR + parakeet via audio CLI) ────────
+# Models skipped for 8 GB M1: qwen3/1.7B (full precision, ~3.4 GB)
+# qwen3-coreml requires a separately compiled .mlmodelc — skipped unless present
 
-echo ""
-echo "── swift-speech ──────────────────────────────────────────────────────────────"
-if ! command -v swift-speech &>/dev/null; then
-  echo "  SKIP — swift-speech not found in PATH"
-  echo "  Add the CLI to PATH and adjust the command in this script if needed"
-  record "swift-speech" "default" "-" "-" "not in PATH"
-else
+run_audio() {
+  local label="$1" engine="$2" model="$3"
+  local ENGINE_OUT="$OUT/audio-${label}"
+  mkdir -p "$ENGINE_OUT"
+
+  echo ""
+  if [[ -n "$model" ]]; then
+    echo "── audio/${label} (engine=${engine}, model=${model}) $(printf '─%.0s' {1..30})"
+  else
+    echo "── audio/${label} (engine=${engine}) $(printf '─%.0s' {1..40})"
+  fi
+
+  if ! command -v audio &>/dev/null; then
+    echo "  SKIP — audio CLI not found"
+    record "audio/${label}" "${engine}${model:+/}${model}" "-" "-" "not installed"
+    return
+  fi
+
+  local ARGS=("$FILE" --engine "$engine")
+  [[ -n "$model" ]] && ARGS+=(--model "$model")
+  [[ -n "$LANG_CODE" && "$LANG_CODE" != "en" ]] && ARGS+=(--language "$LANG_CODE")
+
   tick
-  swift-speech transcribe "$FILE" --output-dir "$SWIFT_OUT" 2>/dev/null || \
-    swift-speech "$FILE" --output-dir "$SWIFT_OUT" 2>/dev/null
+  audio transcribe "${ARGS[@]}" > "$ENGINE_OUT/${NAME}.txt" 2>/dev/null
   ELAPSED=$(tock)
   echo "  Done in ${ELAPSED}s"
-  record "swift-speech" "default" "${ELAPSED}s" "$SWIFT_OUT/${NAME}.txt" ""
-fi
+  record "audio/${label}" "${engine}${model:+/}${model}" "${ELAPSED}s" "$ENGINE_OUT/${NAME}.txt" ""
+}
+
+run_audio "qwen3-0.6B"     "qwen3"    "0.6B"
+run_audio "qwen3-0.6B-8b"  "qwen3"    "0.6B-8bit"
+run_audio "qwen3-1.7B-4b"  "qwen3"    "1.7B-4bit"
+run_audio "parakeet"       "parakeet" ""
 
 # ── Summary table ──────────────────────────────────────────────────────────────
 echo ""
 echo "── Results ───────────────────────────────────────────────────────────────────"
-printf "  %-20s %-24s %6s %6s %6s  %s\n" "Engine" "Model" "Time" "Words" "Dup%" "Note"
-printf "  %s\n" "$(python3 -c "print('─' * 84)")"
+printf "  %-22s %-22s %6s %6s %6s  %s\n" "Engine" "Model" "Time" "Words" "Dup%" "Note"
+printf "  %s\n" "$(python3 -c "print('─' * 86)")"
 for i in "${!RES_ENGINE[@]}"; do
-  printf "  %-20s %-24s %6s %6s %6s  %s\n" \
+  printf "  %-22s %-22s %6s %6s %6s  %s\n" \
     "${RES_ENGINE[$i]}" "${RES_MODEL[$i]}" "${RES_TIME[$i]}" \
     "${RES_WORDS[$i]}" "${RES_DUP[$i]}" "${RES_NOTE[$i]}"
 done
 echo ""
-echo "  Dup% = duplicate lines as % of total — 0% is clean, high % = hallucination loop"
+echo "  Dup% = duplicate lines as % of total — 0% = clean, high % = hallucination loop"
+echo "  Skipped for 8 GB M1: qwen3/1.7B (full precision, ~3.4 GB)"
 echo "  Language: $LANG_CODE"
 echo ""
-echo "  Review outputs:"
-echo "    open $OUT"
+echo "  Review outputs:  open $OUT"
