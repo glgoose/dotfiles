@@ -8,7 +8,6 @@
 #   audio/qwen3-0.6B     Qwen3-ASR-0.6B  (audio transcribe)
 #   audio/qwen3-0.6B-8b  Qwen3-ASR-0.6B-8bit
 #   audio/qwen3-1.7B-4b  Qwen3-ASR-1.7B-4bit  (~850 MB, fits 8 GB)
-#   audio/parakeet       parakeet-tdt via audio CLI
 #
 # Usage: bench-asr [--lang CODE] <audio.wav>
 # Outputs: ./bench-<name>/<engine>/{name}.srt, {name}.txt
@@ -180,7 +179,7 @@ else
   fi
 fi
 
-# ── Engines 4–7: audio transcribe (Qwen3-ASR + parakeet via audio CLI) ────────
+# ── Engines 4–6: audio transcribe (Qwen3-ASR variants) ───────────────────────
 # Models skipped for 8 GB M1: qwen3/1.7B (full precision, ~3.4 GB)
 # qwen3-coreml requires a separately compiled .mlmodelc — skipped unless present
 
@@ -228,7 +227,6 @@ run_audio() {
 run_audio "qwen3-0.6B"     "qwen3"    "0.6B"
 run_audio "qwen3-0.6B-8b"  "qwen3"    "0.6B-8bit"
 run_audio "qwen3-1.7B-4b"  "qwen3"    "1.7B-4bit"
-run_audio "parakeet"       "parakeet" ""
 
 # ── Summary table ──────────────────────────────────────────────────────────────
 echo ""
