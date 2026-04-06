@@ -58,3 +58,31 @@ human_size() {
 }
 
 file_bytes() { wc -c < "$1" | tr -d ' '; }
+
+echo "── A: SoX profile-based ─────────────────────────────────────────────────────"
+A_OUT="${BASE}_a_sox.wav"
+A_START=$(date +%s)
+
+# Detect silences
+SILENCE_INFO=$(ffmpeg -i "$FILE" -af "silencedetect=noise=-30dB:d=1.5" -f null - 2>&1 || true)
+SIL_START=$(echo "$SILENCE_INFO" | grep -m1 'silence_start:' | grep -oE '[0-9]+\.[0-9]+' | tail -1)
+SIL_END=$(echo "$SILENCE_INFO"   | grep -m1 'silence_end:'   | grep -oE '[0-9]+\.[0-9]+' | head -1)
+
+if [[ -z "$SIL_START" || -z "$SIL_END" ]]; then
+  echo "  [skip] No silence detected at -30dBFS — cannot build noise profile."
+  echo "         Try recording a few seconds of room noise at the start of a file."
+else
+  SIL_DUR=$(awk -v s="$SIL_START" -v e="$SIL_END" 'BEGIN{printf "%.3f", e-s}')
+  echo "  Silence found at ${SIL_START}s–${SIL_END}s (${SIL_DUR}s) — building noise profile..."
+
+  ffmpeg -y -ss "$SIL_START" -t "$SIL_DUR" -i "$FILE" \
+    "$WORK/noise_sample.wav" 2>/dev/null
+
+  sox "$WORK/noise_sample.wav" -n noiseprof "$WORK/noise.prof"
+  sox "$FILE" "$A_OUT" noisered "$WORK/noise.prof" 0.21
+
+  A_END=$(date +%s)
+  echo "  Done in $((A_END - A_START))s"
+  echo "  Output: $(human_size "$(file_bytes "$A_OUT")")   $A_OUT"
+fi
+echo ""
