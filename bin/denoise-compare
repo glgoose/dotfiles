@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# denoise-compare — compare three noise-reduction approaches on a WAV file
+# Usage: denoise-compare <file.wav>
+# Outputs: <name>_a_sox.wav, <name>_b_rnnoise.wav, <name>_c_deepfilter.wav
+set -euo pipefail
+
+FILE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      echo "Usage: denoise-compare <file.wav>"
+      echo ""
+      echo "  Runs three denoising approaches and outputs one WAV per approach:"
+      echo "    <name>_a_sox.wav        SoX profile-based (silence → noiseprof → noisered)"
+      echo "    <name>_b_rnnoise.wav    RNNoise neural network (ffmpeg arnndn)"
+      echo "    <name>_c_deepfilter.wav DeepFilterNet (uvx deepfilternet, uses Metal on M1)"
+      echo ""
+      echo "  Listen to each output and compare voice preservation and noise removal."
+      exit 0 ;;
+    *)
+      [[ -n "$FILE" ]] && { echo "Error: unexpected argument: $1"; exit 1; }
+      FILE="$1"; shift ;;
+  esac
+done
+
+[[ -z "$FILE" ]] && { echo "Usage: denoise-compare <file.wav>"; exit 1; }
+
+[[ ! -f "$FILE" ]] && { echo "Error: file not found: $FILE"; exit 1; }
+
+EXT_LOWER=$(echo "${FILE##*.}" | tr '[:upper:]' '[:lower:]')
+[[ "$EXT_LOWER" == "opus" ]] && {
+  echo "Error: Opus files are lossy — apply denoising to WAV or FLAC only."
+  exit 1
+}
+
+check_dep() {
+  local cmd="$1" hint="$2"
+  command -v "$cmd" &>/dev/null || { echo "Error: $cmd not found. $hint"; exit 1; }
+}
+
+check_dep ffmpeg "Install with: brew install ffmpeg"
+check_dep sox    "Install with: brew install sox"
+check_dep uvx    "Install with: brew install uv"
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+BASE="${FILE%.*}"
