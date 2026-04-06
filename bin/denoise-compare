@@ -131,3 +131,17 @@ else
   echo "  [skip] deep-filter failed. Try: uvx --from deepfilternet deep-filter --help"
 fi
 echo ""
+
+echo "── Summary ──────────────────────────────────────────────────────────────────"
+echo "  Input: $FILE"
+echo ""
+for label in "a_sox" "b_rnnoise" "c_deepfilter"; do
+  OUT="${BASE}_${label}.wav"
+  if [[ -f "$OUT" ]]; then
+    printf "  %-28s %s\n" "$OUT" "$(human_size "$(file_bytes "$OUT")")"
+  else
+    printf "  %-28s %s\n" "${BASE}_${label}.wav" "(skipped)"
+  fi
+done
+echo ""
+echo "Listen with: ffplay <file>"
