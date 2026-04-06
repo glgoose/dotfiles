@@ -140,20 +140,25 @@ for FILE in "${WAV_FILES[@]}"; do
   echo "  Transcribing $FILE..."
   FILE_START=$(date +%s)
 
-  # Output to a temp dir so we can pick only .srt and .txt
-  TMPDIR=$(mktemp -d)
-  uvx --from mlx-whisper mlx_whisper "$FILE" \
-    --model "$MLX_MODEL" \
-    --language "$LANG_CODE" \
-    --output-format all \
-    --output-name "$NAME" \
-    --output-dir "$TMPDIR" \
-    --condition-on-previous-text False \
-    --verbose False
+  if [[ "$ENGINE" == "whisper" ]]; then
+    # Output to a temp dir so we can pick only .srt and .txt
+    TMPDIR=$(mktemp -d)
+    uvx --from mlx-whisper mlx_whisper "$FILE" \
+      --model "$MLX_MODEL" \
+      --language "$LANG_CODE" \
+      --output-format all \
+      --output-name "$NAME" \
+      --output-dir "$TMPDIR" \
+      --condition-on-previous-text False \
+      --verbose False
 
-  mv "$TMPDIR/${NAME}.srt" "./${NAME}.srt"
-  mv "$TMPDIR/${NAME}.txt" "./${NAME}.txt"
-  rm -rf "$TMPDIR"
+    mv "$TMPDIR/${NAME}.srt" "./${NAME}.srt"
+    mv "$TMPDIR/${NAME}.txt" "./${NAME}.txt"
+    rm -rf "$TMPDIR"
+  else
+    # parakeet-mlx writes srt/txt to cwd directly
+    uvx parakeet-mlx "$FILE" --output-format all
+  fi
 
   FILE_END=$(date +%s)
   echo "  Done in $((FILE_END - FILE_START))s → ${NAME}.srt, ${NAME}.txt"
@@ -191,7 +196,8 @@ echo "── Summary ───────────────────�
 printf "  %-18s %s\n" "Files processed:" "$FILES_PROCESSED"
 printf "  %-18s %s\n" "Steps run:"       "$STEPS"
 printf "  %-18s %s\n" "Language:"        "$LANG_CODE"
-printf "  %-18s %s\n" "Model:"           "$MLX_MODEL"
+printf "  %-18s %s\n" "Engine:"          "$ENGINE"
+[[ "$ENGINE" == "whisper" ]] && printf "  %-18s %s\n" "Model:" "$MLX_MODEL"
 printf "  %-18s %s\n" "Total audio:"     "$(format_duration "$TOTAL_AUDIO")"
 printf "  %-18s %s\n" "Speed:"           "$(awk -v a="$TOTAL_AUDIO" -v p="$TOTAL" 'BEGIN{printf "x%.1f", a/p}')"
 printf "  %-18s %s\n" "Total time:"      "$(awk -v t="$TOTAL" 'BEGIN{printf "%.1fm (%ds)", t/60, t}')"
