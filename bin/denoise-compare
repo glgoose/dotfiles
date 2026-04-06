@@ -101,3 +101,33 @@ else
   echo "         Then rerun with: ffmpeg -af \"arnndn=m=/path/to/model.rnnn\" ..."
 fi
 echo ""
+
+echo "── C: DeepFilterNet (uvx deepfilternet) ─────────────────────────────────────"
+C_OUT="${BASE}_c_deepfilter.wav"
+C_START=$(date +%s)
+
+mkdir -p "$WORK/df"
+# deep-filter writes to output dir with same basename as input
+INPUT_BASENAME=$(basename "$FILE")
+
+if uvx --from deepfilternet deep-filter "$FILE" --output-dir "$WORK/df" 2>/dev/null; then
+  C_FILE="$WORK/df/$INPUT_BASENAME"
+  if [[ -f "$C_FILE" ]]; then
+    mv "$C_FILE" "$C_OUT"
+  else
+    # Fallback: find any WAV produced in the output dir
+    C_FILE=$(find "$WORK/df" -name "*.wav" | head -1)
+    [[ -n "$C_FILE" ]] && mv "$C_FILE" "$C_OUT"
+  fi
+
+  if [[ -f "$C_OUT" ]]; then
+    C_END=$(date +%s)
+    echo "  Done in $((C_END - C_START))s"
+    echo "  Output: $(human_size "$(file_bytes "$C_OUT")")   $C_OUT"
+  else
+    echo "  [skip] deep-filter ran but produced no output — check uvx/deepfilternet install."
+  fi
+else
+  echo "  [skip] deep-filter failed. Try: uvx --from deepfilternet deep-filter --help"
+fi
+echo ""
