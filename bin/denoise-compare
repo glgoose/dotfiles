@@ -65,8 +65,8 @@ A_START=$(date +%s)
 
 # Detect silences
 SILENCE_INFO=$(ffmpeg -i "$FILE" -af "silencedetect=noise=-30dB:d=1.5" -f null - 2>&1 || true)
-SIL_START=$(echo "$SILENCE_INFO" | grep -m1 'silence_start:' | grep -oE '[0-9]+\.[0-9]+' | tail -1)
-SIL_END=$(echo "$SILENCE_INFO"   | grep -m1 'silence_end:'   | grep -oE '[0-9]+\.[0-9]+' | head -1)
+SIL_START=$(echo "$SILENCE_INFO" | grep -m1 'silence_start:' | sed -n 's/.*silence_start: \([0-9.]*\).*/\1/p')
+SIL_END=$(echo "$SILENCE_INFO"   | grep -m1 'silence_end:'   | sed -n 's/.*silence_end: \([0-9.]*\).*/\1/p')
 
 if [[ -z "$SIL_START" || -z "$SIL_END" ]]; then
   echo "  [skip] No silence detected at -30dBFS — cannot build noise profile."
