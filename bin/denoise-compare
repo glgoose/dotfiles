@@ -14,7 +14,7 @@ while [[ $# -gt 0 ]]; do
       echo "  Runs three denoising approaches and outputs one WAV per approach:"
       echo "    <name>_a_sox.wav        SoX profile-based (silence → noiseprof → noisered)"
       echo "    <name>_b_rnnoise.wav    RNNoise neural network (ffmpeg arnndn)"
-      echo "    <name>_c_deepfilter.wav DeepFilterNet (uvx deepfilternet, uses Metal on M1)"
+      echo "    <name>_c_deepfilter.wav DeepFilterNet2 (uvx deepfilternet, uses Metal on M1)"
       echo ""
       echo "  Listen to each output and compare voice preservation and noise removal."
       exit 0 ;;
@@ -93,14 +93,16 @@ echo "── B: RNNoise (ffmpeg arnndn) ─────────────�
 B_OUT="${BASE}_b_rnnoise.wav"
 B_START=$(date +%s)
 
-if ffmpeg -y -i "$FILE" -af "arnndn" "$B_OUT" 2>/dev/null; then
+RNNOISE_MODEL="$HOME/.local/share/rnnoise/bd.rnnn"
+if [[ ! -f "$RNNOISE_MODEL" ]]; then
+  echo "  [skip] Model not found: $RNNOISE_MODEL"
+  echo "         Run: mkdir -p ~/.local/share/rnnoise && curl -L https://raw.githubusercontent.com/GregorR/rnnoise-models/master/bd.rnnn -o ~/.local/share/rnnoise/bd.rnnn"
+elif ffmpeg -y -i "$FILE" -af "arnndn=m=$RNNOISE_MODEL" "$B_OUT" 2>/dev/null; then
   B_END=$(date +%s)
   echo "  Done in $((B_END - B_START))s"
   echo "  Output: $(human_size "$(file_bytes "$B_OUT")")   $B_OUT"
 else
-  echo "  [skip] arnndn filter failed — your ffmpeg build may require a model file."
-  echo "         See: https://github.com/GregorR/rnnoise-models"
-  echo "         Then rerun with: ffmpeg -af \"arnndn=m=/path/to/model.rnnn\" ..."
+  echo "  [skip] arnndn filter failed."
 fi
 echo ""
 
@@ -112,7 +114,7 @@ mkdir -p "$WORK/df"
 # deep-filter writes to output dir with same basename as input
 INPUT_BASENAME=$(basename "$FILE")
 
-if uvx --from deepfilternet deep-filter "$FILE" -o "$WORK/df" 2>/dev/null; then
+if uvx --python 3.11 --with "torch==2.0.1" --with "torchaudio==2.0.2" --from deepfilternet deepFilter "$FILE" -o "$WORK/df" 2>/dev/null; then
   C_FILE="$WORK/df/$INPUT_BASENAME"
   if [[ -f "$C_FILE" ]]; then
     mv "$C_FILE" "$C_OUT"
@@ -130,7 +132,7 @@ if uvx --from deepfilternet deep-filter "$FILE" -o "$WORK/df" 2>/dev/null; then
     echo "  [skip] deep-filter ran but produced no output — check uvx/deepfilternet install."
   fi
 else
-  echo "  [skip] deep-filter failed. Try: uvx --from deepfilternet deep-filter --help"
+  echo "  [skip] deepFilter failed. Try: uvx --python 3.11 --with torch==2.0.1 --with torchaudio==2.0.2 --from deepfilternet deepFilter --help"
 fi
 echo ""
 
@@ -146,4 +148,3 @@ for label in "a_sox" "b_rnnoise" "c_deepfilter"; do
   fi
 done
 echo ""
-echo "Listen with: ffplay <file>"

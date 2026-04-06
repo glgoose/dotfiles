@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# denoise — reduce background noise in an audio file using FFT-based spectral denoising (afftdn)
+# Usage: denoise <file> [--noise-floor N] [--strength N]
+# Output: <name>_denoised.<ext> alongside the original
+set -euo pipefail
+
+NOISE_FLOOR=""   # empty = auto-detect from silences
+STRENGTH="5"     # nr parameter: dB of noise reduction (empirically tuned for Zoom H1 lecture halls)
+FILES=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --noise-floor|-n)
+      [[ $# -lt 2 ]] && { echo "Error: --noise-floor requires a value in dBFS (e.g. -40)"; exit 1; }
+      NOISE_FLOOR="$2"; shift 2 ;;
+    --strength|-s)
+      [[ $# -lt 2 ]] && { echo "Error: --strength requires a value (e.g. 5)"; exit 1; }
+      STRENGTH="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: denoise <file> [<file2> ...] [--noise-floor N] [--strength N]"
+      echo ""
+      echo "  Reduces background noise using FFT-based spectral denoising (afftdn)."
+      echo "  Output is saved as <name>_denoised.<ext> alongside the original."
+      echo "  Opus files are rejected — apply denoising to WAV or FLAC only."
+      echo ""
+      echo "  --noise-floor N   Noise floor in dBFS. Auto-detected from silences if omitted."
+      echo "                    Falls back to -40 if no silences are found."
+      echo "  --strength N      Noise reduction in dB (default: 5). Higher = more aggressive."
+      echo "                    2-4  very subtle     8-12  noticeable, may affect voice"
+      exit 0 ;;
+    *)
+      FILES+=("$1"); shift ;;
+  esac
+done
+
+[[ ${#FILES[@]} -eq 0 ]] && { echo "Usage: denoise <file> [<file2> ...] [--noise-floor N] [--strength N]"; exit 1; }
+
+file_bytes() { wc -c < "$1" | tr -d ' '; }
+human_size() {
+  awk -v b="$1" 'BEGIN {
+    if      (b >= 1073741824) printf "%.1f GB", b/1073741824
+    else if (b >= 1048576)    printf "%.1f MB", b/1048576
+    else if (b >= 1024)       printf "%.1f KB", b/1024
+    else                      printf "%d B",    b
+  }'
+}
+
+measure_noise_floor() {
+  local file="$1"
+  # Find first silence >= 1.5s at -30dBFS
+  local info sil_start sil_end sil_dur rms
+  info=$(ffmpeg -i "$file" -af "silencedetect=noise=-30dB:d=1.5" -f null - 2>&1 || true)
+  sil_start=$(echo "$info" | grep -m1 'silence_start:' | sed -n 's/.*silence_start: \([0-9.]*\).*/\1/p')
+  sil_end=$(echo "$info"   | grep -m1 'silence_end:'   | sed -n 's/.*silence_end: \([0-9.]*\).*/\1/p')
+
+  if [[ -z "$sil_start" || -z "$sil_end" ]]; then
+    echo ""
+    return
+  fi
+
+  sil_dur=$(awk -v s="$sil_start" -v e="$sil_end" 'BEGIN{printf "%.3f", e-s}')
+  local tmp
+  tmp=$(mktemp /tmp/denoise_sample_XXXXXX.wav)
+  ffmpeg -y -ss "$sil_start" -t "$sil_dur" -i "$file" "$tmp" 2>/dev/null
+  rms=$(ffmpeg -i "$tmp" -af "astats=metadata=1,ametadata=print:key=lavfi.astats.Overall.RMS_level" \
+    -f null - 2>&1 | grep RMS_level | grep -oE '\-[0-9]+\.[0-9]+' | head -1)
+  rm -f "$tmp"
+  echo "$rms"
+}
+
+for FILE in "${FILES[@]}"; do
+  [[ ! -f "$FILE" ]] && { echo "Error: file not found: $FILE"; exit 1; }
+
+  EXT="${FILE##*.}"
+  EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+
+  if [[ "$EXT_LOWER" == "opus" ]]; then
+    echo "Error: applying noise reduction to a lossy Opus file causes generation loss."
+    echo "       Use the original WAV or a FLAC instead. Skipping: $FILE"
+    continue
+  fi
+
+  BASE="${FILE%.*}"
+  OUTPUT="${BASE}_denoised.${EXT}"
+
+  # Determine noise floor
+  NF="$NOISE_FLOOR"
+  NF_SOURCE=""
+  if [[ -z "$NF" ]]; then
+    echo "Measuring noise floor from $FILE..."
+    NF=$(measure_noise_floor "$FILE")
+    if [[ -n "$NF" ]]; then
+      NF_SOURCE="auto-detected"
+    else
+      NF="-40"
+      NF_SOURCE="default (no silence found)"
+    fi
+  else
+    NF_SOURCE="manual"
+  fi
+
+  echo "Input:       $FILE"
+  echo "Output:      $OUTPUT"
+  echo "Noise floor: ${NF} dBFS (${NF_SOURCE})"
+  echo "Strength:    ${STRENGTH} dB"
+  echo ""
+  echo "Processing..."
+
+  START=$(date +%s)
+
+  ffmpeg -y -i "$FILE" \
+    -af "afftdn=nf=${NF}:nr=${STRENGTH}" \
+    "$OUTPUT" 2>/dev/null
+
+  END=$(date +%s)
+
+  SIZE_IN=$(file_bytes "$FILE")
+  SIZE_OUT=$(file_bytes "$OUTPUT")
+
+  echo "Done in $((END - START))s"
+  echo ""
+  echo "  Original:  $(human_size "$SIZE_IN")   $FILE"
+  echo "  Denoised:  $(human_size "$SIZE_OUT")   $OUTPUT"
+  echo ""
+done
