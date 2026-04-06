@@ -41,7 +41,7 @@ check_dep() {
 
 check_dep ffmpeg "Install with: brew install ffmpeg"
 check_dep sox    "Install with: brew install sox"
-check_dep uvx    "Install with: brew install uv"
+check_dep uv     "Install with: brew install uv"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
