@@ -78,12 +78,14 @@ else
   ffmpeg -y -ss "$SIL_START" -t "$SIL_DUR" -i "$FILE" \
     "$WORK/noise_sample.wav" 2>/dev/null
 
-  sox "$WORK/noise_sample.wav" -n noiseprof "$WORK/noise.prof"
-  sox "$FILE" "$A_OUT" noisered "$WORK/noise.prof" 0.21
-
-  A_END=$(date +%s)
-  echo "  Done in $((A_END - A_START))s"
-  echo "  Output: $(human_size "$(file_bytes "$A_OUT")")   $A_OUT"
+  if sox "$WORK/noise_sample.wav" -n noiseprof "$WORK/noise.prof" && \
+     sox "$FILE" "$A_OUT" noisered "$WORK/noise.prof" 0.21; then
+    A_END=$(date +%s)
+    echo "  Done in $((A_END - A_START))s"
+    echo "  Output: $(human_size "$(file_bytes "$A_OUT")")   $A_OUT"
+  else
+    echo "  [skip] SoX noise reduction failed."
+  fi
 fi
 echo ""
 
@@ -110,7 +112,7 @@ mkdir -p "$WORK/df"
 # deep-filter writes to output dir with same basename as input
 INPUT_BASENAME=$(basename "$FILE")
 
-if uvx --from deepfilternet deep-filter "$FILE" --output-dir "$WORK/df" 2>/dev/null; then
+if uvx --from deepfilternet deep-filter "$FILE" -o "$WORK/df" 2>/dev/null; then
   C_FILE="$WORK/df/$INPUT_BASENAME"
   if [[ -f "$C_FILE" ]]; then
     mv "$C_FILE" "$C_OUT"
