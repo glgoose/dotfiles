@@ -86,3 +86,18 @@ else
   echo "  Output: $(human_size "$(file_bytes "$A_OUT")")   $A_OUT"
 fi
 echo ""
+
+echo "── B: RNNoise (ffmpeg arnndn) ───────────────────────────────────────────────"
+B_OUT="${BASE}_b_rnnoise.wav"
+B_START=$(date +%s)
+
+if ffmpeg -y -i "$FILE" -af "arnndn" "$B_OUT" 2>/dev/null; then
+  B_END=$(date +%s)
+  echo "  Done in $((B_END - B_START))s"
+  echo "  Output: $(human_size "$(file_bytes "$B_OUT")")   $B_OUT"
+else
+  echo "  [skip] arnndn filter failed — your ffmpeg build may require a model file."
+  echo "         See: https://github.com/GregorR/rnnoise-models"
+  echo "         Then rerun with: ffmpeg -af \"arnndn=m=/path/to/model.rnnn\" ..."
+fi
+echo ""
