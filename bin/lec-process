@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# lec-process — transcribe lecture WAV files, optionally renaming and correcting
-# Usage: lec-process [--rename|-r] [--lang|-l LANGCODE] [--correct|-c] [--context "string"]
+# lec-process — transcribe lecture WAV files, optionally renaming, correcting, diarizing
+# Usage: lec-process [-r|--rename] [-e|--engine whisper|parakeet] [-l|--lang LANGCODE] [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]
 # Run from inside the lecture folder (e.g. "260402 feminism")
 set -euo pipefail
 
@@ -10,7 +10,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RENAME=false
 LANG_CODE="en"
 CORRECT=false
-CONTEXT_STR=""
+DIARIZE=false
+PROVIDER="openai"
+LANG_SET=false
+ENGINE="whisper"
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -20,30 +23,54 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --lang|-l)
-      [[ $# -lt 2 ]] && { echo "Error: --lang requires a language code (e.g. --lang nl)"; exit 1; }
+      [[ $# -lt 2 ]] && { echo "Error: --lang requires a language code (e.g. --lang nl, --lang fr, --lang de)"; exit 1; }
       LANG_CODE="$2"
+      LANG_SET=true
       shift 2
       ;;
     --correct|-c)
       CORRECT=true
       shift
       ;;
-    --context)
-      [[ $# -lt 2 ]] && { echo "Error: --context requires a string argument"; exit 1; }
-      CONTEXT_STR="$2"
+    --diarize|-d)
+      DIARIZE=true
+      shift
+      ;;
+    --provider|-p)
+      [[ $# -lt 2 ]] && { echo "Error: --provider requires openai or anthropic"; exit 1; }
+      PROVIDER="$2"
       shift 2
+      ;;
+    --engine|-e)
+      [[ $# -lt 2 ]] && { echo "Error: --engine requires whisper or parakeet"; exit 1; }
+      ENGINE="$2"
+      [[ "$ENGINE" != "whisper" && "$ENGINE" != "parakeet" ]] && {
+        echo "Error: --engine must be 'whisper' or 'parakeet'"; exit 1; }
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: lec-process [-r|--rename] [-e|--engine whisper|parakeet] [-l|--lang LANGCODE] [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]"
+      echo "       LANGCODE examples: nl (Dutch), fr (French), de (German), es (Spanish), it (Italian), zh (Chinese), ko (Korean), ja (Japanese)"
+      exit 0
       ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: lec-process [--rename|-r] [--lang|-l LANGCODE] [--correct|-c] [--context \"string\"]"
+      echo "Usage: lec-process [-r|--rename] [-e|--engine whisper|parakeet] [-l|--lang LANGCODE] [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]"
+      echo "       LANGCODE examples: nl (Dutch), fr (French), de (German), es (Spanish), it (Italian), zh (Chinese), ko (Korean), ja (Japanese)"
       exit 1
       ;;
   esac
 done
 
+# Parakeet is English-only
+if [[ "$ENGINE" == "parakeet" && "$LANG_SET" == true ]]; then
+  echo "Error: --engine parakeet is English-only; --lang is not supported."
+  exit 1
+fi
+
 # ── Dependency checks ──────────────────────────────────────────────────────────
-if ! command -v mlx_whisper &>/dev/null; then
-  echo "Error: mlx_whisper not found. Install with: uv tool install mlx-whisper"
+if ! command -v uv &>/dev/null; then
+  echo "Error: uv not found. Install with: brew install uv"
   exit 1
 fi
 
@@ -60,11 +87,11 @@ fi
 
 SCRIPT_START=$(date +%s)
 
-# ── Step 1: Rename (optional) ─────────────────────────────────────────────────
+# ── Rename (optional) ─────────────────────────────────────────────────
 if [[ "$RENAME" == true ]]; then
   FOLDER_NAME="$(basename "$PWD")"
   echo ""
-  echo "── Step 1: Rename ──────────────────────────────────────────────────────────"
+  echo "── Rename ──────────────────────────────────────────────────────────"
 
   INDEX=1
   RENAMED=()
@@ -87,23 +114,35 @@ if [[ "$RENAME" == true ]]; then
   done < <(printf '%s\n' "${RENAMED[@]}" | sort)
 fi
 
-# ── Step 2: Transcribe ────────────────────────────────────────────────────────
+# ── Transcribe ────────────────────────────────────────────────────────
 echo ""
-echo "── Step 2: Transcribe ──────────────────────────────────────────────────────"
+echo "── Transcribe ──────────────────────────────────────────────────────"
 
 # 4-bit quantized: ~463 MB on disk, much lower memory than the full model (~1.6 GB),
 # negligible accuracy loss. Better fit for 8 GB unified memory.
 MLX_MODEL="mlx-community/whisper-large-v3-turbo-4bit"
 
+format_duration() {
+  awk -v s="$1" 'BEGIN{
+    h=int(s/3600); m=int((s%3600)/60)
+    if (h>0) printf "%dh%02dm", h, m
+    else     printf "%dm", m
+  }'
+}
+
 FILES_PROCESSED=0
+TOTAL_AUDIO=0
+
 for FILE in "${WAV_FILES[@]}"; do
-  NAME="${FILE%.wav}"
+  DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$FILE" 2>/dev/null | awk '{printf "%d", $1}')
+  TOTAL_AUDIO=$((TOTAL_AUDIO + DURATION))
+  NAME="${FILE%.[Ww][Aa][Vv]}"
   echo "  Transcribing $FILE..."
   FILE_START=$(date +%s)
 
   # Output to a temp dir so we can pick only .srt and .txt
   TMPDIR=$(mktemp -d)
-  mlx_whisper "$FILE" \
+  uvx --from mlx-whisper mlx_whisper "$FILE" \
     --model "$MLX_MODEL" \
     --language "$LANG_CODE" \
     --output-format all \
@@ -121,13 +160,21 @@ for FILE in "${WAV_FILES[@]}"; do
   FILES_PROCESSED=$((FILES_PROCESSED + 1))
 done
 
-# ── Step 3: Correct (optional) ────────────────────────────────────────────────
+# ── Correct (optional) ────────────────────────────────────────────────
 if [[ "$CORRECT" == true ]]; then
   echo ""
-  echo "── Step 3: Correct ─────────────────────────────────────────────────────────"
-  CORRECT_ARGS=()
-  [[ -n "$CONTEXT_STR" ]] && CORRECT_ARGS+=(--context "$CONTEXT_STR")
-  "$SCRIPT_DIR/lec-correct" "${CORRECT_ARGS[@]}"
+  echo "── Correct ─────────────────────────────────────────────────────────"
+  "$SCRIPT_DIR/lec-correct" --provider "$PROVIDER"
+fi
+
+# ── Diarize (optional) ────────────────────────────────────────────────
+if [[ "$DIARIZE" == true ]]; then
+  echo ""
+  echo "── Diarize ─────────────────────────────────────────────────────────"
+  for FILE in "${WAV_FILES[@]}"; do
+    NAME="${FILE%.[Ww][Aa][Vv]}"
+    "$SCRIPT_DIR/lec-diarize" "$FILE" "${NAME}.srt"
+  done
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -137,10 +184,14 @@ TOTAL=$((SCRIPT_END - SCRIPT_START))
 STEPS="transcribe"
 [[ "$RENAME"   == true ]] && STEPS="rename, $STEPS"
 [[ "$CORRECT"  == true ]] && STEPS="$STEPS, correct"
+[[ "$DIARIZE"  == true ]] && STEPS="$STEPS, diarize"
 
 echo ""
 echo "── Summary ─────────────────────────────────────────────────────────────────"
 printf "  %-18s %s\n" "Files processed:" "$FILES_PROCESSED"
 printf "  %-18s %s\n" "Steps run:"       "$STEPS"
-printf "  %-18s %s\n" "Language:"        "$LANG_CODE  (model: $MLX_MODEL)"
-printf "  %-18s %s\n" "Total time:"      "${TOTAL}s"
+printf "  %-18s %s\n" "Language:"        "$LANG_CODE"
+printf "  %-18s %s\n" "Model:"           "$MLX_MODEL"
+printf "  %-18s %s\n" "Total audio:"     "$(format_duration "$TOTAL_AUDIO")"
+printf "  %-18s %s\n" "Speed:"           "$(awk -v a="$TOTAL_AUDIO" -v p="$TOTAL" 'BEGIN{printf "x%.1f", a/p}')"
+printf "  %-18s %s\n" "Total time:"      "$(awk -v t="$TOTAL" 'BEGIN{printf "%.1fm (%ds)", t/60, t}')"
