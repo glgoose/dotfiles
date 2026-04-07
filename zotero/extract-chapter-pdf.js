@@ -75,9 +75,12 @@ if (existingPdfs.length > 0) {
 
 const bookPdfPath = await bookPdf.getFilePathAsync();
 
-// Check for page labels by scanning raw PDF bytes (in-process, no subprocess).
-// qpdf writes /PageLabels as plain text in the catalog object.
-const bytes = await IOUtils.read(bookPdfPath);
+// Check for page labels by scanning the tail of the PDF (in-process, no subprocess).
+// The PDF catalog (where /PageLabels lives) is always near the end of the file.
+// Reading 64 KB from the tail is sufficient and avoids loading the full PDF into memory.
+const stat = await IOUtils.stat(bookPdfPath);
+const tailSize = Math.min(stat.size, 65536);
+const bytes = await IOUtils.read(bookPdfPath, { offset: stat.size - tailSize, maxBytes: tailSize });
 const pdfText = new TextDecoder('latin1').decode(bytes);
 if (!pdfText.includes('/PageLabels')) {
     showToast('Book PDF has no page labels — add them with qpdf first');
