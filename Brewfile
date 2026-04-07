@@ -5,6 +5,9 @@ brew "stow"
 brew "fzf"
 brew "jq"
 
+# Python tooling
+brew "uv"
+
 # Git
 brew "git-delta"
 
