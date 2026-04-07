@@ -12,9 +12,9 @@ const QPDF       = '/opt/homebrew/bin/qpdf';  // REPLACE with actual path from `
 
 function showToast(msg, headline = 'Extract Chapter PDF') {
     const pw = new Zotero.ProgressWindow({ closeOnClick: true });
+    pw.show();
     pw.changeHeadline(headline);
     pw.addDescription(msg);
-    pw.show();
     pw.startCloseTimer(3000);
 }
 
