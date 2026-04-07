@@ -1,0 +1,32 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["pikepdf"]
+# ///
+
+import sys
+import pikepdf
+
+def error(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+if len(sys.argv) != 4:
+    error("Usage: pdflabels START_LABEL END_LABEL file.pdf")
+
+start_label = sys.argv[1]
+end_label   = sys.argv[2]
+pdf_file    = sys.argv[3]
+
+try:
+    with pikepdf.open(pdf_file) as pdf:
+        labels = {page.label: (i + 1) for i, page in enumerate(pdf.pages)}
+except Exception as e:
+    error(str(e))
+
+if start_label not in labels:
+    error(f"Label '{start_label}' not found in PDF")
+if end_label not in labels:
+    error(f"Label '{end_label}' not found in PDF")
+
+print(f"{labels[start_label]} {labels[end_label]}")
