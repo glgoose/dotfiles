@@ -104,7 +104,8 @@ const pEnd   = (await subprocess(LABEL2PAGE, [end,   bookPdfPath])).trim();
 const physRange = `${pStart}-${pEnd}`;
 
 // Extract pages (cutpdf prints "Created: /path/to/out.pdf" to stdout)
-const stdout = await subprocess(CUTPDF, [physRange, bookPdfPath]);
+// Note: cutpdf arg order is: <range> -l <file>
+const stdout = await subprocess(CUTPDF, [physRange, '-l', bookPdfPath]);
 const outPath = stdout.trim().replace(/^Created:\s*/, '');
 ```
 
@@ -130,6 +131,8 @@ The `fileBaseName` from `getFileBaseNameFromItem` follows the user's Zotero rena
 
 ```js
 if (AUTO_OPEN) {
+    // Zotero.Reader.open() is widely used in community scripts but not formally documented.
+    // Verify against source at chrome/content/zotero/xpcom/reader.js if it fails.
     await Zotero.Reader.open(newAttachment.id);
 }
 showToast(`Extracted pp. ${start}–${end} ✓`);
@@ -152,22 +155,31 @@ function showToast(msg, headline = 'Extract Chapter PDF') {
 
 ### 5.1 `cutpdf` patches
 
-1. **En-dash / `pp.` normalization** in the range argument (strip `pp.`/`p.` prefix, replace en-dash with hyphen).
-2. **Single-page label mode fix:** if `LEND` is empty after `IFS='-' read`, set `LEND=$LSTART`.
-3. **Output filename** uses the normalized range, not the raw user-supplied string.
-4. **`label2page` path** becomes a sibling lookup: `$(dirname "$0")/label2page` (falls back to PATH).
+1. **Shebang / strict mode:** add `set -euo pipefail` (currently only `set -e`), per dotfiles convention.
+2. **En-dash / `pp.` normalization** in the range argument (strip `pp.`/`p.` prefix, replace en-dash with hyphen).
+3. **Single-page label mode fix:** if `LEND` is empty after `IFS='-' read`, set `LEND=$LSTART`.
+4. **Output filename** uses the normalized range, not the raw user-supplied string.
+5. **`label2page` path** becomes a sibling lookup: `$(dirname "$0")/label2page` (falls back to PATH).
 
 ### 5.2 `label2page` changes
 
-1. **Shebang** → `#!/usr/bin/env -S uv run --script` with PEP 723 inline metadata declaring `pikepdf` dep.
+1. **Shebang** → PEP 723 format:
+   ```python
+   #!/usr/bin/env -S uv run --script
+   # /// script
+   # requires-python = ">=3.9"
+   # dependencies = ["pikepdf"]
+   # ///
+   ```
+   Per dotfiles convention (`uv` must be present; no `pip install` or `uv tool install` needed).
 2. **Error message** normalized to English: `f"Label '{label}' not found in PDF"`.
 
 ### 5.3 `haslabels` changes
 
-1. **Shebang** → PEP 723 / uv (same as label2page).
-2. **stdout output**: print `"true"` or `"false"` to stdout (always exit 0) instead of relying on exit codes. The snippet uses `subprocess()` which captures stdout but not exit codes.
-   - `true` → PDF has `/PageLabels`
-   - `false` → PDF lacks `/PageLabels`
+1. **Shebang** → PEP 723 / uv (same format as label2page).
+2. **stdout output**: print `"true"` or `"false"` to stdout (always exit 0) instead of relying on exit codes. `Zotero.Utilities.Internal.subprocess()` captures stdout but not exit codes.
+   - `"true"` → PDF has `/PageLabels`
+   - `"false"` → PDF lacks `/PageLabels`
    - Error → print to stderr, exit 1 (snippet wraps in try/catch)
 
 ---
