@@ -1,0 +1,129 @@
+// Extract chapter PDF — Actions & Tags snippet for Zotero 8
+// Spec: docs/superpowers/specs/2026-04-07-zotero-chapter-extractor-design.md
+//
+// Setup: register in Actions & Tags as "Extract chapter PDF"
+//   Trigger: Item context menu  |  Operation: Custom script
+
+const AUTO_OPEN  = true;   // set false to skip auto-opening extracted PDF
+const PDFLABELS  = '/Users/glenn/dotfiles/bin/pdflabels';
+const QPDF       = '/opt/homebrew/bin/qpdf';  // REPLACE with actual path from `which qpdf`
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+function showToast(msg, headline = 'Extract Chapter PDF') {
+    const pw = new Zotero.ProgressWindow({ closeOnClick: true });
+    pw.changeHeadline(headline);
+    pw.addDescription(msg);
+    pw.show();
+    pw.startCloseTimer(3000);
+}
+
+function parsePages(raw) {
+    let s = raw.trim();
+    s = s.replace(/^pages?\.*\s*/i, '').replace(/^pp?\.\s*/i, '');
+    s = s.replace(/[\u2013\u2014]/g, '-');   // en-dash, em-dash → hyphen
+    s = s.replace(/\s*-\s*/, '-');
+    if (/^\w+$/.test(s))       return { start: s, end: s };   // single page
+    if (/^\w+-\w+$/.test(s)) {
+        const [start, end] = s.split('-');
+        return { start, end };
+    }
+    return null;
+}
+
+const subprocess = Zotero.Utilities.Internal.subprocess.bind(Zotero.Utilities.Internal);
+
+// ── main ─────────────────────────────────────────────────────────────────────
+
+if (item.itemType !== 'bookSection') {
+    showToast('Extract chapter PDF only works on book section items');
+    return;
+}
+
+const rawPages = item.getField('pages').trim();
+if (!rawPages) {
+    showToast('Pages field is empty — cannot extract');
+    return;
+}
+
+const parsed = parsePages(rawPages);
+if (!parsed) {
+    showToast(`Could not parse Pages field: ${rawPages}`);
+    return;
+}
+const { start, end } = parsed;
+
+const parent = Zotero.Items.get(item.parentItemID);
+if (!parent) {
+    showToast('This section has no parent book item');
+    return;
+}
+
+const bookPdf = await parent.getBestAttachment();
+if (!bookPdf || bookPdf.attachmentContentType !== 'application/pdf') {
+    showToast('Parent book has no PDF attachment');
+    return;
+}
+
+const existingPdfs = item.getAttachments()
+    .map(id => Zotero.Items.get(id))
+    .filter(a => a && a.attachmentContentType === 'application/pdf');
+if (existingPdfs.length > 0) {
+    showToast('A PDF is already attached to this section — delete it first to re-extract');
+    return;
+}
+
+const bookPdfPath = await bookPdf.getFilePathAsync();
+
+// Check for page labels by scanning raw PDF bytes (in-process, no subprocess).
+// qpdf writes /PageLabels as plain text in the catalog object.
+const bytes = await IOUtils.read(bookPdfPath);
+const pdfText = new TextDecoder('latin1').decode(bytes);
+if (!pdfText.includes('/PageLabels')) {
+    showToast('Book PDF has no page labels — add them with qpdf first');
+    return;
+}
+
+// Resolve both labels to physical page numbers in one Python invocation
+let physStart, physEnd;
+try {
+    const out = await subprocess(PDFLABELS, [start, end, bookPdfPath]);
+    [physStart, physEnd] = out.trim().split(' ');
+} catch (e) {
+    showToast(e.message || `Could not resolve page labels '${start}'–'${end}'`);
+    return;
+}
+
+// Compute output path beside source PDF
+const outPath = bookPdfPath.replace(/\.pdf$/i, `_${start}-${end}.pdf`);
+
+// Extract pages with qpdf
+try {
+    await subprocess(QPDF, [
+        bookPdfPath,
+        '--pages', bookPdfPath, `${physStart}-${physEnd}`,
+        '--', outPath
+    ]);
+} catch (e) {
+    showToast(`qpdf failed: ${e.message}`);
+    return;
+}
+
+// Import into Zotero with parent-metadata filename
+const fileBaseName = Zotero.Attachments.getFileBaseNameFromItem(parent);
+const newAttachment = await Zotero.Attachments.importFromFile({
+    file: outPath,
+    parentItemID: item.id,
+    contentType: 'application/pdf',
+    fileBaseName: fileBaseName,
+});
+
+// Clean up temp file
+try { await IOUtils.remove(outPath); } catch (_) {}
+
+if (AUTO_OPEN) {
+    // Widely used in community scripts; if it fails check chrome/content/zotero/xpcom/reader.js
+    await Zotero.Reader.open(newAttachment.id);
+}
+
+showToast(`Extracted pp. ${start}–${end} ✓`);
