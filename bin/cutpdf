@@ -15,7 +15,7 @@ POSITIONAL=()
 for arg in "$@"; do
   case "$arg" in
     -l|--label) LABEL_MODE=1 ;;
-    *.pdf)      PDF_FILE="$arg" ;;
+    *.[Pp][Dd][Ff]) PDF_FILE="$arg" ;;
     *)          POSITIONAL+=("$arg") ;;
   esac
 done
@@ -44,7 +44,8 @@ expand_range() {
   fi
 }
 
-PDFLABELS_BIN="$(dirname "$0")/pdflabels"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+PDFLABELS_BIN="$SCRIPT_DIR/pdflabels"
 if ! [ -x "$PDFLABELS_BIN" ]; then
   PDFLABELS_BIN="pdflabels"
 fi
