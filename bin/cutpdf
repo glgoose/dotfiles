@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Usage: cutpdf RANGE [-l|--label] file.pdf
+# Examples:
+#   cutpdf 5-7 file.pdf           # extract physical pages 5 through 7
+#   cutpdf -7 file.pdf            # extract from page 1 to 7
+#   cutpdf 5- file.pdf            # extract from page 5 to last
+#   cutpdf 20-23 -l file.pdf      # extract logical pages 20 to 23 (via pdflabels)
+#   cutpdf "pp. 20-23" -l file.pdf  # strips 'pp.' prefix automatically
+
+set -euo pipefail
+
+LABEL_MODE=0
+POSITIONAL=()
+
+for arg in "$@"; do
+  case "$arg" in
+    -l|--label) LABEL_MODE=1 ;;
+    *.pdf)      PDF_FILE="$arg" ;;
+    *)          POSITIONAL+=("$arg") ;;
+  esac
+done
+
+if [ ${#POSITIONAL[@]} -eq 0 ] || [ -z "${PDF_FILE:-}" ]; then
+  echo "Usage: cutpdf RANGE [-l|--label] file.pdf" >&2
+  exit 1
+fi
+
+# Normalize range: strip pp./p./pages? prefix, replace en/em-dash with hyphen
+RANGE=$(echo "${POSITIONAL[0]}" | sed \
+  -e 's/^[Pp][Aa][Gg][Ee][Ss]*[.] *//; s/^[Pp][Pp][.] *//; s/^[Pp][.] *//' \
+  -e $'s/\xe2\x80\x93/-/g; s/\xe2\x80\x94/-/g' \
+  -e 's/ *- */-/')
+
+expand_range() {
+  local range="$1"
+  local total
+  total=$(qpdf --show-npages "$PDF_FILE")
+  if [[ "$range" =~ ^([0-9]+)-$ ]]; then
+    echo "${BASH_REMATCH[1]}-${total}"
+  elif [[ "$range" =~ ^-([0-9]+)$ ]]; then
+    echo "1-${BASH_REMATCH[1]}"
+  else
+    echo "$range"
+  fi
+}
+
+PDFLABELS_BIN="$(dirname "$0")/pdflabels"
+if ! [ -x "$PDFLABELS_BIN" ]; then
+  PDFLABELS_BIN="pdflabels"
+fi
+
+if [ $LABEL_MODE -eq 1 ]; then
+  IFS='-' read -r LSTART LEND <<< "$RANGE"
+  if [ -z "${LEND:-}" ]; then
+    LEND="$LSTART"
+  fi
+
+  PAGES=$("$PDFLABELS_BIN" "$LSTART" "$LEND" "$PDF_FILE")
+  PSTART="${PAGES%% *}"
+  PEND="${PAGES##* }"
+
+  if [ -z "$PSTART" ] || [ -z "$PEND" ]; then
+    echo "Error: Could not resolve label range." >&2
+    exit 1
+  fi
+  RANGE="${PSTART}-${PEND}"
+else
+  RANGE=$(expand_range "$RANGE")
+fi
+
+BASENAME="${PDF_FILE%.pdf}"
+OUT="${BASENAME}_${RANGE}.pdf"
+
+qpdf "$PDF_FILE" --pages "$PDF_FILE" "$RANGE" -- "$OUT"
+
+echo "Created: $OUT"
