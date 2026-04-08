@@ -86,9 +86,8 @@ if (!bookPdf || bookPdf.attachmentContentType !== 'application/pdf') {
 const existingPdfs = item.getAttachments()
     .map(id => Zotero.Items.get(id))
     .filter(a => a && a.attachmentContentType === 'application/pdf');
-if (existingPdfs.length > 0) {
-    showToast('A PDF is already attached to this section — delete it first to re-extract');
-    return;
+for (const a of existingPdfs) {
+    await a.eraseTx();
 }
 
 const bookPdfPath = await bookPdf.getFilePathAsync();
