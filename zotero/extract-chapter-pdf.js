@@ -126,7 +126,7 @@ try {
 }
 
 // Import into Zotero with parent-metadata filename
-const fileBaseName = Zotero.Attachments.getFileBaseNameFromItem(parent);
+const fileBaseName = Zotero.Attachments.getFileBaseNameFromItem(item);
 const newAttachment = await Zotero.Attachments.importFromFile({
     file: outPath,
     parentItemID: item.id,
