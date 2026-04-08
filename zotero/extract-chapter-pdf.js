@@ -98,13 +98,9 @@ const bookPdfPath = await bookPdf.getFilePathAsync();
 let physStart, physEnd;
 {
     const out = await subprocess(UV, ['run', '--script', PDFLABELS, start, end, bookPdfPath]);
-    Zotero.debug(`extract-chapter-pdf: pdflabels stdout: "${out}"`);
-    Zotero.logError(`extract-chapter-pdf: pdflabels stdout: "${out}"`);
     const parts = out.trim().split(' ');
     if (parts.length !== 2 || !parts[0] || !parts[1]) {
-        const msg = `pdflabels failed — stdout: "${out.trim()}" (check error console for details)`;
-        Zotero.logError(msg);
-        showToast(msg);
+        showToast(`Could not resolve page labels '${start}'–'${end}'`);
         return;
     }
     [physStart, physEnd] = parts;
@@ -114,14 +110,10 @@ let physStart, physEnd;
 const outPath = bookPdfPath.replace(/\.pdf$/i, `_${start}-${end}.pdf`);
 
 // Extract pages with qpdf
-const qpdfArgs = [bookPdfPath, '--pages', bookPdfPath, `${physStart}-${physEnd}`, '--', outPath];
-Zotero.debug(`extract-chapter-pdf: running qpdf ${qpdfArgs.join(' ')}`);
 try {
-    await exec(QPDF, qpdfArgs);
+    await exec(QPDF, [bookPdfPath, '--pages', bookPdfPath, `${physStart}-${physEnd}`, '--', outPath]);
 } catch (e) {
-    const msg = `qpdf failed (pp. ${physStart}–${physEnd}): ${e.message || String(e)}`;
-    Zotero.logError(msg);
-    showToast(msg);
+    showToast(`qpdf failed: ${e.message || String(e)}`);
     return;
 }
 
