@@ -26,6 +26,10 @@ try:
 except Exception as e:
     error(str(e))
 
+# When a PDF has no /PageLabels, pikepdf returns '' for every page label
+if all(label == '' for label in labels):
+    error("PDF has no page labels — add them with qpdf first")
+
 if start_label not in labels:
     error(f"Label '{start_label}' not found in PDF")
 if end_label not in labels:

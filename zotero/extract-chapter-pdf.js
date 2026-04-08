@@ -91,19 +91,8 @@ if (existingPdfs.length > 0) {
 
 const bookPdfPath = await bookPdf.getFilePathAsync();
 
-// Check for page labels by scanning the tail of the PDF (in-process, no subprocess).
-// The PDF catalog (where /PageLabels lives) is always near the end of the file.
-// Reading 64 KB from the tail is sufficient and avoids loading the full PDF into memory.
-const stat = await IOUtils.stat(bookPdfPath);
-const tailSize = Math.min(stat.size, 65536);
-const bytes = await IOUtils.read(bookPdfPath, { offset: stat.size - tailSize, maxBytes: tailSize });
-const pdfText = new TextDecoder('latin1').decode(bytes);
-if (!pdfText.includes('/PageLabels')) {
-    showToast('Book PDF has no page labels — add them with qpdf first');
-    return;
-}
-
-// Resolve both labels to physical page numbers in one Python invocation
+// Resolve both labels to physical page numbers in one Python invocation.
+// pdflabels also detects missing page labels and errors with a clear message.
 let physStart, physEnd;
 try {
     const out = await subprocess(PDFLABELS, [start, end, bookPdfPath]);
