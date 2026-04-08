@@ -35,6 +35,8 @@ const subprocess = Zotero.Utilities.Internal.subprocess.bind(Zotero.Utilities.In
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
+if (!item) return;  // guard against null context (e.g. right-click in metadata panel)
+
 if (item.itemType !== 'bookSection') {
     showToast('Extract chapter PDF only works on book section items');
     return;
@@ -53,9 +55,23 @@ if (!parsed) {
 }
 const { start, end } = parsed;
 
-const parent = Zotero.Items.get(item.parentItemID);
+// Find the source book: first try Zotero parent item, then fall back to Related items.
+// In Zotero, book sections are often standalone items linked via Related, not nested children.
+let parent = item.parentItemID ? Zotero.Items.get(item.parentItemID) : null;
+
 if (!parent) {
-    showToast('This section has no parent book item');
+    const relatedKeys = item.relatedItems;  // array of item keys
+    for (const key of relatedKeys) {
+        const rel = Zotero.Items.getByLibraryAndKey(item.libraryID, key);
+        if (rel && rel.itemType === 'book') {
+            parent = rel;
+            break;
+        }
+    }
+}
+
+if (!parent) {
+    showToast('No book found — link the book as a parent or Related item');
     return;
 }
 
