@@ -5,8 +5,9 @@
 //   Trigger: Item context menu  |  Operation: Custom script
 
 const AUTO_OPEN  = true;   // set false to skip auto-opening extracted PDF
+const UV         = '/opt/homebrew/bin/uv';
 const PDFLABELS  = '/Users/glenn/dotfiles/bin/pdflabels';
-const QPDF       = '/opt/homebrew/bin/qpdf';  // REPLACE with actual path from `which qpdf`
+const QPDF       = '/opt/homebrew/bin/qpdf';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -95,26 +96,32 @@ const bookPdfPath = await bookPdf.getFilePathAsync();
 // Resolve both labels to physical page numbers in one Python invocation.
 // pdflabels also detects missing page labels and errors with a clear message.
 let physStart, physEnd;
-try {
-    const out = await subprocess(PDFLABELS, [start, end, bookPdfPath]);
-    [physStart, physEnd] = out.trim().split(' ');
-} catch (e) {
-    showToast(e.message || `Could not resolve page labels '${start}'–'${end}'`);
-    return;
+{
+    const out = await subprocess(UV, ['run', '--script', PDFLABELS, start, end, bookPdfPath]);
+    Zotero.debug(`extract-chapter-pdf: pdflabels stdout: "${out}"`);
+    Zotero.logError(`extract-chapter-pdf: pdflabels stdout: "${out}"`);
+    const parts = out.trim().split(' ');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        const msg = `pdflabels failed — stdout: "${out.trim()}" (check error console for details)`;
+        Zotero.logError(msg);
+        showToast(msg);
+        return;
+    }
+    [physStart, physEnd] = parts;
 }
 
 // Compute output path beside source PDF
 const outPath = bookPdfPath.replace(/\.pdf$/i, `_${start}-${end}.pdf`);
 
 // Extract pages with qpdf
+const qpdfArgs = [bookPdfPath, '--pages', bookPdfPath, `${physStart}-${physEnd}`, '--', outPath];
+Zotero.debug(`extract-chapter-pdf: running qpdf ${qpdfArgs.join(' ')}`);
 try {
-    await exec(QPDF, [
-        bookPdfPath,
-        '--pages', bookPdfPath, `${physStart}-${physEnd}`,
-        '--', outPath
-    ]);
+    await exec(QPDF, qpdfArgs);
 } catch (e) {
-    showToast(`qpdf failed: ${e.message}`);
+    const msg = `qpdf failed (pp. ${physStart}–${physEnd}): ${e.message || String(e)}`;
+    Zotero.logError(msg);
+    showToast(msg);
     return;
 }
 
