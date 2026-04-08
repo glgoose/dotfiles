@@ -32,6 +32,7 @@ function parsePages(raw) {
 }
 
 const subprocess = Zotero.Utilities.Internal.subprocess.bind(Zotero.Utilities.Internal);
+const exec       = Zotero.Utilities.Internal.exec.bind(Zotero.Utilities.Internal);
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
@@ -107,7 +108,7 @@ const outPath = bookPdfPath.replace(/\.pdf$/i, `_${start}-${end}.pdf`);
 
 // Extract pages with qpdf
 try {
-    await subprocess(QPDF, [
+    await exec(QPDF, [
         bookPdfPath,
         '--pages', bookPdfPath, `${physStart}-${physEnd}`,
         '--', outPath
