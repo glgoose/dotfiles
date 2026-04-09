@@ -62,10 +62,10 @@ if (!pdfPath) {
 
 // Get page count — take last non-empty line in case qpdf emits warnings first
 const countOut = await subprocess(QPDF, ['--show-npages', pdfPath]);
-console.log('[remove-first-page] --show-npages raw output:', JSON.stringify(countOut));
+Zotero.log('[remove-first-page] --show-npages raw output:', JSON.stringify(countOut));
 const countLine = countOut.trim().split('\n').filter(l => l.trim()).pop() || '';
 const pageCount = parseInt(countLine, 10);
-console.log('[remove-first-page] pageCount:', pageCount);
+Zotero.log('[remove-first-page] pageCount:', pageCount);
 if (!pageCount || pageCount <= 1) {
     showToast(pageCount === 1 ? 'PDF has only one page — cannot remove'
                               : `Could not read page count (got: ${countOut.trim()})`);
@@ -86,7 +86,7 @@ if (annotations.length === 0) {
     try {
         await runQpdf([pdfPath, '--pages', pdfPath, `2-${pageCount}`, '--', trimmedPath]);
     } catch (e) {
-        console.error('[remove-first-page] qpdf error:', e);
+        Zotero.log('[remove-first-page] qpdf error:', e);
         showToast(`qpdf failed: ${e.message || String(e)}`);
         return;
     }
@@ -134,7 +134,7 @@ console.log(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmed
 try {
     await runQpdf([exportPath, '--pages', exportPath, `2-${pageCount}`, '--', trimmedPath]);
 } catch (e) {
-    console.error('[remove-first-page] qpdf error (annotations path):', e);
+    Zotero.log('[remove-first-page] qpdf error (annotations path):', e);
     // Annotations are now only in exportPath — tell user so they can recover.
     showToast(`qpdf failed. Annotation backup at: ${exportPath}`);
     return;
