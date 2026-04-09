@@ -60,30 +60,33 @@ if (!pdfPath) {
     return;
 }
 
-// Get page count
+// Get page count — take last non-empty line in case qpdf emits warnings first
 const countOut = await subprocess(QPDF, ['--show-npages', pdfPath]);
-const pageCount = parseInt(countOut.trim(), 10);
-Zotero.debug(`[remove-first-page] ${pdfPath} has ${pageCount} pages`);
-if (pageCount <= 1) {
-    showToast('PDF has only one page — cannot remove');
+console.log('[remove-first-page] --show-npages raw output:', JSON.stringify(countOut));
+const countLine = countOut.trim().split('\n').filter(l => l.trim()).pop() || '';
+const pageCount = parseInt(countLine, 10);
+console.log('[remove-first-page] pageCount:', pageCount);
+if (!pageCount || pageCount <= 1) {
+    showToast(pageCount === 1 ? 'PDF has only one page — cannot remove'
+                              : `Could not read page count (got: ${countOut.trim()})`);
     return;
 }
 
 // ── annotation check ─────────────────────────────────────────────────────────
 
 const annotations = item.getAnnotations();
-Zotero.debug(`[remove-first-page] ${annotations.length} annotation(s) found`);
+console.log(`[remove-first-page] ${annotations.length} annotation(s) found`);
 
 // ── no-annotations path ───────────────────────────────────────────────────────
 
 if (annotations.length === 0) {
     const trimmedPath = pdfPath.replace(/\.pdf$/i, '_trimmed_tmp.pdf');
 
-    Zotero.debug(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmedPath}`);
+    console.log(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmedPath}`);
     try {
         await runQpdf([pdfPath, '--pages', pdfPath, `2-${pageCount}`, '--', trimmedPath]);
     } catch (e) {
-        Zotero.debug(`[remove-first-page] qpdf error: ${e}`);
+        console.error('[remove-first-page] qpdf error:', e);
         showToast(`qpdf failed: ${e.message || String(e)}`);
         return;
     }
@@ -110,28 +113,28 @@ if (annotations.length === 0) {
 // ── has-annotations path ──────────────────────────────────────────────────────
 
 const page1Annotations = annotations.filter(a => a.annotationPageIndex === 0);
-Zotero.debug(`[remove-first-page] ${page1Annotations.length} annotation(s) on page 1`);
+console.log(`[remove-first-page] ${page1Annotations.length} annotation(s) on page 1`);
 
 const exportPath = pdfPath.replace(/\.pdf$/i, '_export_tmp.pdf');
 const trimmedPath = pdfPath.replace(/\.pdf$/i, '_trimmed_tmp.pdf');
 
 // Embed all annotations into a temp PDF and clear them from Zotero DB.
 // transfer: true is critical — prevents duplicates when re-importing below.
-Zotero.debug(`[remove-first-page] exporting annotations to ${exportPath}`);
+console.log(`[remove-first-page] exporting annotations to ${exportPath}`);
 try {
     await Zotero.PDFWorker.export(item.id, exportPath, false, null, true);
 } catch (e) {
-    Zotero.debug(`[remove-first-page] PDFWorker.export error: ${e}`);
+    console.log(`[remove-first-page] PDFWorker.export error: ${e}`);
     showToast(`Failed to export annotations: ${e.message || String(e)}`);
     return;
 }
 
 // Remove first page from the annotation-embedded PDF.
-Zotero.debug(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmedPath}`);
+console.log(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmedPath}`);
 try {
     await runQpdf([exportPath, '--pages', exportPath, `2-${pageCount}`, '--', trimmedPath]);
 } catch (e) {
-    Zotero.debug(`[remove-first-page] qpdf error: ${e}`);
+    console.error('[remove-first-page] qpdf error (annotations path):', e);
     // Annotations are now only in exportPath — tell user so they can recover.
     showToast(`qpdf failed. Annotation backup at: ${exportPath}`);
     return;
@@ -151,7 +154,7 @@ const newAttachment = await Zotero.Attachments.importFromFile({
 });
 
 // Reimport annotations from the embedded PDF into Zotero DB.
-Zotero.debug(`[remove-first-page] reimporting annotations into item ${newAttachment.id}`);
+console.log(`[remove-first-page] reimporting annotations into item ${newAttachment.id}`);
 await Zotero.PDFWorker.import(newAttachment.id);
 
 try { await IOUtils.remove(trimmedPath); } catch (_) {}
