@@ -17,7 +17,8 @@ function showToast(msg, headline = 'Remove First Page') {
     pw.startCloseTimer(3000);
 }
 
-const exec = Zotero.Utilities.Internal.exec.bind(Zotero.Utilities.Internal);
+// subprocess: runs a process and returns stdout; does NOT reject on non-zero exit.
+// exec: rejects on any non-zero exit — do NOT use for qpdf (exit 3 = success+warnings).
 const subprocess = Zotero.Utilities.Internal.subprocess.bind(Zotero.Utilities.Internal);
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -49,6 +50,7 @@ if (!pdfPath) {
 // Get page count
 const countOut = await subprocess(QPDF, ['--show-npages', pdfPath]);
 const pageCount = parseInt(countOut.trim(), 10);
+Zotero.debug(`[remove-first-page] ${pdfPath} has ${pageCount} pages`);
 if (pageCount <= 1) {
     showToast('PDF has only one page — cannot remove');
     return;
@@ -57,15 +59,20 @@ if (pageCount <= 1) {
 // ── annotation check ─────────────────────────────────────────────────────────
 
 const annotations = item.getAnnotations();
+Zotero.debug(`[remove-first-page] ${annotations.length} annotation(s) found`);
 
 // ── no-annotations path ───────────────────────────────────────────────────────
 
 if (annotations.length === 0) {
     const trimmedPath = pdfPath.replace(/\.pdf$/i, '_trimmed_tmp.pdf');
 
+    // subprocess instead of exec: qpdf exits with code 3 on success+warnings,
+    // which exec() incorrectly treats as failure.
+    Zotero.debug(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmedPath}`);
     try {
-        await exec(QPDF, [pdfPath, '--pages', pdfPath, `2-${pageCount}`, '--', trimmedPath]);
+        await subprocess(QPDF, [pdfPath, '--pages', pdfPath, `2-${pageCount}`, '--', trimmedPath]);
     } catch (e) {
+        Zotero.debug(`[remove-first-page] qpdf error: ${e}`);
         showToast(`qpdf failed: ${e.message || String(e)}`);
         return;
     }
@@ -92,23 +99,29 @@ if (annotations.length === 0) {
 // ── has-annotations path ──────────────────────────────────────────────────────
 
 const page1Annotations = annotations.filter(a => a.annotationPageIndex === 0);
+Zotero.debug(`[remove-first-page] ${page1Annotations.length} annotation(s) on page 1`);
 
 const exportPath = pdfPath.replace(/\.pdf$/i, '_export_tmp.pdf');
 const trimmedPath = pdfPath.replace(/\.pdf$/i, '_trimmed_tmp.pdf');
 
 // Embed all annotations into a temp PDF and clear them from Zotero DB.
 // transfer: true is critical — prevents duplicates when re-importing below.
+Zotero.debug(`[remove-first-page] exporting annotations to ${exportPath}`);
 try {
     await Zotero.PDFWorker.export(item.id, exportPath, false, null, true);
 } catch (e) {
+    Zotero.debug(`[remove-first-page] PDFWorker.export error: ${e}`);
     showToast(`Failed to export annotations: ${e.message || String(e)}`);
     return;
 }
 
 // Remove first page from the annotation-embedded PDF.
+// subprocess instead of exec: qpdf exit code 3 = success with warnings.
+Zotero.debug(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmedPath}`);
 try {
-    await exec(QPDF, [exportPath, '--pages', exportPath, `2-${pageCount}`, '--', trimmedPath]);
+    await subprocess(QPDF, [exportPath, '--pages', exportPath, `2-${pageCount}`, '--', trimmedPath]);
 } catch (e) {
+    Zotero.debug(`[remove-first-page] qpdf error: ${e}`);
     // Annotations are now only in exportPath — tell user so they can recover.
     showToast(`qpdf failed. Annotation backup at: ${exportPath}`);
     return;
@@ -128,6 +141,7 @@ const newAttachment = await Zotero.Attachments.importFromFile({
 });
 
 // Reimport annotations from the embedded PDF into Zotero DB.
+Zotero.debug(`[remove-first-page] reimporting annotations into item ${newAttachment.id}`);
 await Zotero.PDFWorker.import(newAttachment.id);
 
 try { await IOUtils.remove(trimmedPath); } catch (_) {}
