@@ -75,18 +75,18 @@ if (!pageCount || pageCount <= 1) {
 // ── annotation check ─────────────────────────────────────────────────────────
 
 const annotations = item.getAnnotations();
-console.log(`[remove-first-page] ${annotations.length} annotation(s) found`);
+Zotero.log(`[remove-first-page] ${annotations.length} annotation(s) found`);
 
 // ── no-annotations path ───────────────────────────────────────────────────────
 
 if (annotations.length === 0) {
     const trimmedPath = pdfPath.replace(/\.pdf$/i, '_trimmed_tmp.pdf');
 
-    console.log(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmedPath}`);
+    Zotero.log(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmedPath}`);
     try {
         await runQpdf([pdfPath, '--pages', pdfPath, `2-${pageCount}`, '--', trimmedPath]);
     } catch (e) {
-        Zotero.log('[remove-first-page] qpdf error:', e);
+        Zotero.log(`[remove-first-page] qpdf error: ${e}`);
         showToast(`qpdf failed: ${e.message || String(e)}`);
         return;
     }
@@ -113,28 +113,28 @@ if (annotations.length === 0) {
 // ── has-annotations path ──────────────────────────────────────────────────────
 
 const page1Annotations = annotations.filter(a => a.annotationPageIndex === 0);
-console.log(`[remove-first-page] ${page1Annotations.length} annotation(s) on page 1`);
+Zotero.log(`[remove-first-page] ${page1Annotations.length} annotation(s) on page 1`);
 
 const exportPath = pdfPath.replace(/\.pdf$/i, '_export_tmp.pdf');
 const trimmedPath = pdfPath.replace(/\.pdf$/i, '_trimmed_tmp.pdf');
 
 // Embed all annotations into a temp PDF and clear them from Zotero DB.
 // transfer: true is critical — prevents duplicates when re-importing below.
-console.log(`[remove-first-page] exporting annotations to ${exportPath}`);
+Zotero.log(`[remove-first-page] exporting annotations to ${exportPath}`);
 try {
     await Zotero.PDFWorker.export(item.id, exportPath, false, null, true);
 } catch (e) {
-    console.log(`[remove-first-page] PDFWorker.export error: ${e}`);
+    Zotero.log(`[remove-first-page] PDFWorker.export error: ${e}`);
     showToast(`Failed to export annotations: ${e.message || String(e)}`);
     return;
 }
 
 // Remove first page from the annotation-embedded PDF.
-console.log(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmedPath}`);
+Zotero.log(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmedPath}`);
 try {
     await runQpdf([exportPath, '--pages', exportPath, `2-${pageCount}`, '--', trimmedPath]);
 } catch (e) {
-    Zotero.log('[remove-first-page] qpdf error (annotations path):', e);
+    Zotero.log(`[remove-first-page] qpdf error (annotations path): ${e}`);
     // Annotations are now only in exportPath — tell user so they can recover.
     showToast(`qpdf failed. Annotation backup at: ${exportPath}`);
     return;
@@ -154,7 +154,7 @@ const newAttachment = await Zotero.Attachments.importFromFile({
 });
 
 // Reimport annotations from the embedded PDF into Zotero DB.
-console.log(`[remove-first-page] reimporting annotations into item ${newAttachment.id}`);
+Zotero.log(`[remove-first-page] reimporting annotations into item ${newAttachment.id}`);
 await Zotero.PDFWorker.import(newAttachment.id);
 
 try { await IOUtils.remove(trimmedPath); } catch (_) {}
