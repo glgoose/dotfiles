@@ -24,9 +24,20 @@ const subprocess = Zotero.Utilities.Internal.subprocess.bind(Zotero.Utilities.In
 
 if (!item) return;
 
+// Allow triggering from a parent item if it has exactly one PDF attachment
 if (item.attachmentContentType !== 'application/pdf') {
-    showToast('This action only works on PDF attachments');
-    return;
+    const pdfAttachments = item.getAttachments()
+        .map(id => Zotero.Items.get(id))
+        .filter(a => a && a.attachmentContentType === 'application/pdf');
+    if (pdfAttachments.length === 0) {
+        showToast('No PDF attachment found');
+        return;
+    }
+    if (pdfAttachments.length > 1) {
+        showToast('Multiple PDFs attached — right-click the specific PDF to use this action');
+        return;
+    }
+    item = pdfAttachments[0];
 }
 
 const pdfPath = await item.getFilePathAsync();
@@ -53,7 +64,7 @@ if (annotations.length === 0) {
     const trimmedPath = pdfPath.replace(/\.pdf$/i, '_trimmed_tmp.pdf');
 
     try {
-        await exec(QPDF, [pdfPath, '--pages', pdfPath, '2-z', '--', trimmedPath]);
+        await exec(QPDF, [pdfPath, '--pages', pdfPath, `2-${pageCount}`, '--', trimmedPath]);
     } catch (e) {
         showToast(`qpdf failed: ${e.message || String(e)}`);
         return;
@@ -96,7 +107,7 @@ try {
 
 // Remove first page from the annotation-embedded PDF.
 try {
-    await exec(QPDF, [exportPath, '--pages', exportPath, '2-z', '--', trimmedPath]);
+    await exec(QPDF, [exportPath, '--pages', exportPath, `2-${pageCount}`, '--', trimmedPath]);
 } catch (e) {
     // Annotations are now only in exportPath — tell user so they can recover.
     showToast(`qpdf failed. Annotation backup at: ${exportPath}`);
