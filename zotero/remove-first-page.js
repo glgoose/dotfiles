@@ -17,19 +17,20 @@ function showToast(msg, headline = 'Remove First Page') {
     pw.startCloseTimer(3000);
 }
 
+const exec       = Zotero.Utilities.Internal.exec.bind(Zotero.Utilities.Internal);
 const subprocess = Zotero.Utilities.Internal.subprocess.bind(Zotero.Utilities.Internal);
 
-// qpdf-aware runner: waits for process to exit, treats exit 3 (success+warnings) as ok.
-// Cannot use exec() — it rejects on any non-zero exit including qpdf's exit 3.
-// Cannot use subprocess() — it only reads stdout without waiting for process exit.
+// exec() rejects on any non-zero exit, but qpdf uses exit code 3 for "success with warnings".
+// Catch that specific code and let it through; re-throw everything else.
 async function runQpdf(args) {
-    const proc = await Subprocess.call({ command: QPDF, arguments: args });
-    let str;
-    while (str = await proc.stdout.readString()) {}  // drain stdout (usually empty)
-    const exitCode = await proc.wait();
-    Zotero.debug(`[remove-first-page] qpdf exit code: ${exitCode}`);
-    if (exitCode !== 0 && exitCode !== 3) {
-        throw new Error(`qpdf exited with code ${exitCode}`);
+    try {
+        await exec(QPDF, args);
+    } catch (e) {
+        if ((e.message || '').includes('exit status 3')) {
+            Zotero.debug('[remove-first-page] qpdf exit 3 (success with warnings) — ok');
+            return;
+        }
+        throw e;
     }
 }
 
@@ -78,8 +79,6 @@ Zotero.debug(`[remove-first-page] ${annotations.length} annotation(s) found`);
 if (annotations.length === 0) {
     const trimmedPath = pdfPath.replace(/\.pdf$/i, '_trimmed_tmp.pdf');
 
-    // subprocess instead of exec: qpdf exits with code 3 on success+warnings,
-    // which exec() incorrectly treats as failure.
     Zotero.debug(`[remove-first-page] running qpdf: pages 2-${pageCount} -> ${trimmedPath}`);
     try {
         await runQpdf([pdfPath, '--pages', pdfPath, `2-${pageCount}`, '--', trimmedPath]);
