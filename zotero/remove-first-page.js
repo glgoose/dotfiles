@@ -77,3 +77,54 @@ if (annotations.length === 0) {
     showToast('First page removed ✓');
     return;
 }
+
+// ── has-annotations path ──────────────────────────────────────────────────────
+
+const page1Annotations = annotations.filter(a => a.annotationPageIndex === 0);
+
+const exportPath = pdfPath.replace(/\.pdf$/i, '_export_tmp.pdf');
+const trimmedPath = pdfPath.replace(/\.pdf$/i, '_trimmed_tmp.pdf');
+
+// Embed all annotations into a temp PDF and clear them from Zotero DB.
+// transfer: true is critical — prevents duplicates when re-importing below.
+try {
+    await Zotero.PDFWorker.export(item.id, exportPath, false, null, true);
+} catch (e) {
+    showToast(`Failed to export annotations: ${e.message || String(e)}`);
+    return;
+}
+
+// Remove first page from the annotation-embedded PDF.
+try {
+    await exec(QPDF, [exportPath, '--pages', exportPath, '2-z', '--', trimmedPath]);
+} catch (e) {
+    // Annotations are now only in exportPath — tell user so they can recover.
+    showToast(`qpdf failed. Annotation backup at: ${exportPath}`);
+    return;
+}
+
+try { await IOUtils.remove(exportPath); } catch (_) {}
+
+const parentItemID = item.parentItemID;
+const fileBaseName = Zotero.Attachments.getFileBaseNameFromItem(item);
+await item.eraseTx();
+
+const newAttachment = await Zotero.Attachments.importFromFile({
+    file: trimmedPath,
+    parentItemID,
+    contentType: 'application/pdf',
+    fileBaseName,
+});
+
+// Reimport annotations from the embedded PDF into Zotero DB.
+await Zotero.PDFWorker.import(newAttachment.id);
+
+try { await IOUtils.remove(trimmedPath); } catch (_) {}
+
+if (page1Annotations.length > 0) {
+    showToast(`First page removed ✓ (${page1Annotations.length} annotation(s) on page 1 were deleted)`);
+} else {
+    showToast('First page removed ✓');
+}
+
+if (AUTO_OPEN) await Zotero.Reader.open(newAttachment.id);
