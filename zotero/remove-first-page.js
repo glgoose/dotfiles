@@ -42,3 +42,38 @@ if (pageCount <= 1) {
     showToast('PDF has only one page — cannot remove');
     return;
 }
+
+// ── annotation check ─────────────────────────────────────────────────────────
+
+const annotations = item.getAnnotations();
+
+// ── no-annotations path ───────────────────────────────────────────────────────
+
+if (annotations.length === 0) {
+    const trimmedPath = pdfPath.replace(/\.pdf$/i, '_trimmed_tmp.pdf');
+
+    try {
+        await exec(QPDF, [pdfPath, '--pages', pdfPath, '2-z', '--', trimmedPath]);
+    } catch (e) {
+        showToast(`qpdf failed: ${e.message || String(e)}`);
+        return;
+    }
+
+    const parentItemID = item.parentItemID;
+    const fileBaseName = Zotero.Attachments.getFileBaseNameFromItem(item);
+    await item.eraseTx();
+
+    const newAttachment = await Zotero.Attachments.importFromFile({
+        file: trimmedPath,
+        parentItemID,
+        contentType: 'application/pdf',
+        fileBaseName,
+    });
+
+    try { await IOUtils.remove(trimmedPath); } catch (_) {}
+
+    if (AUTO_OPEN) await Zotero.Reader.open(newAttachment.id);
+
+    showToast('First page removed ✓');
+    return;
+}
