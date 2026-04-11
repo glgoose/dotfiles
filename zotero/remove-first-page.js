@@ -61,12 +61,13 @@ Zotero.log(`[remove-first-page] ${annotations.length} annotation(s), ${pageCount
 
 // Temp files go to /tmp with ASCII-only names to avoid encoding issues
 // with non-ASCII characters in Zotero storage filenames.
-const ts = Date.now();
+const tmpDir = PathUtils.tempDir;
+const ts     = Date.now();
 
 // ── no-annotations path ───────────────────────────────────────────────────────
 
 if (annotations.length === 0) {
-    const trimmedPath = `/tmp/zotero_trimmed_${ts}.pdf`;
+    const trimmedPath = PathUtils.join(tmpDir, `zotero_trimmed_${ts}.pdf`);
 
     try {
         await exec(QPDF, [pdfPath, '--pages', pdfPath, '2-z', '--', trimmedPath]);
@@ -97,8 +98,8 @@ if (annotations.length === 0) {
 
 const page1Annotations = annotations.filter(a => a.annotationPageIndex === 0);
 
-const exportPath  = `/tmp/zotero_export_${ts}.pdf`;
-const trimmedPath = `/tmp/zotero_trimmed_${ts}.pdf`;
+const exportPath  = PathUtils.join(tmpDir, `zotero_export_${ts}.pdf`);
+const trimmedPath = PathUtils.join(tmpDir, `zotero_trimmed_${ts}.pdf`);
 
 // Embed all annotations into a temp PDF and clear them from Zotero DB.
 // transfer: true prevents duplicates when re-importing below.
