@@ -59,20 +59,28 @@ if (!pageCount || pageCount <= 1) {
 const annotations = item.getAnnotations();
 Zotero.log(`[remove-first-page] ${annotations.length} annotation(s), ${pageCount} pages`);
 
-// Temp files go to /tmp with ASCII-only names to avoid encoding issues
-// with non-ASCII characters in Zotero storage filenames.
 const tmpDir = PathUtils.tempDir;
 const ts     = Date.now();
+Zotero.log(`[remove-first-page] tmpDir: ${tmpDir}`);
 
 // ── no-annotations path ───────────────────────────────────────────────────────
 
 if (annotations.length === 0) {
     const trimmedPath = PathUtils.join(tmpDir, `zotero_trimmed_${ts}.pdf`);
+    Zotero.log(`[remove-first-page] qpdf: ${pdfPath} -> ${trimmedPath}`);
 
     try {
         await exec(QPDF, [pdfPath, '--pages', pdfPath, '2-z', '--', trimmedPath]);
+        Zotero.log('[remove-first-page] exec returned without error');
     } catch (e) {
+        Zotero.log(`[remove-first-page] exec threw: ${e}`);
         showToast(`qpdf failed: ${e.message || String(e)}`);
+        return;
+    }
+
+    if (!await IOUtils.exists(trimmedPath)) {
+        Zotero.log('[remove-first-page] output file missing after exec');
+        showToast('qpdf produced no output — original PDF preserved');
         return;
     }
 
@@ -112,9 +120,16 @@ try {
 
 try {
     await exec(QPDF, [exportPath, '--pages', exportPath, '2-z', '--', trimmedPath]);
+    Zotero.log('[remove-first-page] exec returned without error (annotations path)');
 } catch (e) {
-    // Annotations are now only in exportPath — tell user so they can recover.
+    Zotero.log(`[remove-first-page] exec threw (annotations path): ${e}`);
     showToast(`qpdf failed. Annotation backup at: ${exportPath}`);
+    return;
+}
+
+if (!await IOUtils.exists(trimmedPath)) {
+    Zotero.log('[remove-first-page] output file missing after exec (annotations path)');
+    showToast(`qpdf produced no output. Annotation backup at: ${exportPath}`);
     return;
 }
 
