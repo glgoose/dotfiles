@@ -170,15 +170,22 @@ def apply_labels(pdf: Path, spec: str) -> None:
     ) as tmp:
         tmp_path = Path(tmp.name)
 
-    r = subprocess.run(
-        ["qpdf", str(pdf), "--set-page-labels"] + spec.split() + ["--", str(tmp_path)],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        tmp_path.unlink()
-        print(f"Error: qpdf failed:\n{r.stderr}", file=sys.stderr)
+    try:
+        r = subprocess.run(
+            ["qpdf", str(pdf), "--set-page-labels"] + spec.split() + ["--", str(tmp_path)],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(f"Error: qpdf failed:\n{r.stderr}", file=sys.stderr)
+            sys.exit(1)
+        tmp_path.replace(pdf)
+    except SystemExit:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        print(f"Error applying labels: {e}", file=sys.stderr)
         sys.exit(1)
-    tmp_path.replace(pdf)
 
 
 def build_context(pdf: Path) -> str:
@@ -197,7 +204,10 @@ def build_context(pdf: Path) -> str:
     for p in range(1, min(4, total + 1)):
         pages_1_3 += f"--- Physical page {p} ---\n"
         text = extract_page_text(pdf, p)
-        pages_1_3 += (text.strip() and text) or "(no text)\n"
+        if text.strip():
+            pages_1_3 += text
+        else:
+            pages_1_3 += "(no text)\n"
     parts.append(f"[PAGES 1-3]\n{pages_1_3}")
 
     # TOC
