@@ -6,6 +6,7 @@
 """pdf-label — AI-assisted PDF page label applicator."""
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -27,7 +28,6 @@ def check_deps() -> None:
             print(f"Error: '{t}' not found. Install: {hints[t]}", file=sys.stderr)
         sys.exit(1)
 
-    import os
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "Error: ANTHROPIC_API_KEY not set.\n"

@@ -1,5 +1,9 @@
-import subprocess, sys, os, pytest
+import os
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).parent.parent / "bin" / "pdf-label"
 
@@ -18,4 +22,4 @@ def test_missing_file_arg():
 def test_nonexistent_pdf():
     r = run(["nonexistent.pdf"])
     assert r.returncode != 0
-    assert "not found" in r.stderr.lower() or "no such" in r.stderr.lower()
+    assert "not found" in r.stderr.lower()
