@@ -1,5 +1,7 @@
+import csv
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,11 +26,12 @@ extract_strip = _mod.extract_strip
 validate_spec = _mod.validate_spec
 confirm_flow = _mod.confirm_flow
 
-def run(args, env=None):
+def run(args, env=None, input=None):
     e = {**os.environ, **(env or {})}
     return subprocess.run(
         ["uv", "run", "--script", str(SCRIPT)] + args,
         capture_output=True, text=True, env=e,
+        input=input,
     )
 
 def test_missing_file_arg():
@@ -172,3 +175,40 @@ def test_confirm_flow_edit_invalid_then_valid():
     with patch("builtins.input", side_effect=["e", "bad spec!!!", "1: 2:r 58:D"]):
         result = confirm_flow("1: 2:r 60:D")
     assert result == "1: 2:r 58:D"
+
+
+def load_known_labels() -> dict[str, str]:
+    labels_csv = EXAMPLES / "labels.csv"
+    result = {}
+    with open(labels_csv) as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        for row in reader:
+            if len(row) >= 2:
+                filename = row[0].strip()
+                spec = row[1].strip()
+                result[filename] = spec
+    return result
+
+
+@pytest.mark.skipif(not EXAMPLES.exists(), reason="example PDFs not available")
+@pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="no API key")
+@pytest.mark.parametrize("filename", ["Baehrens.pdf", "Carve.pdf", "Hall.pdf"])
+def test_integration_label_detection(filename, tmp_path):
+    """Script proposes correct labels for clean example PDFs."""
+    known = load_known_labels()
+    pdf = EXAMPLES / filename
+    test_pdf = tmp_path / filename
+    shutil.copy(pdf, test_pdf)
+
+    r = run(["--confirm", str(test_pdf)], input="n\n")
+    # Script blocks on input in confirm mode — but output up to the prompt is captured
+    assert "Proposed labels:" in r.stdout, f"Script output: {r.stdout}\nStderr: {r.stderr}"
+    for line in r.stdout.splitlines():
+        if line.startswith("Proposed labels:"):
+            proposed = line.split(":", 1)[1].strip()
+            expected = known.get(filename, "")
+            # At minimum: same number of label segments (colon count matches)
+            assert proposed.count(":") == expected.count(":"), (
+                f"{filename}: proposed '{proposed}' vs expected '{expected}'"
+            )
