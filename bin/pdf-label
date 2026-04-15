@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["anthropic"]
+# dependencies = ["openai"]
 # ///
 """pdf-label — AI-assisted PDF page label applicator."""
 
@@ -30,23 +30,36 @@ def check_deps() -> None:
             print(f"Error: '{t}' not found. Install: {hints[t]}", file=sys.stderr)
         sys.exit(1)
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if not os.environ.get("OPENAI_API_KEY"):
         print(
-            "Error: ANTHROPIC_API_KEY not set.\n"
-            'Hint: export ANTHROPIC_API_KEY=$(security find-generic-password -a "$USER" -s "anthropic-api-key" -w)',
+            "Error: OPENAI_API_KEY not set.\n"
+            'Hint: export OPENAI_API_KEY=$(security find-generic-password -a "$USER" -s "openai-api-key" -w)',
             file=sys.stderr,
         )
         sys.exit(1)
 
 
 _DOT_LEADER_RE = re.compile(r'\.\s*\.\s*\.\s+\d{1,4}\s*$', re.MULTILINE)
+# Number or roman numeral at end of line: "Title 12" or "Preface ix"
+_NUM_END_RE = re.compile(r'\S.+\s+[ivxlcdmIVXLCDM\d]{1,6}\s*$', re.MULTILINE)
+# Number or roman numeral at start of line: "12  Title" or "vii  Title"
+_NUM_START_RE = re.compile(r'^\s*[ivxlcdmIVXLCDM\d]{1,6}\s{2,}\S', re.MULTILINE)
 
 
 def _is_toc_page(text: str) -> bool:
     """Return True if text looks like a Table of Contents page."""
-    has_contents = "contents" in text.lower()
-    has_dot_leader = bool(_DOT_LEADER_RE.search(text))
-    return has_contents and has_dot_leader
+    if "contents" not in text.lower():
+        return False
+    # Standard dot-leader: "Title . . . . 12"
+    if _DOT_LEADER_RE.search(text):
+        return True
+    # Number/roman at end of multiple lines: "Title ix" or "Chapter 1  42"
+    if len(_NUM_END_RE.findall(text)) >= 3:
+        return True
+    # Number/roman at start of multiple lines: "vii  A Note" or "12  Chapter"
+    if len(_NUM_START_RE.findall(text)) >= 3:
+        return True
+    return False
 
 
 def _sample_pages(total: int, n: int = 15) -> list[int]:
@@ -118,6 +131,53 @@ def has_extractable_text(pdf: Path) -> bool:
     return bool(r.stdout.strip())
 
 
+# Matches an isolated arabic number: not preceded/followed by digits, dots, or hyphen
+# (avoids ISBNs like 978-..., years embedded in text, etc.)
+_ARABIC_PAGE_RE = re.compile(r'(?<!\d)([1-9]\d{0,3})(?!\d)')
+_ROMAN_RE = re.compile(r'^[ivxlcdmIVXLCDM]+$')
+
+
+def _detect_arabic_page(strip: str) -> int | None:
+    """Extract the logical arabic page number from a footer/header strip.
+
+    Looks for a standalone number in the first or last line of the strip.
+    Returns None if no confident match (e.g. roman numeral, no number, or ambiguous).
+    """
+    lines = [l for l in strip.splitlines() if l.strip()]
+    if not lines:
+        return None
+    # Check last line first (most common footer position), then first line (header)
+    candidates = [lines[-1], lines[0]] if len(lines) > 1 else [lines[-1]]
+    for line in candidates:
+        stripped = line.strip()
+        # Skip lines that are clearly chapter titles / long prose
+        # A footer line with a page number is typically short or has a number at the edge
+        nums = _ARABIC_PAGE_RE.findall(stripped)
+        if not nums:
+            continue
+        # Filter: reject numbers that look like years (1800-2100) or are too large
+        valid = [int(n) for n in nums if int(n) <= 9999 and not (1800 <= int(n) <= 2100)]
+        if not valid:
+            continue
+        # Prefer the number at the very start or end of the line (page number position)
+        stripped_no_ws = stripped.strip()
+        # Check if last token is a small arabic number
+        parts = stripped_no_ws.split()
+        if parts:
+            last = parts[-1].strip('|:.,–—-')
+            if last.isdigit() and 1 <= int(last) <= 9999 and not (1800 <= int(last) <= 2100):
+                candidate = int(last)
+                # Sanity: must appear in valid list
+                if candidate in valid:
+                    return candidate
+            first = parts[0].strip('|:.,–—-')
+            if first.isdigit() and 1 <= int(first) <= 9999 and not (1800 <= int(first) <= 2100):
+                candidate = int(first)
+                if candidate in valid:
+                    return candidate
+    return None
+
+
 _SPEC_ENTRY_RE = re.compile(r'^[1-9]\d*:(?:[rRaAD](?:/\d+)?)?$')
 _SPEC_LINE_RE = re.compile(r'^[1-9]\d*:(?:[rRaAD](?:/\d+)?)?(?:\s+[1-9]\d*:(?:[rRaAD](?:/\d+)?)?)*$')
 
@@ -138,29 +198,42 @@ Types:
   (empty)  = no label (cover or blank page)
   r        = lowercase roman numerals starting at i
   D        = arabic numerals starting at 1
-  D/<N>    = arabic numerals starting at N (use when page gap detected)
+  D/<N>    = arabic numerals starting at N (use when page gap detected — physical page N gets label N)
+
+How to determine physical page offsets:
+1. FOOTER METHOD: If a sampled footer shows "Physical page P: ... N" where N is a printed page number,
+   then arabic starts at physical page P - N + 1 (e.g. physical 31 shows footer "21" → arabic starts at 31-21+1=11).
+2. TOC METHOD: If the TOC lists "Chapter X" on logical page N, and a footer confirms "Chapter X" appears
+   on physical page P, then arabic start = P - N + 1.
+3. ROMAN METHOD: Count back from the known arabic start. Pages before arabic start that have content
+   (not cover/blank) use roman numerals.
 
 Rules:
-- Cover pages (image-only or publisher page) get no label: e.g. "1:"
-- First page with roman numeral convention (half-title, preface) starts a roman sequence
-- First page with arabic numbering starts a "D" sequence
-- If footer/header sequence jumps (e.g. page 28→30 skipped), use D/<N> for the next entry
-- Return ONLY the label spec string, nothing else. Example: 1: 2:r 60:D
+- Cover pages (image-only, title, or publisher/series page with no numbered content) get no label: "1:"
+- Only the very first page is typically a cover; pages 2+ with text are usually roman-numbered frontmatter
+- Half-title page, series page, copyright page, TOC pages: these are roman-numbered (even if no number printed)
+- Roman sequence starts at the first non-cover page (often page 2): e.g. "2:r"
+- Arabic sequence starts at Introduction or Chapter 1
+- Do NOT add entries for blank pages at the end of the book
+- If page gaps exist (footer jumps from N to N+2), use D/<start> for the segment after the gap
+- Return ONLY the label spec string, nothing else. Example: 1: 2:r 11:D
 """
 
 
 def query_claude(context: str) -> str:
-    """Call Claude with extracted PDF context. Return raw label spec string."""
-    import anthropic
-    client = anthropic.Anthropic()
-    print("Querying Claude...", flush=True)
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=256,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": context}],
+    """Call OpenAI with extracted PDF context. Return raw label spec string."""
+    import openai
+    client = openai.OpenAI()
+    print("Querying OpenAI...", flush=True)
+    response = client.chat.completions.create(
+        model="gpt-4.1",
+        max_completion_tokens=256,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": context},
+        ],
     )
-    return message.content[0].text.strip()
+    return response.choices[0].message.content.strip()
 
 
 def apply_labels(pdf: Path, spec: str) -> None:
@@ -229,14 +302,25 @@ def build_context(pdf: Path) -> str:
         toc_header = f"[TABLE OF CONTENTS (physical page {toc_page})]"
     parts.append(f"{toc_header}\n{toc_text}")
 
-    # Sampled footers/headers
+    # Sampled footers/headers + page correlation analysis
     sampled = _sample_pages(total, n=15)
     strips: list[str] = []
+    correlations: list[str] = []
     for p in sampled:
         text = extract_page_text(pdf, p)
         strip = extract_strip(text) if text.strip() else "(no text)"
         strips.append(f"Physical page {p}:\n{strip}")
+        # Try to extract logical arabic page number from strip
+        logical = _detect_arabic_page(strip)
+        if logical is not None and logical > 0:
+            arabic_start = p - logical + 1
+            if arabic_start >= 1:
+                correlations.append(
+                    f"Physical {p} shows printed page {logical} → arabic 1 would start at physical {arabic_start}"
+                )
     parts.append("[SAMPLED FOOTERS/HEADERS]\n" + "\n\n".join(strips))
+    if correlations:
+        parts.append("[DETECTED PAGE CORRELATIONS]\n" + "\n".join(correlations))
 
     return "\n\n".join(parts)
 
