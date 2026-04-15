@@ -20,6 +20,7 @@ _mod = _load_script()
 _is_toc_page = _mod._is_toc_page
 _sample_pages = _mod._sample_pages
 extract_strip = _mod.extract_strip
+validate_spec = _mod.validate_spec
 
 def run(args, env=None):
     e = {**os.environ, **(env or {})}
@@ -127,3 +128,25 @@ def test_build_context_contains_sections():
     assert "[SAMPLED FOOTERS/HEADERS]" in ctx
     assert "Total pages:" in ctx
     assert "[TABLE OF CONTENTS" in ctx
+
+
+def test_validate_spec_valid_simple():
+    assert validate_spec("1: 2:r 60:D") is True
+
+def test_validate_spec_valid_gap():
+    assert validate_spec("1:r 28:D 29:D/3 60:D/35") is True
+
+def test_validate_spec_single_entry():
+    assert validate_spec("1:D") is True
+
+def test_validate_spec_no_label():
+    assert validate_spec("1:") is True
+
+def test_validate_spec_invalid_empty():
+    assert validate_spec("") is False
+
+def test_validate_spec_invalid_garbage():
+    assert validate_spec("here are the page labels: 1: 2:r") is False
+
+def test_validate_spec_invalid_page_zero():
+    assert validate_spec("0:D 1:r") is False

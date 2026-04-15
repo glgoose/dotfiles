@@ -117,6 +117,51 @@ def has_extractable_text(pdf: Path) -> bool:
     return bool(r.stdout.strip())
 
 
+_SPEC_ENTRY_RE = re.compile(r'^[1-9]\d*:(?:[rRaAD](?:/\d+)?)?$')
+_SPEC_LINE_RE = re.compile(r'^[1-9]\d*:(?:[rRaAD](?:/\d+)?)?(?:\s+[1-9]\d*:(?:[rRaAD](?:/\d+)?)?)*$')
+
+
+def validate_spec(spec: str) -> bool:
+    """Return True if spec matches qpdf page label format."""
+    spec = spec.strip()
+    if not spec:
+        return False
+    return bool(_SPEC_LINE_RE.match(spec))
+
+
+SYSTEM_PROMPT = """\
+You analyze PDF structure to produce page labels in qpdf format.
+
+Label format — space-separated entries, each: <physical_page>:<type>[/<start>]
+Types:
+  (empty)  = no label (cover or blank page)
+  r        = lowercase roman numerals starting at i
+  D        = arabic numerals starting at 1
+  D/<N>    = arabic numerals starting at N (use when page gap detected)
+
+Rules:
+- Cover pages (image-only or publisher page) get no label: e.g. "1:"
+- First page with roman numeral convention (half-title, preface) starts a roman sequence
+- First page with arabic numbering starts a "D" sequence
+- If footer/header sequence jumps (e.g. page 28→30 skipped), use D/<N> for the next entry
+- Return ONLY the label spec string, nothing else. Example: 1: 2:r 60:D
+"""
+
+
+def query_claude(context: str) -> str:
+    """Call Claude with extracted PDF context. Return raw label spec string."""
+    import anthropic
+    client = anthropic.Anthropic()
+    print("Querying Claude...", flush=True)
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=256,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": context}],
+    )
+    return message.content[0].text.strip()
+
+
 def build_context(pdf: Path) -> str:
     """Extract targeted text and return formatted context string for LLM."""
     total = get_page_count(pdf)
