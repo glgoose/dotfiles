@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -160,6 +161,28 @@ def query_claude(context: str) -> str:
         messages=[{"role": "user", "content": context}],
     )
     return message.content[0].text.strip()
+
+
+def apply_labels(pdf: Path, spec: str) -> None:
+    """Apply page labels to PDF in-place via qpdf."""
+    with tempfile.NamedTemporaryFile(
+        suffix=".pdf", dir=pdf.parent, delete=False
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        r = subprocess.run(
+            ["qpdf", str(pdf), "--set-page-labels"] + spec.split() + ["--", str(tmp_path)],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(f"Error: qpdf failed:\n{r.stderr}", file=sys.stderr)
+            sys.exit(1)
+        tmp_path.replace(pdf)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
 
 
 def build_context(pdf: Path) -> str:
