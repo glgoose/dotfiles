@@ -118,3 +118,11 @@ def test_sample_pages_small_pdf():
 def test_sample_pages_no_duplicates():
     pages = _sample_pages(total=400, n=15)
     assert len(pages) == len(set(pages))
+
+
+@pytest.mark.skipif(not BAEHRENS.exists(), reason="example PDFs not available")
+def test_build_context_contains_sections():
+    ctx = _mod.build_context(BAEHRENS)
+    assert "[PAGES 1-3]" in ctx
+    assert "[SAMPLED FOOTERS/HEADERS]" in ctx
+    assert "Total pages:" in ctx
