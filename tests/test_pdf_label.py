@@ -19,6 +19,7 @@ def _load_script():
 _mod = _load_script()
 _is_toc_page = _mod._is_toc_page
 _sample_pages = _mod._sample_pages
+extract_strip = _mod.extract_strip
 
 def run(args, env=None):
     e = {**os.environ, **(env or {})}
@@ -73,18 +74,13 @@ def test_extract_strip_takes_first_and_last_two():
         "",
         "Footer line",
     ])
-    non_empty = [l for l in text.splitlines() if l.strip()]
-    result = non_empty[:2] + non_empty[-2:]
-    assert result == ["Header line", "Body line 1", "Body line 3", "Footer line"]
+    result = extract_strip(text)
+    assert result == "Header line\nBody line 1\nBody line 3\nFooter line"
 
 
 def test_extract_strip_empty_input():
-    # extract_strip with empty/whitespace-only input returns empty string
-    non_empty = [l for l in "".splitlines() if l.strip()]
-    assert "\n".join(non_empty[:2] + non_empty[-2:]) == ""
-
-    non_empty2 = [l for l in "   \n  \n  ".splitlines() if l.strip()]
-    assert "\n".join(non_empty2[:2] + non_empty2[-2:]) == ""
+    assert extract_strip("") == ""
+    assert extract_strip("   \n  \n  ") == ""
 
 
 def test_is_toc_page_positive():

@@ -38,7 +38,7 @@ def check_deps() -> None:
         sys.exit(1)
 
 
-_DOT_LEADER_RE = re.compile(r'\.\s*\.\s*\.\s*.*\d+\s*$', re.MULTILINE)
+_DOT_LEADER_RE = re.compile(r'\.\s*\.\s*\.\s+\d{1,4}\s*$', re.MULTILINE)
 
 
 def _is_toc_page(text: str) -> bool:
@@ -52,6 +52,8 @@ def _sample_pages(total: int, n: int = 15) -> list[int]:
     """Return n evenly-spaced page numbers from 1..total (inclusive)."""
     if total <= n:
         return list(range(1, total + 1))
+    if n <= 1:
+        return [1]
     step = (total - 1) / (n - 1)
     seen = set()
     pages = []
