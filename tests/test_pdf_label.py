@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -21,6 +22,7 @@ _is_toc_page = _mod._is_toc_page
 _sample_pages = _mod._sample_pages
 extract_strip = _mod.extract_strip
 validate_spec = _mod.validate_spec
+confirm_flow = _mod.confirm_flow
 
 def run(args, env=None):
     e = {**os.environ, **(env or {})}
@@ -150,3 +152,23 @@ def test_validate_spec_invalid_garbage():
 
 def test_validate_spec_invalid_page_zero():
     assert validate_spec("0:D 1:r") is False
+
+def test_confirm_flow_yes():
+    with patch("builtins.input", return_value="y"):
+        result = confirm_flow("1: 2:r 60:D")
+    assert result == "1: 2:r 60:D"
+
+def test_confirm_flow_no():
+    with patch("builtins.input", return_value="n"):
+        result = confirm_flow("1: 2:r 60:D")
+    assert result is None
+
+def test_confirm_flow_edit():
+    with patch("builtins.input", side_effect=["e", "1: 2:r 58:D"]):
+        result = confirm_flow("1: 2:r 60:D")
+    assert result == "1: 2:r 58:D"
+
+def test_confirm_flow_edit_invalid_then_valid():
+    with patch("builtins.input", side_effect=["e", "bad spec!!!", "1: 2:r 58:D"]):
+        result = confirm_flow("1: 2:r 60:D")
+    assert result == "1: 2:r 58:D"

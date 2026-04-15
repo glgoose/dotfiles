@@ -231,6 +231,26 @@ def build_context(pdf: Path) -> str:
     return "\n\n".join(parts)
 
 
+def confirm_flow(spec: str) -> str | None:
+    """Prompt user to apply, abort, or edit the proposed label spec.
+    Returns confirmed spec string, or None to abort."""
+    print(f"Proposed labels: {spec}")
+    while True:
+        choice = input("Apply? [y/n/edit]: ").strip().lower()
+        if choice == "y":
+            return spec
+        elif choice == "n":
+            return None
+        elif choice in ("e", "edit"):
+            while True:
+                corrected = input("Enter corrected spec: ").strip()
+                if validate_spec(corrected):
+                    return corrected
+                print("Invalid spec format. Example: 1: 2:r 60:D")
+        else:
+            print("Please enter y, n, or e.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="pdf-label",
@@ -249,7 +269,25 @@ def main() -> None:
         sys.exit(1)
 
     check_deps()
-    # TODO: implement pipeline
+
+    context = build_context(args.pdf)
+    raw = query_claude(context)
+
+    if not validate_spec(raw):
+        print(f"Error: Claude returned an invalid spec:\n{raw}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.confirm:
+        spec = confirm_flow(raw)
+        if spec is None:
+            print("Aborted.")
+            sys.exit(0)
+    else:
+        spec = raw
+
+    print(f"Applying labels: {spec}", flush=True)
+    apply_labels(args.pdf, spec)
+    print("Done.")
 
 
 if __name__ == "__main__":
