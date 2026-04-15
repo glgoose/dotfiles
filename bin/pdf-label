@@ -7,6 +7,7 @@
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,42 @@ def check_deps() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+_DOT_LEADER_RE = re.compile(r'\.\s*\.\s*\.\s*.*\d+\s*$', re.MULTILINE)
+
+
+def _is_toc_page(text: str) -> bool:
+    """Return True if text looks like a Table of Contents page."""
+    has_contents = "contents" in text.lower()
+    has_dot_leader = bool(_DOT_LEADER_RE.search(text))
+    return has_contents and has_dot_leader
+
+
+def _sample_pages(total: int, n: int = 15) -> list[int]:
+    """Return n evenly-spaced page numbers from 1..total (inclusive)."""
+    if total <= n:
+        return list(range(1, total + 1))
+    step = (total - 1) / (n - 1)
+    seen = set()
+    pages = []
+    for i in range(n):
+        p = round(1 + i * step)
+        if p not in seen:
+            seen.add(p)
+            pages.append(p)
+    return pages
+
+
+def find_toc_page(pdf: Path, total_pages: int) -> int | None:
+    """Scan pages 1→limit for TOC. Return physical page number or None."""
+    limit = max(20, int(total_pages * 0.10))
+    limit = min(limit, total_pages)
+    for page in range(1, limit + 1):
+        text = extract_page_text(pdf, page)
+        if _is_toc_page(text):
+            return page
+    return None
 
 
 def get_page_count(pdf: Path) -> int:

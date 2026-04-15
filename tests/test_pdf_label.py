@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import subprocess
 import sys
@@ -6,6 +7,18 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).parent.parent / "bin" / "pdf-label"
+
+
+def _load_script():
+    loader = importlib.machinery.SourceFileLoader("pdf_label", str(SCRIPT))
+    spec = importlib.util.spec_from_loader("pdf_label", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+_mod = _load_script()
+_is_toc_page = _mod._is_toc_page
+_sample_pages = _mod._sample_pages
 
 def run(args, env=None):
     e = {**os.environ, **(env or {})}
@@ -72,3 +85,40 @@ def test_extract_strip_empty_input():
 
     non_empty2 = [l for l in "   \n  \n  ".splitlines() if l.strip()]
     assert "\n".join(non_empty2[:2] + non_empty2[-2:]) == ""
+
+
+def test_is_toc_page_positive():
+    text = """
+Table of Contents
+
+Introduction . . . . . . . . . . . . . . 1
+Chapter 1 . . . . . . . . . . . . . . . . 15
+"""
+    assert _is_toc_page(text) is True
+
+
+def test_is_toc_page_no_dotleader():
+    text = "This book contains many interesting topics."
+    assert _is_toc_page(text) is False
+
+
+def test_is_toc_page_dotleader_no_contents():
+    text = "Some chapter . . . . . . . . . 42"
+    assert _is_toc_page(text) is False
+
+
+def test_sample_pages_count():
+    pages = _sample_pages(total=400, n=15)
+    assert len(pages) == 15
+    assert pages[0] == 1
+    assert pages[-1] == 400
+
+
+def test_sample_pages_small_pdf():
+    pages = _sample_pages(total=10, n=15)
+    assert pages == list(range(1, 11))
+
+
+def test_sample_pages_no_duplicates():
+    pages = _sample_pages(total=400, n=15)
+    assert len(pages) == len(set(pages))
