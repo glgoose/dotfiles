@@ -44,10 +44,13 @@ def get_page_count(pdf: Path) -> int:
     for line in r.stdout.splitlines():
         if line.startswith("Pages:"):
             return int(line.split()[-1])
-    raise ValueError("pdfinfo did not return page count")
+    raise ValueError(f"pdfinfo did not return page count. Output:\n{r.stdout}")
 
 
 def extract_page_text(pdf: Path, page: int) -> str:
+    if page < 1:
+        raise ValueError(f"page must be >= 1, got {page}")
+    # -layout preserves whitespace/positioning, important for TOC dot-leader detection
     r = subprocess.run(
         ["pdftotext", "-layout", "-f", str(page), "-l", str(page), str(pdf), "-"],
         capture_output=True, text=True,
@@ -67,6 +70,7 @@ def extract_strip(text: str) -> str:
 
 def has_extractable_text(pdf: Path) -> bool:
     """Check if any text is extractable from the first 5 pages."""
+    # Check first 5 pages — reasonable heuristic; if all are image-only, user needs OCR
     r = subprocess.run(
         ["pdftotext", "-f", "1", "-l", "5", str(pdf), "-"],
         capture_output=True, text=True,

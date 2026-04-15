@@ -63,3 +63,12 @@ def test_extract_strip_takes_first_and_last_two():
     non_empty = [l for l in text.splitlines() if l.strip()]
     result = non_empty[:2] + non_empty[-2:]
     assert result == ["Header line", "Body line 1", "Body line 3", "Footer line"]
+
+
+def test_extract_strip_empty_input():
+    # extract_strip with empty/whitespace-only input returns empty string
+    non_empty = [l for l in "".splitlines() if l.strip()]
+    assert "\n".join(non_empty[:2] + non_empty[-2:]) == ""
+
+    non_empty2 = [l for l in "   \n  \n  ".splitlines() if l.strip()]
+    assert "\n".join(non_empty2[:2] + non_empty2[-2:]) == ""
