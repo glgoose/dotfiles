@@ -26,6 +26,8 @@ _sample_pages = _mod._sample_pages
 extract_strip = _mod.extract_strip
 validate_spec = _mod.validate_spec
 confirm_flow = _mod.confirm_flow
+detect_arabic_ranges = _mod.detect_arabic_ranges
+arabic_ranges_to_spec_part = _mod.arabic_ranges_to_spec_part
 
 def run(args, env=None, input=None):
     e = {**os.environ, **(env or {})}
@@ -156,6 +158,95 @@ def test_validate_spec_invalid_garbage():
 
 def test_validate_spec_invalid_page_zero():
     assert validate_spec("0:D 1:r") is False
+
+def _footers(pairs: list[tuple[int, int]]) -> list[tuple[int, str]]:
+    """Build synthetic footer list: (physical, strip_with_page_num)."""
+    return [(p, str(l)) for p, l in pairs]
+
+
+def test_detect_arabic_ranges_simple():
+    footers = _footers([(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)])
+    assert detect_arabic_ranges(footers) == [(1, 1)]
+
+
+def test_detect_arabic_ranges_with_gap():
+    # Physical 3 shows label 4 → gap: new range at (3, 4)
+    footers = _footers([(1, 1), (2, 2), (3, 4), (4, 5), (5, 6)])
+    assert detect_arabic_ranges(footers) == [(1, 1), (3, 4)]
+
+
+def test_detect_arabic_ranges_noise_filtered():
+    # Physical 3 shows label 100 (false positive) — neighbors (2,2) and (4,4) agree
+    footers = _footers([(1, 1), (2, 2), (3, 100), (4, 4), (5, 5)])
+    assert detect_arabic_ranges(footers) == [(1, 1)]
+
+
+def test_detect_arabic_ranges_empty():
+    assert detect_arabic_ranges([]) == []
+    assert detect_arabic_ranges([(1, "(no text)"), (2, "(no text)")]) == []
+
+
+def test_detect_arabic_ranges_hay_prefix():
+    # Simulate Hay.pdf: physical 28=1, 29=3 (gap), 30=4, 31=5
+    footers = _footers([(28, 1), (29, 3), (30, 4), (31, 5)])
+    ranges = detect_arabic_ranges(footers)
+    assert ranges == [(28, 1), (29, 3)]
+
+
+def test_detect_arabic_ranges_backshift_chapter_opener():
+    # Physical 14 is a chapter opener — has text but no running header, so not detected.
+    # Physical 15 is first detected page of new range (label 7, offset 9).
+    # Back-shift: new range start = 14, label = 7-(15-14) = 6.
+    # Old range: 10=1,11=2,12=3,13=4 (offset 10). New range offset 9.
+    footers = (
+        _footers([(10, 1), (11, 2), (12, 3), (13, 4)])
+        + [(14, "Chapter Two")]          # text but no running header → no detection
+        + _footers([(15, 7), (16, 8)])   # new range, 15-7+1=9
+    )
+    assert detect_arabic_ranges(footers) == [(10, 1), (14, 6)]
+
+
+def test_detect_arabic_ranges_backshift_two_undetected():
+    # Two consecutive undetected pages at gap boundary (blank + chapter opener).
+    # Physical 14: blank section page (no text). Physical 15: chapter opener (text, no detect).
+    # Physical 16: first detected of new range, label 9 (offset 8).
+    # Back-shift: p_start = 13+1 = 14, l_start = 9-(16-14) = 7.
+    footers = (
+        _footers([(10, 1), (11, 2), (12, 3), (13, 4)])  # old range, offset 10
+        + [(14, "(no text)"), (15, "Chapter Three")]      # blank + chapter opener
+        + _footers([(16, 9), (17, 10)])                   # new range, 16-9+1=8
+    )
+    assert detect_arabic_ranges(footers) == [(10, 1), (14, 7)]
+
+
+def test_detect_arabic_ranges_backshift_respects_old_range():
+    # Between the old range and new range, physical 14 has a detectable number
+    # matching the OLD range (label 5, old offset 10: 14-5+1=10). The new range
+    # starts AFTER physical 14 — at physical 15 (chapter opener, no detect).
+    # Physical 16 is first detected of new range, label 7 (offset 10? No: 16-7+1=10,
+    # same offset means no gap). Use offset 9: physical 16=8 (16-8+1=9).
+    # Old: 10=1,...,14=5 (offset 10). Physical 14 detectable (standalone "5").
+    # → Physical 14 would be in filtered (consistent with prev 13=4).
+    # → p_prev becomes 14, not 13. Back-shift scans from 15 only.
+    # Physical 15: chapter opener "Chapter" → no detect → p_start=15.
+    # l_start = 8-(16-15) = 7.
+    footers = (
+        _footers([(10, 1), (11, 2), (12, 3), (13, 4), (14, 5)])  # old range
+        + [(15, "Chapter Four")]                                     # chapter opener
+        + _footers([(16, 8), (17, 9)])                              # new range, offset 9
+    )
+    assert detect_arabic_ranges(footers) == [(10, 1), (15, 7)]
+
+
+def test_arabic_ranges_to_spec_part():
+    assert arabic_ranges_to_spec_part([(28, 1)]) == "28:D"
+    assert arabic_ranges_to_spec_part([(28, 1), (29, 3)]) == "28:D 29:D/3"
+    assert arabic_ranges_to_spec_part([(18, 1), (33, 17), (60, 45)]) == "18:D 33:D/17 60:D/45"
+
+
+def test_arabic_ranges_to_spec_part_empty():
+    assert arabic_ranges_to_spec_part([]) == ""
+
 
 def test_confirm_flow_yes():
     with patch("builtins.input", return_value="y"):

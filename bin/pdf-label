@@ -121,6 +121,120 @@ def extract_strip(text: str) -> str:
     return "\n".join(lines[:2] + lines[-2:])
 
 
+def _estimate_arabic_start(pdf: Path, total: int) -> int | None:
+    """Estimate physical page where arabic numbering starts using 15 sampled footers.
+
+    Uses max offset rather than mode: each page-label gap decreases the offset by the
+    gap size, so the maximum observed offset corresponds to the earliest arabic page.
+    Mode fails for books with many gaps because the largest range (mid-book) dominates.
+    """
+    sampled = _sample_pages(total, n=15)
+    offsets: list[int] = []
+    for p in sampled:
+        text = extract_page_text(pdf, p)
+        if not text.strip():
+            continue
+        l = _detect_arabic_page(extract_strip(text))
+        if l and l > 0:
+            start = p - l + 1
+            if 1 <= start <= total:
+                offsets.append(start)
+    if not offsets:
+        return None
+    return max(offsets)
+
+
+def extract_all_footers(pdf: Path, total: int, start: int = 1) -> list[tuple[int, str]]:
+    """Extract footer strips for pages start..total in a single pdftotext call."""
+    r = subprocess.run(
+        ["pdftotext", "-layout", "-f", str(start), "-l", str(total), str(pdf), "-"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return []
+    pages = r.stdout.split("\x0c")
+    expected = total - start + 1
+    result = []
+    for i, text in enumerate(pages[:expected], start):
+        result.append((i, extract_strip(text) if text.strip() else "(no text)"))
+    return result
+
+
+def detect_arabic_ranges(footers: list[tuple[int, str]]) -> list[tuple[int, int]]:
+    """Detect arabic page number ranges from all footer strips.
+
+    Returns (physical_start, first_label) pairs for each distinct arabic range.
+    Noise-filters isolated false positives (e.g. chapter numbers in headers).
+    """
+    footer_dict: dict[int, str] = {p: strip for p, strip in footers}
+
+    detected: list[tuple[int, int]] = []
+    for p, strip in footers:
+        l = _detect_arabic_page(strip)
+        if l is not None and l > 0:
+            detected.append((p, l))
+
+    if not detected:
+        return []
+
+    def _ok(pi: int, li: int, pj: int, lj: int) -> bool:
+        return lj == li + (pj - pi)
+
+    # Keep detections consistent with ≥1 neighbor; filter isolated outliers
+    filtered: list[tuple[int, int]] = []
+    n = len(detected)
+    for i, (p, l) in enumerate(detected):
+        has_prev = i > 0
+        has_next = i < n - 1
+        if has_prev and _ok(*detected[i - 1], p, l):
+            filtered.append((p, l))
+            continue
+        if has_next and _ok(p, l, *detected[i + 1]):
+            filtered.append((p, l))
+            continue
+        # Isolated: skip only if both neighbors exist and agree with each other
+        if has_prev and has_next and _ok(*detected[i - 1], *detected[i + 1]):
+            continue
+        filtered.append((p, l))
+
+    if not filtered:
+        return []
+
+    # Emit a new range entry at each offset discontinuity.
+    # Back-shift: chapter openers and blank section-opener pages often have no running
+    # header, so the first detection in a new range may be page 2 or 3 of that range.
+    # We infer the true range start by scanning forward from p_prev+1: any page with a
+    # detectable number consistent with the OLD range still belongs to the old range, so
+    # the new range starts after it.  Pages with no detectable number (chapter openers,
+    # blanks) are assumed to open the new range.
+    ranges: list[tuple[int, int]] = [(filtered[0][0], filtered[0][1])]
+    for i in range(1, len(filtered)):
+        p_cur, l_cur = filtered[i]
+        p_prev, l_prev = filtered[i - 1]
+        if not _ok(p_prev, l_prev, p_cur, l_cur):
+            # Find the first page after p_prev that belongs to the new range.
+            p_start = p_prev + 1
+            for q in range(p_prev + 1, p_cur):
+                strip_q = footer_dict.get(q, "(no text)")
+                det_q = _detect_arabic_page(strip_q)
+                if det_q is not None and det_q == l_prev + (q - p_prev):
+                    # q has a number matching the old range → still old range
+                    p_start = q + 1
+                # else: no detection or inconsistent → new range starts here or earlier
+            l_start = l_cur - (p_cur - p_start)
+            ranges.append((p_start, max(1, l_start)))
+
+    return ranges
+
+
+def arabic_ranges_to_spec_part(ranges: list[tuple[int, int]]) -> str:
+    """Convert arabic ranges to a space-joined qpdf spec fragment."""
+    return " ".join(
+        f"{p}:D" if l == 1 else f"{p}:D/{l}"
+        for p, l in ranges
+    )
+
+
 def has_extractable_text(pdf: Path) -> bool:
     """Check if any text is extractable from the first 5 pages."""
     # Check first 5 pages — reasonable heuristic; if all are image-only, user needs OCR
@@ -131,50 +245,40 @@ def has_extractable_text(pdf: Path) -> bool:
     return bool(r.stdout.strip())
 
 
-# Matches an isolated arabic number: not preceded/followed by digits, dots, or hyphen
-# (avoids ISBNs like 978-..., years embedded in text, etc.)
-_ARABIC_PAGE_RE = re.compile(r'(?<!\d)([1-9]\d{0,3})(?!\d)')
-_ROMAN_RE = re.compile(r'^[ivxlcdmIVXLCDM]+$')
+# pdftotext -layout running headers have wide internal whitespace (title + page number
+# spread across the full page width). Content lines have normal word spacing.
+_WIDE_SPACE_RE = re.compile(r'\s{8,}')
 
 
 def _detect_arabic_page(strip: str) -> int | None:
-    """Extract the logical arabic page number from a footer/header strip.
+    """Extract the logical arabic page number from a running header/footer strip.
 
-    Looks for a standalone number in the first or last line of the strip.
-    Returns None if no confident match (e.g. roman numeral, no number, or ambiguous).
+    Only trusts lines that look like running headers (pdftotext -layout produces
+    wide internal whitespace between title and page number) or standalone single-
+    number lines. This avoids false positives from citation numbers, footnotes,
+    or content lines that happen to end with a small number.
+
+    Checks header (first line) before footer (last line), first token before
+    last, so "12  Chapter 1" returns 12, not 1.
     """
     lines = [l for l in strip.splitlines() if l.strip()]
     if not lines:
         return None
-    # Check last line first (most common footer position), then first line (header)
-    candidates = [lines[-1], lines[0]] if len(lines) > 1 else [lines[-1]]
+    candidates = [lines[0], lines[-1]] if len(lines) > 1 else [lines[0]]
     for line in candidates:
-        stripped = line.strip()
-        # Skip lines that are clearly chapter titles / long prose
-        # A footer line with a page number is typically short or has a number at the edge
-        nums = _ARABIC_PAGE_RE.findall(stripped)
-        if not nums:
+        parts = line.strip().split()
+        if not parts:
             continue
-        # Filter: reject numbers that look like years (1800-2100) or are too large
-        valid = [int(n) for n in nums if int(n) <= 9999 and not (1800 <= int(n) <= 2100)]
-        if not valid:
+        is_running_head = bool(_WIDE_SPACE_RE.search(line))
+        is_standalone = len(parts) == 1
+        if not (is_running_head or is_standalone):
             continue
-        # Prefer the number at the very start or end of the line (page number position)
-        stripped_no_ws = stripped.strip()
-        # Check if last token is a small arabic number
-        parts = stripped_no_ws.split()
-        if parts:
-            last = parts[-1].strip('|:.,–—-')
-            if last.isdigit() and 1 <= int(last) <= 9999 and not (1800 <= int(last) <= 2100):
-                candidate = int(last)
-                # Sanity: must appear in valid list
-                if candidate in valid:
-                    return candidate
-            first = parts[0].strip('|:.,–—-')
-            if first.isdigit() and 1 <= int(first) <= 9999 and not (1800 <= int(first) <= 2100):
-                candidate = int(first)
-                if candidate in valid:
-                    return candidate
+        for token in [parts[0], parts[-1]]:
+            t = token.strip('|:.,–—-()')
+            if t.isdigit():
+                n = int(t)
+                if 1 <= n <= 9999 and not (1800 <= n <= 2100):
+                    return n
     return None
 
 
@@ -220,7 +324,40 @@ Rules:
 """
 
 
-def query_claude(context: str) -> str:
+def _frontmatter_system_prompt(arabic_start: int) -> str:
+    fm_end = arabic_start - 1
+    return f"""\
+You determine the cover/roman frontmatter structure for a PDF.
+
+Arabic page numbering starts at physical page {arabic_start}.
+Analyze pages 1\u2013{fm_end} and return ONLY the qpdf label entries for that frontmatter section.
+
+Entry format: <physical_page>:<type>[/<start>]
+  (empty) = no label (cover or blank page)
+  r       = roman numerals from i
+  r/<N>   = roman numerals starting at N
+
+Rules:
+- Page 1 is usually a cover (image/title page with no body text): "1:"
+- If page 1 has roman-numbered content: "1:r" (no cover entry)
+- Roman sequence covers: half-title, copyright, TOC, and preface pages
+- Blank or image-only pages AFTER the cover are STILL roman — do NOT add extra unlabeled entries.
+  Only page 1 can be unlabeled as cover. If pages 2–{fm_end} have no extractable text, they are
+  image-only frontmatter pages and should be roman (covered by a single "2:r" entry).
+- Use a SINGLE "N:r" entry for the entire roman section \u2014 do NOT enumerate each page separately
+- Do NOT include arabic entries \u2014 those are already determined
+
+IMPORTANT: Return a MINIMAL spec. "1: 2:r" means page 1 is cover, pages 2\u2013{fm_end} are all roman.
+Do not write "1: 2:r 3:r 4:r ..." \u2014 that is wrong. Just "1: 2:r" covers all roman pages.
+
+Return ONLY the space-separated spec fragment for pages 1\u2013{fm_end}.
+Example: "1: 2:r"   (cover + roman from page 2)
+Example: "1:r"       (roman from page 1, no cover)
+If there is no frontmatter at all: return empty string
+"""
+
+
+def query_claude(context: str, system: str | None = None) -> str:
     """Call OpenAI with extracted PDF context. Return raw label spec string."""
     import openai
     client = openai.OpenAI()
@@ -229,7 +366,7 @@ def query_claude(context: str) -> str:
         model="gpt-4.1",
         max_completion_tokens=256,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system if system is not None else SYSTEM_PROMPT},
             {"role": "user", "content": context},
         ],
     )
@@ -261,66 +398,71 @@ def apply_labels(pdf: Path, spec: str) -> None:
         sys.exit(1)
 
 
-def build_context(pdf: Path) -> str:
-    """Extract targeted text and return formatted context string for LLM."""
-    total = get_page_count(pdf)
+def build_context(
+    pdf: Path,
+    total: int | None = None,
+    arabic_start: int | None = None,
+) -> str:
+    """Extract targeted text and return formatted context string for LLM.
 
-    # Check extractable text
-    if not has_extractable_text(pdf):
-        print("Error: PDF has no extractable text — run OCR first.", file=sys.stderr)
-        sys.exit(1)
+    When arabic_start is given: frontmatter-only context (pages 1..arabic_start-1 + TOC).
+    When arabic_start is None: full context with sampled footers (fallback path).
+    """
+    if total is None:
+        total = get_page_count(pdf)
 
     parts: list[str] = [f"Total pages: {total}\n"]
 
-    # Pages 1-3
-    pages_1_3 = ""
-    for p in range(1, min(4, total + 1)):
-        pages_1_3 += f"--- Physical page {p} ---\n"
+    # Determine page range for full-text extraction
+    if arabic_start is not None:
+        full_text_end = min(arabic_start - 1, 20)
+    else:
+        full_text_end = 3
+
+    pages_text = ""
+    for p in range(1, min(full_text_end + 1, total + 1)):
+        pages_text += f"--- Physical page {p} ---\n"
         text = extract_page_text(pdf, p)
-        if text.strip():
-            pages_1_3 += text
-        else:
-            pages_1_3 += "(no text)\n"
-    parts.append(f"[PAGES 1-3]\n{pages_1_3}")
+        pages_text += text if text.strip() else "(no text)\n"
+    label = "[PAGES 1-3]" if full_text_end <= 3 else f"[PAGES 1-{full_text_end}]"
+    parts.append(f"{label}\n{pages_text}")
 
     # TOC
-    print("Extracting structure...", flush=True)
     toc_page = find_toc_page(pdf, total)
     if toc_page is None:
-        print("Warning: Table of Contents not found — proceeding with pages 1-3 and sampled footers only.")
+        print("Warning: Table of Contents not found.")
         toc_text = "(Table of Contents not found)"
     else:
         toc_text = extract_page_text(pdf, toc_page) or "(no text on TOC page)"
-        # Also grab the next page in case TOC spans two pages
         if toc_page + 1 <= total:
             next_text = extract_page_text(pdf, toc_page + 1)
             if next_text.strip() and _is_toc_page(next_text):
                 toc_text += f"\n--- TOC continued (page {toc_page + 1}) ---\n{next_text}"
-    if toc_page is None:
-        toc_header = "[TABLE OF CONTENTS (not found)]"
-    else:
-        toc_header = f"[TABLE OF CONTENTS (physical page {toc_page})]"
+    toc_header = (
+        "[TABLE OF CONTENTS (not found)]" if toc_page is None
+        else f"[TABLE OF CONTENTS (physical page {toc_page})]"
+    )
     parts.append(f"{toc_header}\n{toc_text}")
 
-    # Sampled footers/headers + page correlation analysis
-    sampled = _sample_pages(total, n=15)
-    strips: list[str] = []
-    correlations: list[str] = []
-    for p in sampled:
-        text = extract_page_text(pdf, p)
-        strip = extract_strip(text) if text.strip() else "(no text)"
-        strips.append(f"Physical page {p}:\n{strip}")
-        # Try to extract logical arabic page number from strip
-        logical = _detect_arabic_page(strip)
-        if logical is not None and logical > 0:
-            arabic_start = p - logical + 1
-            if arabic_start >= 1:
-                correlations.append(
-                    f"Physical {p} shows printed page {logical} → arabic 1 would start at physical {arabic_start}"
-                )
-    parts.append("[SAMPLED FOOTERS/HEADERS]\n" + "\n\n".join(strips))
-    if correlations:
-        parts.append("[DETECTED PAGE CORRELATIONS]\n" + "\n".join(correlations))
+    if arabic_start is None:
+        # Fallback: sampled footers + correlations for full-LLM path
+        sampled = _sample_pages(total, n=15)
+        strips: list[str] = []
+        correlations: list[str] = []
+        for p in sampled:
+            text = extract_page_text(pdf, p)
+            strip = extract_strip(text) if text.strip() else "(no text)"
+            strips.append(f"Physical page {p}:\n{strip}")
+            logical = _detect_arabic_page(strip)
+            if logical is not None and logical > 0:
+                offset = p - logical + 1
+                if offset >= 1:
+                    correlations.append(
+                        f"Physical {p} shows printed page {logical} → arabic 1 would start at physical {offset}"
+                    )
+        parts.append("[SAMPLED FOOTERS/HEADERS]\n" + "\n\n".join(strips))
+        if correlations:
+            parts.append("[DETECTED PAGE CORRELATIONS]\n" + "\n".join(correlations))
 
     return "\n\n".join(parts)
 
@@ -364,20 +506,74 @@ def main() -> None:
 
     check_deps()
 
-    context = build_context(args.pdf)
-    raw = query_claude(context)
+    total = get_page_count(args.pdf)
 
-    if not validate_spec(raw):
-        print(f"Error: Claude returned an invalid spec:\n{raw}", file=sys.stderr)
+    if not has_extractable_text(args.pdf):
+        print("Error: PDF has no extractable text — run OCR first.", file=sys.stderr)
+        sys.exit(1)
+
+    print("Extracting structure...", flush=True)
+    estimated_start = _estimate_arabic_start(args.pdf, total)
+    scan_from = estimated_start if estimated_start else 1
+    footers = extract_all_footers(args.pdf, total, start=scan_from)
+    ranges = detect_arabic_ranges(footers)
+
+    if estimated_start:
+        # Drop false positives: genuine gap ranges have offset (p-l+1) ≤ estimated_start,
+        # because each label-gap decreases the offset by 1. Random false positives
+        # typically produce offsets >> estimated_start.
+        ranges = [(p, l) for p, l in ranges if (p - l + 1) <= estimated_start + 2]
+
+        # Normalize first range: determine the true arabic_start.
+        if ranges and ranges[0][1] == 1:
+            # The first detected page already has label 1 — direct confirmation of start.
+            arabic_start = ranges[0][0]
+        elif ranges:
+            # First detected label > 1: chapter opener(s) at the start lacked a running
+            # header, so we infer the true start from the offset.
+            arabic_start_inferred = ranges[0][0] - ranges[0][1] + 1
+            arabic_start = (
+                estimated_start
+                if abs(estimated_start - arabic_start_inferred) <= 3
+                else arabic_start_inferred
+            )
+        else:
+            arabic_start = estimated_start
+        # Rebuild: first entry is always (arabic_start, 1); keep only genuine gaps
+        genuine_gaps = [
+            (p, l) for p, l in ranges
+            if l != 1 + (p - arabic_start)
+        ]
+        ranges = [(arabic_start, 1)] + genuine_gaps
+
+    if ranges and ranges[0][0] > 1:
+        # Hybrid path: arabic spec is algorithmic, ask LLM for frontmatter only
+        arabic_spec = arabic_ranges_to_spec_part(ranges)
+        arabic_start = ranges[0][0]
+        context = build_context(args.pdf, total=total, arabic_start=arabic_start)
+        fm_raw = query_claude(context, system=_frontmatter_system_prompt(arabic_start))
+        fm_raw = fm_raw.strip()
+        if fm_raw and not validate_spec(fm_raw):
+            print(f"Warning: LLM returned invalid frontmatter '{fm_raw}', ignoring.", file=sys.stderr)
+            fm_raw = ""
+        spec = (fm_raw + " " + arabic_spec).strip() if fm_raw else arabic_spec
+    elif ranges:
+        # Arabic starts at page 1 — no frontmatter needed
+        spec = arabic_ranges_to_spec_part(ranges)
+    else:
+        # Fallback: no arabic detected, let LLM handle everything
+        context = build_context(args.pdf, total=total)
+        spec = query_claude(context)
+
+    if not validate_spec(spec):
+        print(f"Error: LLM returned an invalid spec:\n{spec}", file=sys.stderr)
         sys.exit(1)
 
     if args.confirm:
-        spec = confirm_flow(raw)
+        spec = confirm_flow(spec)
         if spec is None:
             print("Aborted.")
             sys.exit(0)
-    else:
-        spec = raw
 
     print(f"Applying labels: {spec}", flush=True)
     apply_labels(args.pdf, spec)
