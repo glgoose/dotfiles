@@ -7,6 +7,7 @@ export PATH=$JAVA_HOME/bin:$PATH
 export PATH=$PATH:~/scripts
 
 export HOMEBREW_AUTO_UPDATE_SECS=86400
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000
 export ZSH=$HOME/.oh-my-zsh
 export NVM_DIR="$HOME/.nvm"
 
@@ -173,3 +174,8 @@ if [[ $- == *i* ]]; then
   [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
 fi
 
+
+export BIB="$HOME/.local/share/bib"
+
+# Added by Copilot CLI setup: include local skills
+export COPILOT_CUSTOM_INSTRUCTIONS_DIRS="$HOME/.copilot/skills"
