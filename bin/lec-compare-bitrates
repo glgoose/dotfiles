@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# lec-compare-bitrates — encode a single WAV to 96k/64k/48k mono Opus and compare file sizes
+# Usage: lec-compare-bitrates [--normalize|-n] <file.wav>
+set -euo pipefail
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+NORMALIZE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --normalize|-n) NORMALIZE=true; shift ;;
+    *)
+      if [[ "$1" == -* ]]; then
+        echo "Unknown option: $1"
+        echo "Usage: lec-compare-bitrates [--normalize|-n] <file.wav>"
+        exit 1
+      fi
+      break
+      ;;
+  esac
+done
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: lec-compare-bitrates [--normalize|-n] <file.wav>"
+  exit 1
+fi
+
+INPUT_FILE="$1"
+
+# ── Dependency check ───────────────────────────────────────────────────────────
+for cmd in ffmpeg ffprobe jq; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Error: $cmd not found. Install with: brew install ffmpeg"
+    exit 1
+  fi
+done
+
+if [[ ! -f "$INPUT_FILE" ]]; then
+  echo "Error: file not found: $INPUT_FILE"
+  exit 1
+fi
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+file_bytes() { wc -c < "$1" | tr -d ' '; }
+
+human_size() {
+  awk -v b="$1" 'BEGIN {
+    if      (b >= 1073741824) printf "%.1f GB", b/1073741824
+    else if (b >= 1048576)    printf "%.1f MB", b/1048576
+    else if (b >= 1024)       printf "%.1f KB", b/1024
+    else                      printf "%d B",    b
+  }'
+}
+
+# ── Measure input ──────────────────────────────────────────────────────────────
+INPUT_SIZE=$(file_bytes "$INPUT_FILE")
+DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$INPUT_FILE" 2>/dev/null)
+
+echo ""
+echo "── Input ──────────────────────────────────────────────────────────────────"
+printf "  File:       %s\n" "$INPUT_FILE"
+printf "  Size:       %s\n" "$(human_size "$INPUT_SIZE")"
+printf "  Duration:   %.0f seconds\n" "$DURATION"
+
+# ── Measure loudness (if normalize enabled) ────────────────────────────────────
+LOUDNORM_AF=""
+
+if [[ "$NORMALIZE" == true ]]; then
+  echo ""
+  echo "── Measuring loudness ────────────────────────────────────────────────────"
+
+  STATS=$(ffmpeg -i "$INPUT_FILE" \
+    -af "loudnorm=I=-16:TP=-1:LRA=9:print_format=json" \
+    -f null - 2>&1)
+
+  JSON=$(echo "$STATS" | grep -A20 'Parsed_loudnorm' \
+    | awk '/\{/{p=1} p{print; if(/\}/)exit}' \
+    | sed 's/: *-inf/: "-999.0"/g; s/: *nan/: "0.0"/g' \
+    | jq '.')
+
+  input_i=$(      echo "$JSON" | jq -r '.input_i')
+  input_tp=$(     echo "$JSON" | jq -r '.input_tp')
+  input_lra=$(    echo "$JSON" | jq -r '.input_lra')
+  input_thresh=$( echo "$JSON" | jq -r '.input_thresh')
+  target_offset=$(echo "$JSON" | jq -r '.target_offset')
+
+  LOUDNORM_AF="loudnorm=I=-16:TP=-1:LRA=9:\
+measured_I=${input_i}:measured_TP=${input_tp}:measured_LRA=${input_lra}:\
+measured_thresh=${input_thresh}:offset=${target_offset}:\
+linear=true:print_format=summary"
+
+  echo "  Input loudness:    I=$(echo "$JSON" | jq -r '.input_i') LUFS"
+  echo "  Target loudness:   I=-16 LUFS"
+fi
+
+# ── Encode to three bitrates ───────────────────────────────────────────────────
+echo ""
+ENCODE_DESC="Encoding (mono)"
+[[ "$NORMALIZE" == true ]] && ENCODE_DESC="Encoding (mono, normalized)"
+echo "── $ENCODE_DESC ────────────────────────────────────────────────────────"
+
+BITRATES=(96 64 48)
+declare -a SIZES
+declare -a RATIOS
+declare -a SAVINGS
+
+for i in 0 1 2; do
+  BITRATE="${BITRATES[$i]}"
+  OUTPUT="${INPUT_FILE%.*}_${BITRATE}k.opus"
+
+  printf "  %sk Opus... " "$BITRATE"
+
+  if [[ "$NORMALIZE" == true ]]; then
+    ffmpeg -y -i "$INPUT_FILE" -af "$LOUDNORM_AF" -c:a libopus -ac 1 -b:a "${BITRATE}k" "$OUTPUT" 2>/dev/null
+  else
+    ffmpeg -y -i "$INPUT_FILE" -c:a libopus -ac 1 -b:a "${BITRATE}k" "$OUTPUT" 2>/dev/null
+  fi
+
+  OUTPUT_SIZE=$(file_bytes "$OUTPUT")
+  RATIO=$(printf "%.1f%%" $(echo "scale=4; $OUTPUT_SIZE * 100 / $INPUT_SIZE" | bc))
+  SAVINGS_PCT=$(printf "%.1f%%" $(echo "scale=4; ($INPUT_SIZE - $OUTPUT_SIZE) * 100 / $INPUT_SIZE" | bc))
+
+  SIZES[$i]="$OUTPUT_SIZE"
+  RATIOS[$i]="$RATIO"
+  SAVINGS[$i]="$SAVINGS_PCT"
+
+  printf "%s (%s, saves %s)\n" "$(human_size "$OUTPUT_SIZE")" "$RATIO" "$SAVINGS_PCT"
+done
+
+# ── Summary table ──────────────────────────────────────────────────────────────
+echo ""
+echo "── Summary ────────────────────────────────────────────────────────────────"
+printf "  %-12s %-12s %-10s %-10s\n" "Bitrate" "File size" "vs Input" "Savings"
+echo "  ────────────────────────────────────────────────────────────"
+
+for i in 0 1 2; do
+  BITRATE="${BITRATES[$i]}"
+  printf "  %-12s %-12s %-10s %-10s\n" "${BITRATE}k mono" "$(human_size "${SIZES[$i]}")" "${RATIOS[$i]}" "${SAVINGS[$i]}"
+done
+
+echo ""
+echo "Files created:"
+for BITRATE in "${BITRATES[@]}"; do
+  echo "  ${INPUT_FILE%.*}_${BITRATE}k.opus"
+done
