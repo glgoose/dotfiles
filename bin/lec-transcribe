@@ -74,14 +74,29 @@ if ! command -v uv &>/dev/null; then
   exit 1
 fi
 
-# ── Collect WAV files, sorted alphabetically ──────────────────────────────────
-WAV_FILES=()
+# ── Collect FLAC/WAV files, prefer FLAC when both share a stem ────────────────
+AUDIO_FILES=()
+FLAC_STEMS=()
+
 while IFS= read -r f; do
-  WAV_FILES+=("$f")
+  AUDIO_FILES+=("$f")
+  FLAC_STEMS+=("${f%.*}")
+done < <(find . -maxdepth 1 -iname "*.flac" | sed 's|^\./||' | sort)
+
+while IFS= read -r f; do
+  stem="${f%.*}"
+  skip=false
+  for s in "${FLAC_STEMS[@]+"${FLAC_STEMS[@]}"}"; do
+    [[ "$s" == "$stem" ]] && { skip=true; break; }
+  done
+  [[ "$skip" == false ]] && AUDIO_FILES+=("$f")
 done < <(find . -maxdepth 1 -iname "*.wav" | sed 's|^\./||' | sort)
 
-if [[ ${#WAV_FILES[@]} -eq 0 ]]; then
-  echo "Error: no .wav files found in the current directory."
+IFS=$'\n' AUDIO_FILES=($(printf '%s\n' "${AUDIO_FILES[@]+"${AUDIO_FILES[@]}"}" | sort))
+unset IFS
+
+if [[ ${#AUDIO_FILES[@]} -eq 0 ]]; then
+  echo "Error: no .wav or .flac files found in the current directory."
   exit 1
 fi
 
@@ -95,8 +110,9 @@ if [[ "$RENAME" == true ]]; then
 
   INDEX=1
   RENAMED=()
-  for FILE in "${WAV_FILES[@]}"; do
-    TARGET="${FOLDER_NAME}_${INDEX}.wav"
+  for FILE in "${AUDIO_FILES[@]}"; do
+    EXT="${FILE##*.}"
+    TARGET="${FOLDER_NAME}_${INDEX}.${EXT}"
     if [[ "$FILE" == "$TARGET" ]]; then
       echo "  [skip] $FILE"
     else
@@ -108,9 +124,9 @@ if [[ "$RENAME" == true ]]; then
   done
 
   # Re-sort after rename (names are now deterministic)
-  WAV_FILES=()
+  AUDIO_FILES=()
   while IFS= read -r f; do
-    WAV_FILES+=("$f")
+    AUDIO_FILES+=("$f")
   done < <(printf '%s\n' "${RENAMED[@]}" | sort)
 fi
 
@@ -133,10 +149,10 @@ format_duration() {
 FILES_PROCESSED=0
 TOTAL_AUDIO=0
 
-for FILE in "${WAV_FILES[@]}"; do
+for FILE in "${AUDIO_FILES[@]}"; do
   DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$FILE" 2>/dev/null | awk '{printf "%d", $1}')
   TOTAL_AUDIO=$((TOTAL_AUDIO + DURATION))
-  NAME="${FILE%.[Ww][Aa][Vv]}"
+  NAME="${FILE%.*}"
   echo "  Transcribing $FILE..."
   FILE_START=$(date +%s)
 
@@ -176,8 +192,8 @@ fi
 if [[ "$DIARIZE" == true ]]; then
   echo ""
   echo "── Diarize ─────────────────────────────────────────────────────────"
-  for FILE in "${WAV_FILES[@]}"; do
-    NAME="${FILE%.[Ww][Aa][Vv]}"
+  for FILE in "${AUDIO_FILES[@]}"; do
+    NAME="${FILE%.*}"
     "$SCRIPT_DIR/lec-diarize" "$FILE" "${NAME}.srt"
   done
 fi
