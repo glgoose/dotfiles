@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# lec-correct — post-process whisper transcriptions using the Anthropic API
-# Usage: lec-correct [--context "string"]
+# lec-correct — post-process whisper transcriptions using OpenAI or Anthropic
+# Usage: lec-correct [-p|--provider openai|anthropic]
 # Run from inside the lecture folder containing .txt/.srt file pairs.
 #
 # For each pair, sends the SRT text (one line per block) to the API, gets back
@@ -9,19 +9,21 @@
 set -euo pipefail
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
-CONTEXT_STR=""
+PROVIDER="openai"
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --context)
-      [[ $# -lt 2 ]] && { echo "Error: --context requires a string argument"; exit 1; }
-      CONTEXT_STR="$2"
+    --provider|-p)
+      [[ $# -lt 2 ]] && { echo "Error: --provider requires openai or anthropic"; exit 1; }
+      PROVIDER="$2"
+      [[ "$PROVIDER" != "openai" && "$PROVIDER" != "anthropic" ]] && {
+        echo "Error: --provider must be 'openai' or 'anthropic'"; exit 1; }
       shift 2
       ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: lec-correct [--context \"string\"]"
+      echo "Usage: lec-correct [-p|--provider openai|anthropic]"
       exit 1
       ;;
   esac
@@ -38,20 +40,30 @@ if ! command -v jq &>/dev/null; then
 fi
 
 # ── API key check ──────────────────────────────────────────────────────────────
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-  echo "Error: ANTHROPIC_API_KEY is not set."
-  echo "Hint: Add to ~/.zshrc: export ANTHROPIC_API_KEY=\$(security find-generic-password -a \"\$USER\" -s \"anthropic-api-key\" -w)"
-  exit 1
+if [[ "$PROVIDER" == "openai" ]]; then
+  if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+    echo "Error: OPENAI_API_KEY is not set."
+    echo "Hint: Add to ~/.zshrc: export OPENAI_API_KEY=\$(security find-generic-password -a \"\$USER\" -s \"openai-api-key\" -w)"
+    exit 1
+  fi
+else
+  if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "Error: ANTHROPIC_API_KEY is not set."
+    echo "Hint: Add to ~/.zshrc: export ANTHROPIC_API_KEY=\$(security find-generic-password -a \"\$USER\" -s \"anthropic-api-key\" -w)"
+    exit 1
+  fi
 fi
 
-# ── Determine context ──────────────────────────────────────────────────────────
-# Priority: --context flag > context.txt in current dir > generic fallback
-if [[ -z "$CONTEXT_STR" && -f "context.txt" ]]; then
-  CONTEXT_STR="$(cat context.txt)"
-fi
-[[ -z "$CONTEXT_STR" ]] && CONTEXT_STR="general lecture transcription"
+# ── Model selection & pricing (per million tokens) ────────────────────────────
+OPENAI_MODEL="gpt-5.5"
+OPENAI_INPUT_PRICE=2.50
+OPENAI_OUTPUT_PRICE=15.00
 
-SYSTEM_PROMPT="You are correcting an automatic speech recognition transcript. Fix transcription errors: misheard words, wrong proper nouns, garbled technical terms. Do not paraphrase or summarize — preserve the speaker's words exactly except where clearly wrong. Return only the corrected text with the same number of lines as the input — one corrected line per input line. No commentary. Domain context: ${CONTEXT_STR}"
+ANTHROPIC_MODEL="claude-sonnet-4-6"
+ANTHROPIC_INPUT_PRICE=3.00
+ANTHROPIC_OUTPUT_PRICE=15.00
+
+SYSTEM_PROMPT="You are correcting an automatic speech recognition transcript of an academic lecture. Fix transcription errors: misheard words, wrong proper nouns, garbled technical terms. Rules: (1) Be conservative — if you are not certain a word is wrong, leave it exactly as-is. (2) Never substitute a similar-sounding or visually similar word unless the original is clearly a mishearing. (3) Be consistent across the whole document — if a name or term appears multiple times, use the same corrected form every time. (4) Do not paraphrase or summarize — preserve the speaker's exact words and sentence structure. (5) Return only the corrected text with the same number of lines as the input — one corrected line per input line. No commentary."
 
 # ── Collect .txt/.srt file pairs ───────────────────────────────────────────────
 PAIRS=()
@@ -83,31 +95,60 @@ extract_srt_text_lines() {
   ' "$1"
 }
 
-# ── Helper: call Anthropic API ─────────────────────────────────────────────────
-# Accepts multi-line text on stdin (one segment per line), prints corrected text.
+# ── Helper: call API ───────────────────────────────────────────────────────────
+# Accepts text as $1, prints corrected text. Uses $PROVIDER.
 call_api() {
   local content="$1"
   local payload response
 
-  payload=$(jq -n \
-    --arg model  "claude-sonnet-4-5" \
-    --arg system "$SYSTEM_PROMPT" \
-    --arg text   "$content" \
-    '{model: $model, max_tokens: 8192, system: $system,
-      messages: [{role: "user", content: $text}]}')
+  if [[ "$PROVIDER" == "openai" ]]; then
+    payload=$(jq -n \
+      --arg model  "$OPENAI_MODEL" \
+      --arg system "$SYSTEM_PROMPT" \
+      --arg text   "$content" \
+      '{model: $model, max_completion_tokens: 8192,
+        messages: [{role: "system", content: $system},
+                   {role: "user",   content: $text}]}')
 
-  response=$(curl -sf https://api.anthropic.com/v1/messages \
-    -H "x-api-key: $ANTHROPIC_API_KEY"      \
-    -H "anthropic-version: 2023-06-01"      \
-    -H "content-type: application/json"     \
-    -d "$payload")
+    response=$(curl -s https://api.openai.com/v1/chat/completions \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -H "content-type: application/json"        \
+      -d "$payload") || {
+        echo "Error: network error (curl failed)" >&2; exit 1; }
 
-  if echo "$response" | jq -e '.error' &>/dev/null; then
-    echo "API error: $(echo "$response" | jq -r '.error.message')" >&2
-    exit 1
+    if echo "$response" | jq -e '.error' &>/dev/null; then
+      echo "API error: $(echo "$response" | jq -r '.error.message')" >&2
+      exit 1
+    fi
+
+    jq -r '.usage.prompt_tokens, .usage.completion_tokens' <<< "$response" \
+      | paste - - >> "$TOKENS_FILE"
+    echo "$response" | jq -r '.choices[0].message.content'
+
+  else
+    payload=$(jq -n \
+      --arg model  "$ANTHROPIC_MODEL" \
+      --arg system "$SYSTEM_PROMPT" \
+      --arg text   "$content" \
+      '{model: $model, max_tokens: 8192, system: $system,
+        messages: [{role: "user", content: $text}]}')
+
+    response=$(curl -sf https://api.anthropic.com/v1/messages \
+      -H "x-api-key: $ANTHROPIC_API_KEY"      \
+      -H "anthropic-version: 2023-06-01"      \
+      -H "content-type: application/json"     \
+      -d "$payload") || {
+        echo "Error: curl failed — check network or ANTHROPIC_API_KEY" >&2; exit 1; }
+
+    if echo "$response" | jq -e '.error' &>/dev/null; then
+      echo "API error: $(echo "$response" | jq -r '.error.message')" >&2
+      exit 1
+    fi
+
+    jq -r '.usage.input_tokens, .usage.output_tokens' <<< "$response" \
+      | paste - - >> "$TOKENS_FILE"
+    echo "$response" | jq -r '.content[0].text'
   fi
-
-  echo "$response" | jq -r '.content[0].text'
 }
 
 # ── Helper: rebuild SRT substituting corrected text lines ─────────────────────
@@ -136,7 +177,10 @@ rebuild_srt() {
 }
 
 # ── Process each pair ──────────────────────────────────────────────────────────
-PAIRS_PROCESSED=0
+TOTAL_LINES_CHANGED=0
+declare -a PAIR_NAMES=()
+declare -a PAIR_CHANGES=()
+TOKENS_FILE=$(mktemp)   # accumulates "input_tok\toutput_tok" per API call
 
 for BASE in "${PAIRS[@]}"; do
   TXT="${BASE}.txt"
@@ -187,6 +231,10 @@ for BASE in "${PAIRS[@]}"; do
     done
   fi
 
+  CHANGED=$(paste "$SRT_LINES" "$CORRECTED" | awk -F'\t' '$1 != $2' | wc -l | tr -d ' ')
+  PAIR_NAMES+=("$BASE")
+  PAIR_CHANGES+=("$CHANGED")
+
   # Rewrite .srt with corrected text, timestamps untouched
   rebuild_srt "$SRT" "$CORRECTED" > "${SRT}.tmp" && mv "${SRT}.tmp" "$SRT"
 
@@ -196,9 +244,29 @@ for BASE in "${PAIRS[@]}"; do
   rm "$SRT_LINES" "$CORRECTED"
 
   PAIR_END=$(date +%s)
-  echo "  Done in $((PAIR_END - PAIR_START))s"
-  PAIRS_PROCESSED=$(( PAIRS_PROCESSED + 1 ))
+  echo "  Done in $((PAIR_END - PAIR_START))s — ${CHANGED} $( [[ $CHANGED -eq 1 ]] && echo line || echo lines ) changed"
+  TOTAL_LINES_CHANGED=$(( TOTAL_LINES_CHANGED + CHANGED ))
 done
+
+# ── Cost calculation ──────────────────────────────────────────────────────────
+TOTAL_IN=0; TOTAL_OUT=0
+if [[ -s "$TOKENS_FILE" ]]; then
+  while IFS=$'\t' read -r in_tok out_tok; do
+    TOTAL_IN=$(( TOTAL_IN + ${in_tok:-0} ))
+    TOTAL_OUT=$(( TOTAL_OUT + ${out_tok:-0} ))
+  done < "$TOKENS_FILE"
+fi
+rm "$TOKENS_FILE"
+
+if [[ "$PROVIDER" == "openai" ]]; then
+  COST=$(awk -v i="$TOTAL_IN" -v o="$TOTAL_OUT" \
+    -v ip="$OPENAI_INPUT_PRICE" -v op="$OPENAI_OUTPUT_PRICE" \
+    'BEGIN{printf "$%.4f", i/1e6*ip + o/1e6*op}')
+else
+  COST=$(awk -v i="$TOTAL_IN" -v o="$TOTAL_OUT" \
+    -v ip="$ANTHROPIC_INPUT_PRICE" -v op="$ANTHROPIC_OUTPUT_PRICE" \
+    'BEGIN{printf "$%.4f", i/1e6*ip + o/1e6*op}')
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 SCRIPT_END=$(date +%s)
@@ -206,5 +274,12 @@ TOTAL=$(( SCRIPT_END - SCRIPT_START ))
 
 echo ""
 echo "── Summary ─────────────────────────────────────────────────────────────────"
-printf "  %-18s %s\n" "Pairs corrected:" "$PAIRS_PROCESSED"
+MODEL_LABEL="$( [[ "$PROVIDER" == "openai" ]] && echo "$OPENAI_MODEL" || echo "$ANTHROPIC_MODEL" )"
+for i in "${!PAIR_NAMES[@]}"; do
+  n="${PAIR_CHANGES[$i]}"
+  printf "  %-18s %s\n" "${PAIR_NAMES[$i]}:" "$n $( [[ $n -eq 1 ]] && echo line || echo lines ) changed"
+done
+printf "  %-18s %s\n" "Total changed:"   "$TOTAL_LINES_CHANGED"
+printf "  %-18s %s\n" "Model:"           "$MODEL_LABEL"
+printf "  %-18s %s\n" "Cost:"            "$COST  (${TOTAL_IN} in / ${TOTAL_OUT} out tokens)"
 printf "  %-18s %s\n" "Total time:"      "${TOTAL}s"
