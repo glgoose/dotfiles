@@ -1,47 +1,81 @@
 #!/usr/bin/env bash
-# lec-archive — normalize and encode lecture WAV files to Opus or FLAC
-# Usage: lec-archive [--flac] [--skip-normalize]
+# lec-archive — archive lecture WAVs as mono FLAC and/or mono Opus
+# Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-r|--rename]
 # Run from inside the lecture folder (e.g. "260402 feminism")
 # WAV files are never deleted — remove them manually once lec-process is done.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
 # ── Defaults ───────────────────────────────────────────────────────────────────
-USE_FLAC=false
+OUTPUT_MODE="both" # both | flac | opus
+MODE_SET=false
 SKIP_NORMALIZE=false
+RENAME=false
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --flac)           USE_FLAC=true;       shift ;;
-    --skip-normalize) SKIP_NORMALIZE=true; shift ;;
+    --flac|-f)
+      if [[ "$MODE_SET" == true && "$OUTPUT_MODE" != "flac" ]]; then
+        echo "Error: choose only one output mode flag: --flac or --opus"
+        exit 1
+      fi
+      OUTPUT_MODE="flac"
+      MODE_SET=true
+      shift
+      ;;
+    --opus|-o)
+      if [[ "$MODE_SET" == true && "$OUTPUT_MODE" != "opus" ]]; then
+        echo "Error: choose only one output mode flag: --flac or --opus"
+        exit 1
+      fi
+      OUTPUT_MODE="opus"
+      MODE_SET=true
+      shift
+      ;;
+    --skip-normalize|-s) SKIP_NORMALIZE=true; shift ;;
+    --rename|-r)         RENAME=true;         shift ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: lec-archive [--flac] [--skip-normalize]"
+      echo "Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-r|--rename]"
       exit 1
       ;;
   esac
 done
 
 # ── Dependency check ───────────────────────────────────────────────────────────
-if ! command -v ffmpeg &>/dev/null; then
-  echo "Error: ffmpeg not found. Install with: brew install ffmpeg"
-  exit 1
+REQUIRED_CMDS=(ffmpeg ffprobe)
+if [[ "$OUTPUT_MODE" != "flac" && "$SKIP_NORMALIZE" == false ]]; then
+  REQUIRED_CMDS+=(jq)
 fi
 
-# ── Collect WAV files, sorted alphabetically ──────────────────────────────────
+for cmd in "${REQUIRED_CMDS[@]}"; do
+  if ! command -v "$cmd" &>/dev/null; then
+    INSTALL_HINT="$cmd"
+    [[ "$cmd" == "ffprobe" ]] && INSTALL_HINT="ffmpeg"
+    echo "Error: $cmd not found. Install with: brew install $INSTALL_HINT"
+    exit 1
+  fi
+done
+
+# ── Collect input files: prefer FLAC, fall back to WAV ────────────────────────
 WAV_FILES=()
 while IFS= read -r f; do
   WAV_FILES+=("$f")
-done < <(find . -maxdepth 1 -iname "*.wav" | sed 's|^\./||' | sort)
+done < <(find . -maxdepth 1 -iname "*.flac" | sed 's|^\./||' | sort)
 
 if [[ ${#WAV_FILES[@]} -eq 0 ]]; then
-  echo "Error: no .wav files found in the current directory."
+  while IFS= read -r f; do
+    WAV_FILES+=("$f")
+  done < <(find . -maxdepth 1 -iname "*.wav" | sed 's|^\./||' | sort)
+fi
+
+if [[ ${#WAV_FILES[@]} -eq 0 ]]; then
+  echo "Error: no .flac or .wav files found in the current directory."
   exit 1
 fi
 
 SCRIPT_START=$(date +%s)
+FOLDER=$(basename "$PWD")
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 file_bytes() { wc -c < "$1" | tr -d ' '; }
@@ -55,46 +89,111 @@ human_size() {
   }'
 }
 
-# ── Step 1: Normalize ─────────────────────────────────────────────────────────
-if [[ "$SKIP_NORMALIZE" == false ]]; then
-  echo ""
-  echo "── Step 1: Normalize (-16 LUFS / -1 dBTP / LRA 9) ─────────────────────────"
-  for FILE in "${WAV_FILES[@]}"; do
-    "$SCRIPT_DIR/lec-normalize" "$FILE"
-  done
-fi
+format_duration() {
+  awk -v s="$1" 'BEGIN{
+    h=int(s/3600); m=int((s%3600)/60)
+    if (h>0) printf "%dh%02dm", h, m
+    else     printf "%dm", m
+  }'
+}
 
-# ── Step 2: Encode ────────────────────────────────────────────────────────────
+percent_of() {
+  awk -v n="$1" -v d="$2" 'BEGIN {
+    if (d == 0) printf "n/a"
+    else        printf "%.1f%%", n/d*100
+  }'
+}
+
+# ── Encode (+ optional normalize for Opus) ────────────────────────────────────
 echo ""
-if [[ "$USE_FLAC" == true ]]; then
-  EXT="flac"
-  echo "── Step 2: Encode to FLAC (compression level 8) ────────────────────────────"
-else
-  EXT="opus"
-  echo "── Step 2: Encode to Opus (96 kbps) ────────────────────────────────────────"
-fi
+case "$OUTPUT_MODE" in
+  both)
+    if [[ "$SKIP_NORMALIZE" == false ]]; then
+      echo "── Encode FLAC (mono, level 8) + normalize+encode Opus (mono, 96 kbps) ───────"
+    else
+      echo "── Encode FLAC (mono, level 8) + encode Opus (mono, 96 kbps; normalize skipped) ─"
+    fi
+    ;;
+  flac)
+    echo "── Encode to FLAC (mono, compression level 8) ─────────────────────────────────"
+    ;;
+  opus)
+    echo "── Encode to Opus (mono, 96 kbps)$([[ "$SKIP_NORMALIZE" == true ]] && echo '; normalize skipped') ─────────────────────"
+    ;;
+esac
 
 FILES_PROCESSED=0
-TOTAL_SAVED=0
+TOTAL_AUDIO=0
+TOTAL_INPUT=0
+TOTAL_FLAC=0
+TOTAL_OPUS=0
 
 for FILE in "${WAV_FILES[@]}"; do
-  NAME="${FILE%.wav}"
-  OUTPUT="${NAME}.${EXT}"
+  DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$FILE" 2>/dev/null | awk '{printf "%d", $1}')
+  TOTAL_AUDIO=$((TOTAL_AUDIO + DURATION))
 
-  SIZE_BEFORE=$(file_bytes "$FILE")
-  echo "  $FILE → $OUTPUT  ($(human_size "$SIZE_BEFORE"))"
-
-  if [[ "$USE_FLAC" == true ]]; then
-    ffmpeg -y -i "$FILE" -compression_level 8 "$OUTPUT" 2>/dev/null
+  NAME="${FILE%.[Ff][Ll][Aa][Cc]}"
+  NAME="${NAME%.[Ww][Aa][Vv]}"
+  if [[ "$RENAME" == true ]]; then
+    BASE_NAME="${FOLDER}_$((FILES_PROCESSED + 1))"
   else
-    ffmpeg -y -i "$FILE" -c:a libopus -b:a 96k "$OUTPUT" 2>/dev/null
+    BASE_NAME="$NAME"
   fi
 
-  SIZE_AFTER=$(file_bytes "$OUTPUT")
-  SAVED=$((SIZE_BEFORE - SIZE_AFTER))
-  TOTAL_SAVED=$((TOTAL_SAVED + SAVED))
+  OUTPUT_FLAC="${BASE_NAME}.flac"
+  OUTPUT_OPUS="${BASE_NAME}.opus"
+  SIZE_BEFORE=$(file_bytes "$FILE")
+  TOTAL_INPUT=$((TOTAL_INPUT + SIZE_BEFORE))
 
-  echo "    $(human_size "$SIZE_BEFORE") → $(human_size "$SIZE_AFTER")  (saved $(human_size "$SAVED"))"
+  echo "  $FILE  ($(human_size "$SIZE_BEFORE"))"
+
+  if [[ "$OUTPUT_MODE" == "both" || "$OUTPUT_MODE" == "flac" ]]; then
+    if [[ "$FILE" == "$OUTPUT_FLAC" ]]; then
+      SIZE_FLAC=$(file_bytes "$OUTPUT_FLAC")
+      TOTAL_FLAC=$((TOTAL_FLAC + SIZE_FLAC))
+      echo "    FLAC: $OUTPUT_FLAC  (already FLAC, skipped re-encode)"
+    else
+      ffmpeg -y -i "$FILE" -c:a flac -sample_fmt s16 -compression_level 8 -ac 1 "$OUTPUT_FLAC" 2>/dev/null
+      SIZE_FLAC=$(file_bytes "$OUTPUT_FLAC")
+      SAVED_FLAC=$((SIZE_BEFORE - SIZE_FLAC))
+      TOTAL_FLAC=$((TOTAL_FLAC + SIZE_FLAC))
+      echo "    FLAC: $OUTPUT_FLAC  ($(human_size "$SIZE_BEFORE") → $(human_size "$SIZE_FLAC"), saved $(human_size "$SAVED_FLAC"))"
+    fi
+  fi
+
+  if [[ "$OUTPUT_MODE" == "both" || "$OUTPUT_MODE" == "opus" ]]; then
+    if [[ "$SKIP_NORMALIZE" == false ]]; then
+      echo "    Opus: analyzing loudness..."
+      STATS=$(ffmpeg -i "$FILE" \
+        -af "loudnorm=I=-16:TP=-1:LRA=9:print_format=json" \
+        -f null - 2>&1)
+
+      JSON=$(echo "$STATS" | grep -A20 'Parsed_loudnorm' \
+        | awk '/\{/{p=1} p{print; if(/\}/)exit}' \
+        | sed 's/: *-inf/: "-999.0"/g; s/: *nan/: "0.0"/g' \
+        | jq '.')
+
+      input_i=$(      echo "$JSON" | jq -r '.input_i')
+      input_tp=$(     echo "$JSON" | jq -r '.input_tp')
+      input_lra=$(    echo "$JSON" | jq -r '.input_lra')
+      input_thresh=$( echo "$JSON" | jq -r '.input_thresh')
+      target_offset=$(echo "$JSON" | jq -r '.target_offset')
+
+      LOUDNORM_AF="loudnorm=I=-16:TP=-1:LRA=9:\
+measured_I=${input_i}:measured_TP=${input_tp}:measured_LRA=${input_lra}:\
+measured_thresh=${input_thresh}:offset=${target_offset}:\
+linear=true:print_format=summary"
+
+      ffmpeg -y -i "$FILE" -af "$LOUDNORM_AF" -c:a libopus -ac 1 -b:a 96k "$OUTPUT_OPUS" 2>/dev/null
+    else
+      ffmpeg -y -i "$FILE" -c:a libopus -ac 1 -b:a 96k "$OUTPUT_OPUS" 2>/dev/null
+    fi
+
+    SIZE_OPUS=$(file_bytes "$OUTPUT_OPUS")
+    SAVED_OPUS=$((SIZE_BEFORE - SIZE_OPUS))
+    TOTAL_OPUS=$((TOTAL_OPUS + SIZE_OPUS))
+    echo "    Opus: $OUTPUT_OPUS  ($(human_size "$SIZE_BEFORE") → $(human_size "$SIZE_OPUS"), saved $(human_size "$SAVED_OPUS"))"
+  fi
 
   FILES_PROCESSED=$((FILES_PROCESSED + 1))
 done
@@ -103,13 +202,49 @@ done
 SCRIPT_END=$(date +%s)
 TOTAL=$((SCRIPT_END - SCRIPT_START))
 
-STEPS="encode"
-[[ "$SKIP_NORMALIZE" == false ]] && STEPS="normalize, encode"
+case "$OUTPUT_MODE" in
+  both)
+    MODE_LABEL="both (FLAC then Opus)"
+    if [[ "$SKIP_NORMALIZE" == false ]]; then
+      STEPS="encode FLAC + normalize + encode Opus"
+    else
+      STEPS="encode FLAC + encode Opus"
+    fi
+    ;;
+  flac)
+    MODE_LABEL="flac-only"
+    STEPS="encode FLAC"
+    ;;
+  opus)
+    MODE_LABEL="opus-only"
+    if [[ "$SKIP_NORMALIZE" == false ]]; then
+      STEPS="normalize + encode Opus"
+    else
+      STEPS="encode Opus"
+    fi
+    ;;
+esac
 
 echo ""
 echo "── Summary ─────────────────────────────────────────────────────────────────"
 printf "  %-18s %s\n" "Files processed:" "$FILES_PROCESSED"
 printf "  %-18s %s\n" "Steps run:"       "$STEPS"
-printf "  %-18s %s\n" "Output format:"   "$EXT"
-printf "  %-18s %s\n" "Total saved:"     "$(human_size "$TOTAL_SAVED")"
-printf "  %-18s %s\n" "Total time:"      "${TOTAL}s"
+printf "  %-18s %s\n" "Output mode:"    "$MODE_LABEL"
+printf "  %-18s %s\n" "Channels:"       "mono (ac=1)"
+printf "  %-18s %s\n" "Total audio:"    "$(format_duration "$TOTAL_AUDIO")"
+printf "  %-18s %s\n" "Input total:"    "$(human_size "$TOTAL_INPUT")"
+
+if [[ "$OUTPUT_MODE" == "both" || "$OUTPUT_MODE" == "flac" ]]; then
+  printf "  %-18s %s\n" "FLAC total:" "$(human_size "$TOTAL_FLAC") ($(percent_of "$TOTAL_FLAC" "$TOTAL_INPUT") of input)"
+fi
+
+if [[ "$OUTPUT_MODE" == "both" || "$OUTPUT_MODE" == "opus" ]]; then
+  printf "  %-18s %s\n" "Opus total:" "$(human_size "$TOTAL_OPUS") ($(percent_of "$TOTAL_OPUS" "$TOTAL_INPUT") of input)"
+fi
+
+if [[ "$OUTPUT_MODE" == "both" ]]; then
+  COMBINED=$((TOTAL_FLAC + TOTAL_OPUS))
+  printf "  %-18s %s\n" "Combined total:" "$(human_size "$COMBINED") ($(percent_of "$COMBINED" "$TOTAL_INPUT") of input)"
+fi
+
+printf "  %-18s %s\n" "Total time:" "$(awk -v t="$TOTAL" 'BEGIN{printf "%.1fm (%ds)", t/60, t}')"
