@@ -1,6 +1,6 @@
 [user]
 	name = Glenn Goossens
-	email = glgoose@pm.me
+	email = 48956933+glgoose@users.noreply.github.com
 	signingkey = 9A2743456A90FFC8B3EB32064444BD34EFE79F4E
 
 [core]
@@ -29,5 +29,3 @@
 
 [pull]
 	rebase = false
-[credential "https://dev.azure.com"]
-	useHttpPath = true
