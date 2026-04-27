@@ -803,6 +803,15 @@
   "harper.linters.LongSentences": false,
   "editor.formatOnSave": true,
   "claudeCode.preferredLocation": "panel",
-  "claudeCode.useTerminal": true,
   "claudeCode.allowDangerouslySkipPermissions": true,
+  "astro.content-intellisense": true,
+  "bridge.token": "4ea87127f8ddd8088fd40c7d9996c2da97c680ad51f7edbde4a91f7fe140bd6a",
+  "bridge.port": 61198,
+  "github.copilot.enable": {
+    "*": true,
+    "markdown": false,
+  },
+  "PandocCiter.DefaultBib": "/Users/glenn/.local/share/bib/refs.json",
+  "github.copilot.chat.claudeAgent.allowDangerouslySkipPermissions": true,
+  "security.workspace.trust.untrustedFiles": "open",
 }
