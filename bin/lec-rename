@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# lec-rename — rename files in the current folder to <foldername>_N.<ext>
+# Usage: lec-rename [-e|--ext EXT]... [-n|--dry-run]
+# Run from inside the lecture folder.
+# Default extensions: wav opus flac srt txt
+# Files within each extension group are sorted alphabetically before numbering.
+set -euo pipefail
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+DRY_RUN=false
+EXTS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ext|-e)
+      [[ $# -lt 2 ]] && { echo "Error: --ext requires a value"; exit 1; }
+      EXTS+=("$2"); shift 2 ;;
+    --dry-run|-n) DRY_RUN=true; shift ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: lec-rename [-e|--ext EXT]... [-n|--dry-run]"
+      exit 1 ;;
+  esac
+done
+
+if [[ ${#EXTS[@]} -eq 0 ]]; then
+  EXTS=(wav opus flac srt txt)
+fi
+
+# ── Rename ─────────────────────────────────────────────────────────────────────
+FOLDER=$(basename "$PWD")
+TOTAL_RENAMES=0
+
+echo ""
+[[ "$DRY_RUN" == true ]] && PREFIX="[dry run] " || PREFIX=""
+echo "── ${PREFIX}Rename → \"$FOLDER\" ─────────────────────────────────────────────────"
+
+for EXT in "${EXTS[@]}"; do
+  FILES=()
+  while IFS= read -r f; do
+    FILES+=("$f")
+  done < <(find . -maxdepth 1 -iname "*.${EXT}" | sed 's|^\./||' | sort)
+
+  [[ ${#FILES[@]} -eq 0 ]] && continue
+
+  N=1
+  for FILE in "${FILES[@]}"; do
+    ORIG_EXT="${FILE##*.}"
+    NEW="${FOLDER}_${N}.${ORIG_EXT}"
+    if [[ "$FILE" == "$NEW" ]]; then
+      echo "  $FILE (unchanged)"
+    else
+      echo "  $FILE → $NEW"
+      if [[ "$DRY_RUN" == false ]]; then
+        mv -- "$FILE" "$NEW"
+      fi
+      TOTAL_RENAMES=$((TOTAL_RENAMES + 1))
+    fi
+    N=$((N + 1))
+  done
+done
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo "── Summary ─────────────────────────────────────────────────────────────────"
+if [[ "$DRY_RUN" == true ]]; then
+  printf "  %-18s %s\n" "Would rename:" "$TOTAL_RENAMES file(s)"
+else
+  printf "  %-18s %s\n" "Renamed:" "$TOTAL_RENAMES file(s)"
+fi
