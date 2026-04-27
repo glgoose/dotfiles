@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Usage: scan-to-pdf [OPTIONS] input.tif output.pdf
+#
+# Converts a scanned TIFF to a high-quality compressed PDF.
+# Single JPEG pass via img2pdf — no generation loss.
+#
+# Options:
+#   -q, --quality N     JPEG quality 1-100 (default: 90)
+#   -d, --dpi N         Output DPI (default: 300)
+#   -r, --rotate N      Rotate degrees: 90, 180, 270 (default: none)
+#   -e, --enhance       CLAHE local contrast on L-channel — recovers faint ink near page edges (off by default)
+#   --contrast          Apply auto contrast stretch (off by default)
+#   --sharpen           Apply unsharp mask after contrast (for crisp edges)
+#   --pdfa              PDF/A-2b output + OCR layer (on by default, requires ocrmypdf if OCR used)
+#   --no-ocr            Skip OCR text layer (disables PDF/A conversion)
+#   -l, --lang LANG     OCR language(s), Tesseract codes (default: nld)
+#                       Examples: eng, nld, nld+lat, nld+fra+eng
+#                       List installed: tesseract --list-langs
+#   --keep-intermediates  Don't delete intermediate files
+#   -h, --help          Show this help
+#
+# Examples:
+#   scan-to-pdf scan.tif degree.pdf                    # Creates PDF/A-2b with OCR (default)
+#   scan-to-pdf --no-ocr scan.tif degree.pdf           # Regular PDF, no OCR
+#   scan-to-pdf -r 90 scan.tif degree.pdf              # Rotated, PDF/A-2b with OCR
+#   scan-to-pdf -r 90 --enhance scan.tif degree.pdf    # Enhanced, PDF/A-2b with OCR
+#   scan-to-pdf -r 90 --contrast --sharpen scan.tif degree.pdf
+#
+# Pipeline:
+#   TIFF → (rotate) → Lanczos resample → (CLAHE enhance) → (contrast stretch) → (USM) → JPEG q{N} 1x1
+#        → img2pdf (lossless wrap) → [ocrmypdf PDF/A-2b]
+#
+# Dependencies: imagemagick, img2pdf, ocrmypdf (optional)
+
+set -euo pipefail
+
+QUALITY=90
+DPI=300
+ROTATE=""
+CONTRAST=0
+ENHANCE=0
+SHARPEN=0
+PDFA=1
+NO_OCR=0
+LANG="nld"
+KEEP=0
+INPUT=""
+OUTPUT=""
+
+usage() {
+  sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -q|--quality)        QUALITY="$2"; shift 2 ;;
+    -d|--dpi)            DPI="$2"; shift 2 ;;
+    -r|--rotate)         ROTATE="$2"; shift 2 ;;
+    -e|--enhance)        ENHANCE=1; shift ;;
+    --contrast)          CONTRAST=1; shift ;;
+    --sharpen)           SHARPEN=1; shift ;;
+    --pdfa)              PDFA=1; shift ;;
+    --no-ocr)            NO_OCR=1; shift ;;
+    -l|--lang)           LANG="$2"; shift 2 ;;
+    --keep-intermediates) KEEP=1; shift ;;
+    -h|--help)           usage 0 ;;
+    *.tif|*.tiff|*.TIF|*.TIFF) INPUT="$1"; shift ;;
+    *.pdf|*.PDF)         OUTPUT="$1"; shift ;;
+    *) echo "Unknown argument: $1" >&2; usage 1 ;;
+  esac
+done
+
+[[ -z "$INPUT" ]]  && { echo "Error: no input TIFF specified" >&2; usage 1; }
+[[ -z "$OUTPUT" ]] && { echo "Error: no output PDF specified" >&2; usage 1; }
+[[ -f "$INPUT" ]]  || { echo "Error: input file not found: $INPUT" >&2; exit 1; }
+
+command -v magick   >/dev/null 2>&1 || { echo "Error: imagemagick not found" >&2; exit 1; }
+command -v img2pdf  >/dev/null 2>&1 || { echo "Error: img2pdf not found (brew install img2pdf)" >&2; exit 1; }
+if [[ $PDFA -eq 1 ]] && [[ $NO_OCR -eq 0 ]]; then
+  command -v ocrmypdf >/dev/null 2>&1 || { echo "Error: ocrmypdf not found (brew install ocrmypdf)" >&2; exit 1; }
+fi
+
+TMPDIR_WORK=$(mktemp -d)
+trap '[[ $KEEP -eq 0 ]] && rm -rf "$TMPDIR_WORK"' EXIT
+
+TMP_TIF="$TMPDIR_WORK/resampled.tif"
+TMP_JPG="$TMPDIR_WORK/compressed.jpg"
+TMP_PDF="$TMPDIR_WORK/wrapped.pdf"
+
+echo "Input:    $INPUT"
+echo "Output:   $OUTPUT"
+echo "DPI:      $DPI  Quality: $QUALITY  Rotate: ${ROTATE:-none}"
+echo "Enhance:  $ENHANCE  Contrast: $CONTRAST  Sharpen: $SHARPEN  PDF/A: $PDFA  OCR: $((1 - NO_OCR))  Lang: $LANG"
+echo
+
+# Step 1: rotate (optional) + Lanczos resample to target DPI
+MAGICK_RESAMPLE=(-filter Lanczos -resample "$DPI" -density "$DPI")
+[[ -n "$ROTATE" ]] && MAGICK_RESAMPLE=(-rotate "$ROTATE" "${MAGICK_RESAMPLE[@]}")
+
+echo "→ Resampling to ${DPI} DPI..."
+magick "$INPUT" "${MAGICK_RESAMPLE[@]}" "$TMP_TIF"
+
+# Step 2: enhancements → single JPEG encode
+# Order: CLAHE (local contrast) → global contrast → USM → encode
+MAGICK_ENCODE=()
+[[ $ENHANCE   -eq 1 ]] && MAGICK_ENCODE+=(-colorspace LAB -channel R -clahe 50x50%+256+3 +channel -colorspace sRGB)
+[[ $CONTRAST  -eq 1 ]] && MAGICK_ENCODE+=(-contrast-stretch 0.5%x0.5%)
+[[ $SHARPEN   -eq 1 ]] && MAGICK_ENCODE+=(-unsharp 0x1+0.5+0.03)
+MAGICK_ENCODE+=(-quality "$QUALITY" -sampling-factor 1x1)
+
+echo "→ Encoding JPEG (q${QUALITY}, enhance: $ENHANCE, contrast: $CONTRAST, sharpen: $SHARPEN)..."
+magick "$TMP_TIF" "${MAGICK_ENCODE[@]}" "$TMP_JPG"
+
+# Step 3: lossless wrap into PDF (img2pdf embeds JPEG bytes verbatim — no re-encode)
+echo "→ Wrapping into PDF..."
+img2pdf "$TMP_JPG" -o "$TMP_PDF"
+
+if [[ $PDFA -eq 1 ]] && [[ $NO_OCR -eq 0 ]]; then
+  # Step 4: OCR text layer + PDF/A-2b conformance, lossless image optimizer
+  echo "→ Running OCR + PDF/A-2b conversion..."
+  ocrmypdf --output-type pdfa-2 --optimize 1 --quiet -l "$LANG" "$TMP_PDF" "$OUTPUT"
+else
+  cp "$TMP_PDF" "$OUTPUT"
+fi
+
+SIZE=$(du -sh "$OUTPUT" | cut -f1)
+echo
+echo "Done: $OUTPUT ($SIZE)"

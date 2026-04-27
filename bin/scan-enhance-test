@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Usage: scan-enhance-test [-o OUTDIR] [-w PCT] [-r DEG] [-R REF.tif] TIFF
+#
+# Crops the right edge of TIFF (after rotation) and runs a grid of
+# ImageMagick enhancement recipes. Outputs a labeled montage for comparison.
+# Optionally prepend a reference TIFF (unprocessed) as the first cell.
+#
+# Options:
+#   -o, --outdir    Output directory (default: <input-dir>/scan-enhance-<ts>)
+#   -w, --width-pct ROI width as % of rotated page width (default: 20)
+#   -r, --rotate    Clockwise rotation degrees applied before crop (default: 90)
+#   -R, --ref       Reference TIFF: shown as first cell, no processing applied
+#   -h, --help      Show this help
+#
+# Examples:
+#   scan-enhance-test -R SCAN_0006.tif SCAN_0004.tif
+#   scan-enhance-test -w 25 -r 90 scan.tif
+#
+# Dependencies: imagemagick (magick, montage)
+
+set -euo pipefail
+
+WIDTH_PCT=20
+ROTATE=90
+OUTDIR=""
+REF_TIF=""
+INPUT=""
+
+usage() {
+  sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--outdir)    OUTDIR="$2"; shift 2 ;;
+    -w|--width-pct) WIDTH_PCT="$2"; shift 2 ;;
+    -r|--rotate)    ROTATE="$2"; shift 2 ;;
+    -R|--ref)       REF_TIF="$2"; shift 2 ;;
+    -h|--help)      usage 0 ;;
+    *.tif|*.tiff|*.TIF|*.TIFF)
+      [[ -z "$INPUT" ]] && INPUT="$1" || { echo "Error: only one main TIFF supported (use -R for reference)" >&2; exit 1; }
+      shift ;;
+    *) echo "Unknown argument: $1" >&2; usage 1 ;;
+  esac
+done
+
+[[ -z "$INPUT" ]]  && { echo "Error: no input TIFF specified" >&2; usage 1; }
+[[ -f "$INPUT" ]]  || { echo "Error: not found: $INPUT" >&2; exit 1; }
+[[ -n "$REF_TIF" && ! -f "$REF_TIF" ]] && { echo "Error: ref not found: $REF_TIF" >&2; exit 1; }
+
+command -v magick   >/dev/null 2>&1 || { echo "Error: imagemagick not found" >&2; exit 1; }
+command -v montage  >/dev/null 2>&1 || { echo "Error: montage not found (part of imagemagick)" >&2; exit 1; }
+
+if [[ -z "$OUTDIR" ]]; then
+  OUTDIR="$(dirname "$INPUT")/scan-enhance-$(date +%Y%m%d_%H%M%S)"
+fi
+
+mkdir -p "$OUTDIR/roi"
+
+# Variant definitions: parallel arrays
+LABELS=(
+  "clahe-orig"
+  "clahe-L-8-c2"
+  "clahe-L-8-c3"
+  "clahe-L-8-c4"
+  "clahe-L-25-c3"
+  "clahe-L-50-c3"
+  "clahe-orig+usm-safe"
+  "clahe-L-8-c3+usm-safe"
+  "clahe-L-8-c3+usm-lo"
+  "level+clahe-L-8"
+  "bgdiv+clahe-L"
+  "sig5+clahe-L"
+)
+
+RECIPES=(
+  "-clahe 50x50%+128+2"
+  "-colorspace LAB -channel R -clahe 8x8%+256+2 +channel -colorspace sRGB"
+  "-colorspace LAB -channel R -clahe 8x8%+256+3 +channel -colorspace sRGB"
+  "-colorspace LAB -channel R -clahe 8x8%+256+4 +channel -colorspace sRGB"
+  "-colorspace LAB -channel R -clahe 25x25%+256+3 +channel -colorspace sRGB"
+  "-colorspace LAB -channel R -clahe 50x50%+256+3 +channel -colorspace sRGB"
+  "-clahe 50x50%+128+2 -unsharp 0x1.5+0.6+0.05"
+  "-colorspace LAB -channel R -clahe 8x8%+256+3 +channel -colorspace sRGB -unsharp 0x1+0.5+0.05"
+  "-colorspace LAB -channel R -clahe 8x8%+256+3 +channel -colorspace sRGB -unsharp 0x1+0.5+0.02"
+  "-level 10%,90% -colorspace LAB -channel R -clahe 8x8%+256+3 +channel -colorspace sRGB"
+  "-colorspace LAB -channel R -clahe 8x8%+256+3 +channel -colorspace sRGB"
+  "-sigmoidal-contrast 5x50% -colorspace LAB -channel R -clahe 8x8%+256+2 +channel -colorspace sRGB"
+)
+
+N_VARIANTS=${#LABELS[@]}
+MONTAGE_COLS=4
+
+# Helper: crop + resample a TIFF to ROI PNG (no enhancement)
+crop_roi() {
+  local src="$1" dst="$2"
+  local w h crop_w read_out
+
+  read_out=$(magick identify -format "%wx%h\n" "$src" 2>/dev/null | head -1)
+  w=$(echo "$read_out" | cut -dx -f1)
+  h=$(echo "$read_out" | cut -dx -f2)
+  if [[ "$ROTATE" == "90" || "$ROTATE" == "270" ]]; then
+    local tmp=$w; w=$h; h=$tmp
+  fi
+  crop_w=$(( w * WIDTH_PCT / 100 ))
+
+  magick "$src" \
+    -rotate "$ROTATE" \
+    -gravity East -crop "${crop_w}x${h}+0+0" +repage \
+    -filter Lanczos -resample 300 -density 300 \
+    "$dst"
+
+  echo "${crop_w}x${h}"
+}
+
+MONTAGE_INPUTS=()
+
+# --- Reference cell (0006, unprocessed) ---
+if [[ -n "$REF_TIF" ]]; then
+  REF_BASE=$(basename "$REF_TIF" | sed 's/\.[Tt][Ii][Ff][Ff]\?$//')
+  REF_PNG="$OUTDIR/roi/${REF_BASE}_REF.png"
+  echo "Reference: $REF_TIF"
+  echo "→ Rotate ${ROTATE}° + crop right ${WIDTH_PCT}% (no processing)..."
+  DIMS=$(crop_roi "$REF_TIF" "$REF_PNG")
+  echo "→ ROI: ${DIMS} px → 300 DPI"
+  MONTAGE_INPUTS+=(-label "${REF_BASE}\nREF (scanner sharpen)" "$REF_PNG")
+fi
+
+# --- Processed variants (0004) ---
+BASE=$(basename "$INPUT" | sed 's/\.[Tt][Ii][Ff][Ff]\?$//')
+echo
+echo "Processing: $INPUT"
+echo "→ Rotate ${ROTATE}° + crop right ${WIDTH_PCT}%..."
+
+ROI_TIF=$(mktemp /tmp/scan-enhance-roi-XXXXXX.tif)
+trap 'rm -f "$ROI_TIF"' EXIT
+
+DIMS=$(crop_roi "$INPUT" "$ROI_TIF")
+echo "→ ROI: ${DIMS} px → 300 DPI"
+echo "→ Running ${N_VARIANTS} variants..."
+
+for (( i=0; i<N_VARIANTS; i++ )); do
+  LABEL="${LABELS[$i]}"
+  RECIPE="${RECIPES[$i]}"
+  OUT_PNG="$OUTDIR/roi/${BASE}_${LABEL}.png"
+
+  printf "  [%2d/%d] %-15s" "$((i+1))" "$N_VARIANTS" "$LABEL"
+
+  if [[ "$LABEL" == bgdiv* ]]; then
+    # Background-divide needs a two-step pipeline; IM parentheses don't survive string word-split
+    BG_TMP=$(mktemp /tmp/scan-enhance-bg-XXXXXX.tif)
+    magick "$ROI_TIF" -blur 0x80 "$BG_TMP"
+    # shellcheck disable=SC2086
+    magick "$ROI_TIF" "$BG_TMP" -compose Divide_Src -composite -auto-level \
+      ${RECIPE} "$OUT_PNG"
+    rm -f "$BG_TMP"
+  elif [[ -z "$RECIPE" ]]; then
+    magick "$ROI_TIF" "$OUT_PNG"
+  else
+    # shellcheck disable=SC2086
+    magick "$ROI_TIF" $RECIPE "$OUT_PNG"
+  fi
+
+  MONTAGE_INPUTS+=(-label "${BASE}\n${LABEL}" "$OUT_PNG")
+  echo " done"
+done
+
+rm -f "$ROI_TIF"
+trap - EXIT
+
+# --- Montage ---
+COMPARE_ALL="$OUTDIR/compare_all.png"
+echo
+echo "→ Building montage: $COMPARE_ALL"
+
+montage "${MONTAGE_INPUTS[@]}" \
+  -tile "${MONTAGE_COLS}x" \
+  -geometry +4+4 \
+  -font /System/Library/Fonts/SFNSMono.ttf \
+  -pointsize 28 \
+  -background black \
+  -fill white \
+  "$COMPARE_ALL"
+
+echo
+echo "Done. Output: $OUTDIR"
+echo "  compare_all.png   — grid: REF first, then all variants"
+echo "  roi/*.png         — individual cells for pixel-peeping"
+echo
+echo "Open with:"
+echo "  open \"$COMPARE_ALL\""
