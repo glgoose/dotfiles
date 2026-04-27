@@ -73,9 +73,9 @@ if (annotations.length === 0) {
         await exec(QPDF, [pdfPath, '--pages', pdfPath, '2-z', '--', trimmedPath]);
         Zotero.log('[remove-first-page] exec returned without error');
     } catch (e) {
-        Zotero.log(`[remove-first-page] exec threw: ${e}`);
-        showToast(`qpdf failed: ${e.message || String(e)}`);
-        return;
+        // qpdf exits with code 3 for "success with warnings" (e.g. xref issues in JSTOR PDFs).
+        // The output file IS created. Use IOUtils.exists below as the real success check.
+        Zotero.log(`[remove-first-page] exec threw (may be exit-3 warning): ${e}`);
     }
 
     if (!await IOUtils.exists(trimmedPath)) {
@@ -112,7 +112,7 @@ const trimmedPath = PathUtils.join(tmpDir, `zotero_trimmed_${ts}.pdf`);
 // Embed all annotations into a temp PDF and clear them from Zotero DB.
 // transfer: true prevents duplicates when re-importing below.
 try {
-    await Zotero.PDFWorker.export(item.id, exportPath, false, null, true);
+    await Zotero.PDFWorker.export(item.id, exportPath, false, '', true);
 } catch (e) {
     showToast(`Failed to export annotations: ${e.message || String(e)}`);
     return;
@@ -122,9 +122,9 @@ try {
     await exec(QPDF, [exportPath, '--pages', exportPath, '2-z', '--', trimmedPath]);
     Zotero.log('[remove-first-page] exec returned without error (annotations path)');
 } catch (e) {
-    Zotero.log(`[remove-first-page] exec threw (annotations path): ${e}`);
-    showToast(`qpdf failed. Annotation backup at: ${exportPath}`);
-    return;
+    // qpdf exits with code 3 for "success with warnings" (e.g. xref issues in JSTOR PDFs).
+    // The output file IS created. Use IOUtils.exists below as the real success check.
+    Zotero.log(`[remove-first-page] exec threw (annotations path, may be exit-3 warning): ${e}`);
 }
 
 if (!await IOUtils.exists(trimmedPath)) {
@@ -147,7 +147,9 @@ const newAttachment = await Zotero.Attachments.importFromFile({
 });
 
 // Reimport annotations from the embedded PDF into Zotero DB.
-await Zotero.PDFWorker.import(newAttachment.id);
+// transfer: true marks them as native Zotero annotations (not locked/external).
+// Without it, annotations appear locked and require "File > Import Annotations" manually.
+await Zotero.PDFWorker.import(newAttachment.id, false, '', true);
 
 try { await IOUtils.remove(trimmedPath); } catch (_) {}
 
