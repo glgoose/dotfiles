@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# lec-diarize — add speaker labels to transcribed SRTs using pyannote.audio
+# Usage: lec-diarize [file.wav]   (or run with no args to process all WAVs in current folder)
+# Output: <name>.diarized.srt alongside the original SRT
+#
+# Setup (once):
+#   Accept model terms at: huggingface.co/pyannote/speaker-diarization-3.1
+#   security add-generic-password -a "$USER" -s "hf-token" -w
+#   Add to ~/.zshrc: export HF_TOKEN=$(security find-generic-password -a "$USER" -s "hf-token" -w)
+set -euo pipefail
+
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  echo "Error: HF_TOKEN is not set."
+  echo "Hint: security add-generic-password -a \"\$USER\" -s \"hf-token\" -w"
+  echo "      Then add to ~/.zshrc: export HF_TOKEN=\$(security find-generic-password -a \"\$USER\" -s \"hf-token\" -w)"
+  exit 1
+fi
+
+# ── Collect WAV files ──────────────────────────────────────────────────────────
+if [[ $# -gt 0 ]]; then
+  WAV_FILES=("$@")
+else
+  WAV_FILES=()
+  while IFS= read -r f; do
+    WAV_FILES+=("$f")
+  done < <(find . -maxdepth 1 -iname "*.wav" | sed 's|^\./||' | sort)
+fi
+
+if [[ ${#WAV_FILES[@]} -eq 0 ]]; then
+  echo "Error: no .wav files found in the current directory."
+  exit 1
+fi
+
+SCRIPT_START=$(date +%s)
+
+for WAV in "${WAV_FILES[@]}"; do
+  [[ ! -f "$WAV" ]] && { echo "Error: file not found: $WAV"; exit 1; }
+  SRT="${WAV%.wav}.srt"
+  [[ ! -f "$SRT" ]] && { echo "  [skip] $WAV — no matching SRT found"; continue; }
+
+  OUT="${SRT%.srt}.diarized.srt"
+  START=$(date +%s)
+  echo "  Diarizing $(basename "$WAV")..."
+
+  uv run --python 3.11 --with pyannote.audio --with torch python3 - "$WAV" "$SRT" "$OUT" "$HF_TOKEN" << 'PYEOF'
+import sys, re, torch
+from pathlib import Path
+
+wav_path, srt_path, out_path, hf_token = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+from pyannote.audio import Pipeline
+
+# MPS = Apple Silicon GPU, falls back to CPU
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("  Device: MPS (Apple Silicon)")
+else:
+    device = torch.device("cpu")
+    print("  Device: CPU")
+
+pipeline = Pipeline.from_pretrained(
+    "pyannote/speaker-diarization-3.1",
+    use_auth_token=hf_token
+)
+pipeline.to(device)
+
+diarization = pipeline(wav_path)
+
+segments = [
+    (turn.start, turn.end, speaker)
+    for turn, _, speaker in diarization.itertracks(yield_label=True)
+]
+
+def ts_to_sec(ts):
+    h, m, s = ts.replace(',', '.').split(':')
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+def dominant_speaker(start, end):
+    totals = {}
+    for seg_start, seg_end, spk in segments:
+        overlap = min(end, seg_end) - max(start, seg_start)
+        if overlap > 0:
+            totals[spk] = totals.get(spk, 0) + overlap
+    return max(totals, key=totals.get) if totals else None
+
+TS_RE = re.compile(r'(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})')
+lines = Path(srt_path).read_text().splitlines()
+
+out_lines = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    m = TS_RE.match(line)
+    if m:
+        start = ts_to_sec(m.group(1))
+        end   = ts_to_sec(m.group(2))
+        spk   = dominant_speaker(start, end)
+        out_lines.append(line)
+        i += 1
+        if i < len(lines) and lines[i].strip():
+            prefix = f"[{spk}] " if spk else ""
+            out_lines.append(prefix + lines[i])
+            i += 1
+        continue
+    out_lines.append(line)
+    i += 1
+
+Path(out_path).write_text('\n'.join(out_lines) + '\n')
+PYEOF
+
+  END=$(date +%s)
+  echo "  Done in $((END - START))s → $OUT"
+done
+
+SCRIPT_END=$(date +%s)
+echo ""
+echo "  Total: $((SCRIPT_END - SCRIPT_START))s"
