@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{TOPIC}} — variants</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    :root {
+      --primary: #003D6B;
+      --primary-light: #dce8f2;
+    }
+    body {
+      background: #f5f4f2;
+      font-family: system-ui, -apple-system, sans-serif;
+      padding: 2rem;
+      margin: 0;
+    }
+    .topic-h {
+      font-size: 1rem;
+      font-weight: 600;
+      color: #475569;
+      margin: 0 0 0.25rem;
+    }
+    .hint {
+      font-size: 0.78rem;
+      color: #94a3b8;
+      margin: 0 0 1.5rem;
+    }
+    .hint code {
+      background: #fff;
+      border: 1px solid #e5e2e2;
+      border-radius: 4px;
+      padding: 0.05rem 0.35rem;
+      font-size: 0.72rem;
+    }
+    .variants-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+    }
+    .variant-card {
+      background: #fff;
+      border: 1px solid #e5e2e2;
+      border-radius: 10px;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+    }
+    .variant-label {
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: #94a3b8;
+      text-transform: uppercase;
+      margin-bottom: 0.4rem;
+    }
+    .variant-desc {
+      font-size: 0.78rem;
+      color: #64748b;
+      margin-bottom: 0.85rem;
+      line-height: 1.4;
+    }
+    .variant-body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 80px;
+      flex: 1;
+    }
+  </style>
+</head>
+<body>
+  <h1 class="topic-h">{{TOPIC}}</h1>
+  <p class="hint">Reload <code>Cmd+R</code> after Claude regenerates. Pick in TUI: type <code>B</code> or <code>B tighter padding</code> or <code>go with B</code>.</p>
+  <div class="variants-grid">
+    {{VARIANTS_HTML}}
+  </div>
+</body>
+</html>

@@ -18,7 +18,7 @@ brew bundle --file="$DOTFILES/Brewfile"
 # Stow all packages
 echo "Stowing dotfiles..."
 cd "$DOTFILES"
-stow zsh git vim vscode
+stow zsh git vim vscode claude
 
 # Configure Bitwarden server
 bw config server https://vault.bitwarden.eu
