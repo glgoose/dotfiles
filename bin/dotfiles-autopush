@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Daily auto-push for ~/dotfiles. Pushes main when ahead of origin/main and
+# the working tree is clean. Never auto-commits — repo convention is one
+# commit per script/config file. Notifies via macOS notification on dirty
+# tree so the user knows there is work to commit.
+
+DOTFILES="${HOME}/dotfiles"
+LOG_DIR="${HOME}/.local/state"
+LOG="${LOG_DIR}/dotfiles-autopush.log"
+
+mkdir -p "${LOG_DIR}"
+
+log() {
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "${LOG}"
+}
+
+notify() {
+    osascript -e "display notification \"$1\" with title \"dotfiles\"" >/dev/null 2>&1 || true
+}
+
+cd "${DOTFILES}"
+
+git fetch --quiet origin
+
+if [[ -n "$(git status --porcelain)" ]]; then
+    log "skipped: dirty tree"
+    notify "uncommitted changes — autopush skipped"
+    exit 0
+fi
+
+behind=$(git rev-list --count main..origin/main)
+ahead=$(git rev-list --count origin/main..main)
+
+if (( behind > 0 )); then
+    log "warning: ${behind} commits behind origin/main, no auto-pull"
+    notify "behind origin/main by ${behind} — pull manually"
+    exit 0
+fi
+
+if (( ahead == 0 )); then
+    log "up to date"
+    exit 0
+fi
+
+if git push origin main >> "${LOG}" 2>&1; then
+    log "pushed ${ahead} commits"
+else
+    log "push failed (exit $?)"
+    notify "push to origin/main failed"
+    exit 1
+fi
