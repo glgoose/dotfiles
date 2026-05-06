@@ -7,3 +7,5 @@ alias heicjpg="mogrify -format jpg *.(HEIC|heic) && rm *.(HEIC|heic)"
 alias pptpdf="soffice --headless --convert-to pdf *.pptx"
 alias ocr="ocrmypdf -l eng --redo-ocr --oversample 300 --output-type pdf"
 alias clauded="claude --dangerously-skip-permissions"
+alias ytmp4='yt-dlp -f "bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]" --merge-output-format mp4'
+alias ytmp4-playlist='yt-dlp -f "bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]" --merge-output-format mp4 --replace-in-metadata "title" "\s+[｜|].*" "" --replace-in-metadata "title" "？" "?" -o "%(playlist_index)02d - %(title)s.%(ext)s"'
