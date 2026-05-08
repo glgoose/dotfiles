@@ -23,4 +23,10 @@ stow zsh git vim vscode claude
 # Configure Bitwarden server
 bw config server https://vault.bitwarden.eu
 
+# Install matpocock skills into ~/.agents/skills/ (tracked symlinks in claude/ point here)
+if [ ! -d "$HOME/.agents/skills/diagnose" ]; then
+  echo "Installing matpocock skills..."
+  npx -y skills add mattpocock/skills -g -y
+fi
+
 echo "Done."
