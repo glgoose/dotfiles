@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Create per-skill symlinks under ~/dotfiles/agents/.agents/skills/ pointing into
+# the vendored submodules at ~/dotfiles/agents/.agents/skills-vendor/.
+#
+# Each config entry: <vendor-dir>:<source-subpath>:<comma-separated-excludes>
+# Multiple entries per vendor are allowed (e.g. one per category).
+
+set -euo pipefail
+
+DOT="${DOTFILES:-$HOME/dotfiles}"
+SKILLS="$DOT/agents/.agents/skills"
+VENDOR="$DOT/agents/.agents/skills-vendor"
+
+configs=(
+  "mattpocock-skills:skills/engineering:"
+  "mattpocock-skills:skills/productivity:"
+  "obsidian-skills:skills:obsidian-cli,obsidian-markdown"
+)
+
+if [ ! -d "$SKILLS" ]; then
+  echo "ERROR: $SKILLS not found" >&2
+  exit 1
+fi
+
+linked=0
+skipped=0
+for entry in "${configs[@]}"; do
+  IFS=':' read -r vendor subpath excludes <<<"$entry"
+  src_root="$VENDOR/$vendor/$subpath"
+  if [ ! -d "$src_root" ]; then
+    echo "WARN: $src_root missing (submodule not initialised?), skipping" >&2
+    continue
+  fi
+  for d in "$src_root"/*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    if [[ ",$excludes," == *",$name,"* ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    rel="../skills-vendor/$vendor/$subpath/$name"
+    target="$SKILLS/$name"
+    ln -sfn "$rel" "$target"
+    linked=$((linked + 1))
+  done
+done
+
+pruned=0
+for entry in "$SKILLS"/*; do
+  if [ -L "$entry" ] && [ ! -e "$entry" ]; then
+    rm "$entry"
+    pruned=$((pruned + 1))
+  fi
+done
+
+echo "sync-vendor-skills: linked=$linked excluded=$skipped pruned=$pruned"

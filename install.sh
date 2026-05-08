@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 DOTFILES="$(cd "$(dirname "$0")" && pwd)"
 
@@ -15,18 +15,20 @@ fi
 echo "Installing packages from Brewfile..."
 brew bundle --file="$DOTFILES/Brewfile"
 
-# Stow all packages
-echo "Stowing dotfiles..."
+# Initialise submodules (vendored agent skills: mattpocock/skills, kepano/obsidian-skills)
+echo "Updating submodules..."
 cd "$DOTFILES"
-stow zsh git vim vscode claude
+git submodule update --init --recursive
+
+# Generate per-skill symlinks under agents/.agents/skills/ pointing into vendored submodules
+echo "Syncing vendored skill symlinks..."
+"$DOTFILES/bin/sync-vendor-skills"
+
+# Stow all packages (agents/pi/copilot bridge ~/.claude, ~/.pi, ~/.copilot to ~/.agents/skills)
+echo "Stowing dotfiles..."
+stow zsh git vim vscode claude agents pi copilot
 
 # Configure Bitwarden server
 bw config server https://vault.bitwarden.eu
-
-# Install matpocock skills into ~/.agents/skills/ (tracked symlinks in claude/ point here)
-if [ ! -d "$HOME/.agents/skills/diagnose" ]; then
-  echo "Installing matpocock skills..."
-  npx -y skills add mattpocock/skills -g -y
-fi
 
 echo "Done."

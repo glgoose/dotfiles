@@ -1,0 +1,6 @@
+[submodule "agents/.agents/skills-vendor/mattpocock-skills"]
+	path = agents/.agents/skills-vendor/mattpocock-skills
+	url = https://github.com/mattpocock/skills
+[submodule "agents/.agents/skills-vendor/obsidian-skills"]
+	path = agents/.agents/skills-vendor/obsidian-skills
+	url = https://github.com/kepano/obsidian-skills
