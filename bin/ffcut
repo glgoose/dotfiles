@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# ffcut — cut a media file (audio or video) without re-encoding
+# Usage: ffcut [-b|--begin TIME] [-e|--end TIME] [-x|--exact] [-o|--output FILE] FILE
+# Wraps `ffmpeg -c copy`. Works on any container ffmpeg understands (mp4, mkv, mp3, flac, wav, m4a, ...).
+# -x places -ss after -i for frame-accurate cuts (slower, decodes to seek point).
+set -euo pipefail
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+BEGIN_TIME=""
+END_TIME=""
+OUTPUT_FILE=""
+EXACT=false
+INPUT=""
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+validate_time() {
+  local t="$1"
+  if [[ "$t" =~ ^[-]?([0-9]{1,2}:)?[0-9]{1,2}:[0-9]{1,2}(\.[0-9]+)?$ ]] \
+     || [[ "$t" =~ ^[-]?[0-9]+(\.[0-9]+)?(s|ms|us)?$ ]]; then
+    return 0
+  fi
+  echo "Error: invalid time format: $t" >&2
+  exit 1
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -b|--begin)
+      [[ $# -lt 2 ]] && { echo "Error: --begin requires a value" >&2; exit 1; }
+      validate_time "$2"; BEGIN_TIME="$2"; shift 2 ;;
+    -e|--end)
+      [[ $# -lt 2 ]] && { echo "Error: --end requires a value" >&2; exit 1; }
+      validate_time "$2"; END_TIME="$2"; shift 2 ;;
+    -o|--output)
+      [[ $# -lt 2 ]] && { echo "Error: --output requires a value" >&2; exit 1; }
+      OUTPUT_FILE="$2"; shift 2 ;;
+    -x|--exact) EXACT=true; shift ;;
+    -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+    --) shift; INPUT="${1:-}"; break ;;
+    -*) echo "Error: unknown option: $1" >&2; exit 1 ;;
+    *)  if [[ -z "$INPUT" ]]; then INPUT="$1"; else echo "Error: extra positional: $1" >&2; exit 1; fi
+        shift ;;
+  esac
+done
+
+# ── Validation ────────────────────────────────────────────────────────────────
+[[ -z "$INPUT" ]] && { echo "Error: no input file given" >&2; exit 1; }
+[[ -f "$INPUT" ]] || { echo "Error: not a file: $INPUT" >&2; exit 1; }
+command -v ffmpeg &>/dev/null || { echo "Error: ffmpeg not found. Install with: brew install ffmpeg" >&2; exit 1; }
+
+# ── Default output: <stem>-cut.<ext> ──────────────────────────────────────────
+if [[ -z "$OUTPUT_FILE" ]]; then
+  OUTPUT_FILE="${INPUT%.*}-cut.${INPUT##*.}"
+fi
+
+# ── Build ffmpeg args ─────────────────────────────────────────────────────────
+SS_ARGS=()
+TO_ARGS=()
+[[ -n "$BEGIN_TIME" ]] && SS_ARGS=(-ss "$BEGIN_TIME")
+[[ -n "$END_TIME"   ]] && TO_ARGS=(-to "$END_TIME")
+
+if $EXACT; then
+  ffmpeg -i "$INPUT" ${SS_ARGS[@]+"${SS_ARGS[@]}"} ${TO_ARGS[@]+"${TO_ARGS[@]}"} -c copy -y "$OUTPUT_FILE"
+else
+  ffmpeg ${SS_ARGS[@]+"${SS_ARGS[@]}"} ${TO_ARGS[@]+"${TO_ARGS[@]}"} -i "$INPUT" -c copy -y "$OUTPUT_FILE"
+fi
+
+echo "$OUTPUT_FILE"
