@@ -6,13 +6,9 @@
   <title>{{TOPIC}} — variants</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <link rel="stylesheet" href="../_tokens.css">
   <style>
-    :root {
-      --primary: #003D6B;
-      --primary-light: #dce8f2;
-    }
     body {
-      background: #f5f4f2;
       font-family: system-ui, -apple-system, sans-serif;
       padding: 2rem;
       margin: 0;
@@ -65,11 +61,75 @@
       text-transform: uppercase;
       margin-bottom: 0.5rem;
     }
+    .variant-tradeoff {
+      font-size: 0.72rem;
+      color: #94a3b8;
+      font-style: italic;
+      margin-bottom: 0.85rem;
+      line-height: 1.4;
+    }
+    .variant-tradeoff::before { content: "trade · "; opacity: 0.6; font-style: normal; }
+    .tune-panel {
+      margin-top: 1rem;
+      padding: 0.75rem;
+      border-top: 1px dashed #e5e2e2;
+      display: flex; flex-direction: column; gap: 0.4rem;
+      font-family: ui-monospace, monospace;
+      font-size: 0.72rem;
+      color: #475569;
+    }
+    .tune-row { display: grid; grid-template-columns: 90px 1fr 56px; align-items: center; gap: 0.5rem; }
+    .tune-row.tune-toggle { grid-template-columns: 90px auto; }
+    .tune-row input[type=range] { width: 100%; accent-color: var(--primary); }
+    .tune-val { text-align: right; color: #1e293b; font-weight: 600; }
+    .tune-actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+    .copy-prompt {
+      background: var(--primary); color: #fff; border: 0;
+      padding: 0.35rem 0.75rem; border-radius: 6px; cursor: pointer;
+      font: inherit; font-weight: 600;
+    }
+    .copy-prompt:hover { filter: brightness(1.08); }
+    .reset { background: transparent; color: #94a3b8; border: 0; cursor: pointer; font: inherit; }
+    .reset:hover { color: #475569; }
+    .snippet {
+      margin-top: 0.75rem;
+      border-top: 1px dashed #e5e2e2;
+      padding-top: 0.5rem;
+      font-family: ui-monospace, monospace;
+      font-size: 0.7rem;
+    }
+    .snippet summary {
+      cursor: pointer;
+      color: #64748b;
+      user-select: none;
+      padding: 0.25rem 0;
+    }
+    .snippet summary:hover { color: #1e293b; }
+    .snippet pre {
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 0.75rem;
+      border-radius: 6px;
+      overflow-x: auto;
+      margin: 0.5rem 0;
+      line-height: 1.45;
+    }
+    .snippet code { font-family: inherit; }
+    .copy-snippet {
+      background: transparent;
+      border: 1px solid #cbd5e0;
+      padding: 0.3rem 0.65rem;
+      border-radius: 5px;
+      font: inherit;
+      cursor: pointer;
+      color: #475569;
+    }
+    .copy-snippet:hover { background: #f8fafc; }
   </style>
 </head>
 <body x-data="{ active: 'a' }">
   <h1 class="topic-h">{{TOPIC}}</h1>
-  <p class="hint">Reload <code>Cmd+R</code> after Claude regenerates. Pick in TUI: type <code>B</code> or <code>B tighter padding</code> or <code>go with B</code>.</p>
+  <p class="hint">Reload <code>Cmd+R</code> after Claude regenerates. Tune sliders &rarr; <code>Copy as prompt</code> &rarr; paste in TUI. Pick in TUI: type <code>B</code> or <code>B tighter padding</code> or <code>go with B</code> (paste copied prompt + <code>go with B</code> to bake tuned values into the handoff).</p>
   <div class="variant-tabs">
     {{TABS_HTML}}
   </div>

@@ -9,12 +9,22 @@ description: Generate side-by-side UI variant mockups in browser for fast design
 
 ## Trigger
 
-`/mockup <topic> [, <count> variants] [, full page|small component]`
+`/mockup <topic> [, <count> variants] [, full page|small component] [, <modifier>...]`
 
 Examples:
 - `/mockup confirm button, 4 variants`
 - `/mockup toolbar redesign, 3 variants, full page`
 - `/mockup empty state for grid`
+- `/mockup checkout button hover, 3 variants, tunable, with snippets`
+
+### Modifier flags
+
+| Flag | Effect | Default |
+|------|--------|---------|
+| `tunable` / `with sliders` / `knobs` / `tune` | Force sliders on (§4b) | auto-detect |
+| `no sliders` / `static` | Force sliders off | auto-detect |
+| `with snippets` / `show code` / `with code` | Add collapsible code panel per variant (§4c) | off (auto-on if invocation mentions *port*, *port to React*, *port to Flask*, *for the real component*) |
+| `full page` / `full screen` | Use tabs layout (§3) | grid |
 
 ## Purpose
 
@@ -81,6 +91,16 @@ rm -f ~/.claude/mockups/<project>/<topic>/HANDOFF.md
 grep -q "Topic: <topic>" ~/.claude/mockups/<project>/LATEST_HANDOFF.md 2>/dev/null && rm -f ~/.claude/mockups/<project>/LATEST_HANDOFF.md
 ```
 
+**Project-level tokens file**: also check `~/.claude/mockups/<project-slug>/_tokens.css`. If it does not exist, generate it now (and its companion `_tokens.html`). If it exists, leave it alone — the user may have hand-edited it.
+
+To generate `_tokens.css`:
+
+1. Read the project repo's `CLAUDE.md` (in repo root) for design tokens. Probe in order: a `## Design tokens` / `## Colors` / `## Styling` section, `:root { ... }` snippets, or explicit `--primary` / `bg` mentions. For uhasselt-stage: `--primary:#003D6B; --primary-light:#dce8f2; bg:#f5f4f2`.
+2. If tokens found, write them to `_tokens.css` as a `:root { ... }` block plus a `body { background: <bg>; }` rule. If nothing found, write a minimal default (`:root { --primary: #475569; --primary-light: #e2e8f0; } body { background: #f5f4f2; }`).
+3. Also write a sibling `_tokens.html` — a small browseable swatch page with a `<link rel="stylesheet" href="_tokens.css">`, an `<h1>{{project}} design tokens</h1>`, and colored squares per token plus a font-family preview. The user can `open file://…/_tokens.html` to inspect. Pure convenience; mockups don't depend on it.
+
+Templates `<head>` already contains `<link rel="stylesheet" href="../_tokens.css">` — that's why the file must exist by render time.
+
 ### 3. Pick layout
 
 - **Default: grid** (`templates/grid.html`) — all variants visible on one page.
@@ -110,17 +130,22 @@ Each variant must commit to a **bold, distinct aesthetic pole** — not just a c
 - Same layout, different color
 - All variants = centered card + drop shadow + rounded corners
 - Any variant using Inter / Roboto / Arial / system-ui
+- **Variant without a stated tradeoff** — implies it dominates the others, which would mean the comparison is fake. Regenerate.
 
 For each variant (typically 3, range 2–6):
 - Assign letter ID: A, B, C, …
 - Name the aesthetic direction explicitly in the description (e.g. "industrial mono utility" not "compact dark").
-- Write a one-line description.
-- Produce HTML body (Tailwind classes + inline `<style>` for tokens and Google Fonts imports).
+- Write a **two-line description**:
+  - Line 1 (`{{DESCRIPTION}}`): one-line aesthetic direction (e.g. *"industrial mono utility — tight monospace, ink-on-paper"*).
+  - Line 2 (`{{TRADEOFF}}`): the cost this variant accepts, framed as `<strength> / <cost>` (e.g. *"dense + fast / cramped on mobile"*, *"editorial gravitas / heavier visual weight"*, *"spacious + readable / takes more vertical real estate"*).
+- Produce HTML body (Tailwind classes + inline `<style>` for per-variant typography / Google Fonts imports). Project-wide tokens (`--primary`, `--primary-light`, body bg) come from `~/.claude/mockups/<project>/_tokens.css` linked in the template `<head>` — don't redeclare them inline.
 - If interactive (button click, toggle), wrap in per-variant Alpine `x-data`.
 
 Match existing project tokens when known (look at recent CSS in repo). For uhasselt-stage: `--primary:#003D6B; --primary-light:#dce8f2; bg:#f5f4f2` — treat these as the base palette; each variant can extend or contrast against them but should not ignore them entirely.
 
 **Responsive component?** If the component looks different per viewport (mobile/tablet/desktop, breakpoint-driven content swap, grid cell at different widths), see step 4a before generating.
+
+**Tunable component?** If variants differ along continuous numeric tokens (spacing, duration, radius, shadow, scale, hue), see step 4b — embed sliders + a Copy-as-prompt button so the user tunes in-browser instead of round-tripping freeform "tighter padding" feedback.
 
 ### 4a. Responsive / viewport-aware components
 
@@ -134,6 +159,91 @@ Each sub-section needs a short caption (e.g. `xl ≥1280px · 261px cel`) so use
 
 Full HTML structure, anti-pattern catalogue, breakpoints reference: see [`responsive-patterns.md`](responsive-patterns.md).
 
+### 4b. Tunable parameters (sliders + Copy as prompt)
+
+When variants differ by **degree** along continuous numeric tokens, embed a per-variant slider panel + a "Copy as prompt" button. User tunes in-browser, clicks copy, pastes the resulting text in the TUI: plain paste rewrites that variant's slider defaults in `mockup.html`; paste containing `go with <ID>` / `pick <ID>` jumps to the pick flow with the tuned values baked into the handoff.
+
+**Auto-detect rules — include sliders when:**
+- Variants share ≥1 continuous numeric token: padding/gap, border-radius, font-size, duration, scale, shadow blur/offset, opacity, hue/lightness.
+- ≥2 variants would expose the same control set (otherwise sliders are noise).
+- Invocation contains `tunable`, `with sliders`, `knobs`, `tune` &rarr; forced on.
+
+**Skip sliders when:**
+- Variants differ structurally — icon vs no-icon, modal vs inline, single-line vs stacked. That's a *kind* difference; sliders only help on degree.
+- Invocation contains `no sliders` / `static`.
+
+**Per-variant budget**: 3–5 controls max. More overloads the comparison.
+
+**Widget shape (per variant, dropped after `.variant-body`):**
+
+```html
+<div class="tune-panel" x-data="{ duration: 220, scale: 1.04, shadow: 8, spring: true }">
+  <div class="tune-row">
+    <label>duration</label>
+    <input type="range" min="80" max="600" step="10" x-model.number="duration">
+    <span class="tune-val" x-text="duration + 'ms'"></span>
+  </div>
+  <!-- more .tune-row entries... -->
+  <div class="tune-actions">
+    <button class="copy-prompt" @click="
+      navigator.clipboard.writeText(
+        `apply variant B tuned values to the real component:\n` +
+        `duration: ${duration}ms\nscale: ${scale}\nshadow: ${shadow}px\n` +
+        `easing: ${spring ? 'spring' : 'ease-out'}`
+      );
+      $event.target.textContent = 'copied ✓';
+      setTimeout(() => $event.target.textContent = 'Copy as prompt', 1500);
+    ">Copy as prompt</button>
+    <button class="reset" @click="duration=220; scale=1.04; shadow=8; spring=true">reset</button>
+  </div>
+</div>
+```
+
+Bind the variant body to the same `x-data` scope via CSS vars: `:style="`--dur:${duration}ms; --scale:${scale}; --shadow:${shadow}px;`"`. One variable layer keeps the variant CSS clean.
+
+**Widget rules:**
+- Variant ID is hard-coded into the clipboard string (`variant B` above) so the parser routes the paste to the right variant.
+- Slider defaults equal the variant's designed values; reset returns to those.
+- Numeric values include units in display AND clipboard (`220ms`, `8px`); toggles stringify as human labels (`spring` / `ease-out`, never `true` / `false`).
+
+**Prompt format contract — Copy as prompt MUST emit:**
+
+```
+apply variant <ID> tuned values to the real component:
+<token>: <value>
+<token>: <value>
+...
+```
+
+If you change this shape, also update the iteration parser in "On iteration feedback" below.
+
+**Full widget HTML, CSS expectations, and three worked examples** (hover animation / card spacing / modal sizing): see [`templates/slider-panel.md`](templates/slider-panel.md).
+
+### 4c. Code-snippet preview (opt-in)
+
+When the invocation contains `with snippets` / `show code` / `with code`, OR the topic mentions intent to port (*port*, *port to React*, *port to Flask*, *for the real component*), append a `<details class="snippet">` block to each variant card — after `.tune-panel` if present, else after `.variant-body`:
+
+```html
+<details class="snippet">
+  <summary>show code</summary>
+  <pre><code class="lang-html">{{ESCAPED_HTML}}</code></pre>
+  <button class="copy-snippet" onclick="
+    navigator.clipboard.writeText(this.previousElementSibling.textContent);
+    this.textContent = 'copied ✓';
+    setTimeout(() => this.textContent = 'copy snippet', 1500);
+  ">copy snippet</button>
+</details>
+```
+
+`{{ESCAPED_HTML}}` rules:
+- Includes the variant's rendered HTML body + any per-variant `<style>` block, HTML-escaped (`&amp;`, `&lt;`, `&gt;`).
+- **Strips** `.variant-card` wrapper, `data-variant`, `.variant-label`, `.variant-desc`, `.variant-tradeoff`, `.tune-panel`, Tailwind CDN script, and mockup-only Alpine `x-data`.
+- Keeps Tailwind utility classes inline on elements (they port directly to React `className=`).
+- Keeps whitespace/indentation untouched — readability matters for the port.
+- `<details>` defaults to closed; user expands per-variant when comparing code.
+
+Full markup, escaping rules, worked example, anti-patterns: see [`templates/snippet-preview.md`](templates/snippet-preview.md).
+
 ### 5. Render template
 
 Read `templates/grid.html` or `templates/tabs.html`. Replace placeholders:
@@ -145,7 +255,10 @@ Each variant block (grid):
 <div class="variant-card" data-variant="{{ID}}" x-data='{{ALPINE_STATE}}'>
   <div class="variant-label">{{ID}} — {{TITLE}}</div>
   <div class="variant-desc">{{DESCRIPTION}}</div>
+  <div class="variant-tradeoff">{{TRADEOFF}}</div>
   <div class="variant-body">{{HTML}}</div>
+  <!-- .tune-panel (if §4b applies) goes here -->
+  <!-- <details class="snippet"> (if §4c applies) goes here -->
 </div>
 ```
 
@@ -153,6 +266,7 @@ Each variant block (tabs):
 ```html
 <div x-show="active === '{{id_lower}}'" data-variant="{{ID}}">
   <p class="section-label">{{ID}} — {{DESCRIPTION}}</p>
+  <div class="variant-tradeoff">{{TRADEOFF}}</div>
   {{HTML}}
 </div>
 ```
@@ -192,6 +306,8 @@ Then **stop**. Wait for user TUI input.
 
 User types in TUI. Parse intent:
 
+- **Paste of tuned values** (input matches `^apply variant ([A-Z]) tuned values`): parse the variant ID and the `key: value` lines. Rewrite that variant's `tune-panel` `x-data` defaults in `mockup.html` to the pasted values (so reload preserves them) — and update any matching defaults referenced in a `reset` handler on the same panel. Reply: "Updated variant `<ID>` defaults — reload Cmd+R."
+- **Paste of tuned values + pick** (same paste also contains `go with <ID>` / `pick <ID>` case-insensitive, anywhere): jump straight to the pick flow ("On pick" section) using the pasted values as authoritative — they override the `x-data` defaults still in `mockup.html`.
 - **Tweak one variant** (`B tighter padding`): regenerate `mockup.html` with only that variant changed. Tell user "Reload (Cmd+R)."
 - **Regenerate all** (`redo with X`): same path, fresh variants applying X.
 - **Add variant** (`add D: ghost`): append to existing file.
@@ -208,6 +324,8 @@ When user signals a winner (`B`, `go with B`, `B looks good`, `pick B`):
 Steps:
 
 1. **Parse winning variant.** Read `mockup.html`, locate `data-variant="<ID>"`, extract the full inner block (`.variant-label`, `.variant-desc`, `.variant-body` and any per-variant `<style>` / Alpine `x-data`). Capture the title and description text.
+
+   **Capture tuned values too.** If the winning variant has a `.tune-panel`, also extract the current `x-data` defaults (key + value for each slider/toggle). These become the `## Tuned values` block in the handoff. If the pick was triggered by a paste containing `apply variant <ID> tuned values to the real component:`, **prefer the pasted values** over the file's `x-data` defaults — the paste IS the user's final answer, the file may not have been rewritten yet.
 
 2. **Resolve target file aggressively.** Search the originating conversation for the most recently mentioned template / blueprint / page / partial path. Strong signals: a path the user said `/mockup` was *for* ("mockup the toolbar in `templates/grid.html`"), the file the conversation was already editing, the screen name in the topic slug. Only fall back to `TBD — confirm before implementing` if there is genuinely no signal in the conversation. **Do NOT** ask the user — by pick time the signal is either there or it isn't, and the next session can disambiguate.
 
@@ -226,7 +344,7 @@ Steps:
 
    ## What the winner is
 
-   <one-paragraph description: visual choices, structure, key tokens, why it won over the other variants>
+   <one-paragraph description: visual choices, structure, key tokens, why it won over the other variants — reference each loser's stated tradeoff explicitly ("A was too cramped on mobile, C's editorial gravitas felt too heavy")>
 
    ## Tweak notes accumulated during iteration
 
@@ -247,11 +365,20 @@ Steps:
 
    <!-- if the variant relied on per-variant <style> blocks or non-trivial CSS tokens, embed them here too -->
 
+   ## Tuned values
+
+   <!-- Only present when the winning variant had a .tune-panel. Authoritative over slider defaults in the embedded HTML above. -->
+
+   - duration: 220ms
+   - scale: 1.04
+   - shadow: 8px
+   - easing: spring
+
    ## How to implement (recipe for the next session)
 
    1. Read the **Winning variant — embedded source** section above. The fenced HTML block is the design to apply.
-   2. Open `<target file>` and replace the corresponding region with the variant body. Strip the `variant-card` wrapper, the `data-variant` attribute, and any mockup-only Alpine `x-data` (unless the real component genuinely uses Alpine).
-   3. Reconcile design tokens with project tokens. For uhasselt-stage: `--primary:#003D6B; --primary-light:#dce8f2; bg:#f5f4f2`. If the variant uses inline Tailwind classes, those work as-is; if it uses custom CSS, move declarations into the project stylesheet.
+   2. Open `<target file>` and replace the corresponding region with the variant body. Strip the `variant-card` wrapper, the `data-variant` attribute, the entire `.tune-panel` block, the `<details class="snippet">` block (if present), and any mockup-only Alpine `x-data` (unless the real component genuinely uses Alpine). **If a `## Tuned values` section is present above, those are the exact numbers to apply — slider defaults in the embedded HTML may be stale, the Tuned values block is authoritative.** If `with snippets` was used during iteration, the user has already vetted the markup in-browser; the port is mostly mechanical.
+   3. Reconcile design tokens with project tokens. The mockup pulled tokens from `~/.claude/mockups/<project>/_tokens.css` — confirm the values there still match the live project before substituting. For uhasselt-stage the canonical values are `--primary:#003D6B; --primary-light:#dce8f2; bg:#f5f4f2`. If the variant uses inline Tailwind classes, those work as-is; if it uses custom CSS, move declarations into the project stylesheet.
    4. **Rebuild Tailwind** if the project has a CSS build step (look for `tailwind.in.css` / `npm run build:css` in repo root) — `npm run build:css`.
    5. Verify on the dev server: `<dev-server-url-or-TBD>`. Restart needed only if Python/config changed (templates auto-reload).
 
@@ -311,7 +438,7 @@ Steps:
 
 ## Out-of-scope guardrails
 
-If user requests any of these, **do not silently add them**. Surface the skill is intentionally minimal and ask if they want to extend:
+Sliders + Copy-as-prompt are **in scope** (§4b). Still out of scope — if user requests any of these, **do not silently add them**. Surface the skill is intentionally minimal and ask if they want to extend:
 
 - Local HTTP server for the mockup
 - JSON feedback files
@@ -326,6 +453,8 @@ These were all explicitly designed out. Adding them is a design change, not a ro
 
 ```
 ~/.claude/mockups/<project-slug>/
+  ├── _tokens.css               # project design tokens (CSS) — generated on first mockup; preserved on subsequent runs
+  ├── _tokens.html              # browseable swatch page — open file://… for visual reference
   ├── LATEST_HANDOFF.md         # project-level pointer to most recent pick — enables "implement the latest mockup winner"
   └── <topic-slug>/
       ├── mockup.html           # variants — overwritten on each iteration; cleared on re-run
@@ -336,3 +465,6 @@ These were all explicitly designed out. Adding them is a design change, not a ro
 
 - `templates/grid.html` — default layout, all variants in CSS grid
 - `templates/tabs.html` — fallback for full-page-sized variants
+- `templates/slider-panel.md` — reference for §4b tunable widget
+- `templates/snippet-preview.md` — reference for §4c code-snippet panel
+- `responsive-patterns.md` — reference for §4a viewport-aware variants
