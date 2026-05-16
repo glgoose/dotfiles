@@ -4,10 +4,11 @@
 // Setup: register in Actions & Tags as "Extract chapter PDF"
 //   Trigger: Item context menu  |  Operation: Custom script
 
-const AUTO_OPEN  = true;   // set false to skip auto-opening extracted PDF
-const UV         = '/opt/homebrew/bin/uv';
-const PDFLABELS  = '/Users/glenn/dotfiles/bin/pdflabels';
-const QPDF       = '/opt/homebrew/bin/qpdf';
+const AUTO_OPEN     = true;   // set false to skip auto-opening extracted PDF
+const UV            = '/opt/homebrew/bin/uv';
+const PDFLABELS     = '/Users/glenn/dotfiles/bin/pdflabels';
+const PDFPRUNE_TOC  = '/Users/glenn/dotfiles/bin/pdfprune-outline';
+const QPDF          = '/opt/homebrew/bin/qpdf';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -118,6 +119,16 @@ try {
 } catch (e) {
     showToast(`qpdf failed: ${e.message || String(e)}`);
     return;
+}
+
+// Prune the outline so the sidebar TOC reflects only the extracted chapter.
+// qpdf copies the source outline verbatim, leaving dangling entries; this
+// rewrites them to keep only entries inside the page range, remapped.
+// Non-fatal: a stale outline does not invalidate the chapter PDF.
+try {
+    await exec(UV, ['run', '--script', PDFPRUNE_TOC, bookPdfPath, outPath, String(physStart), String(physEnd)]);
+} catch (e) {
+    Zotero.debug(`pdfprune-outline failed (non-fatal): ${e.message || String(e)}`);
 }
 
 // Import into Zotero with parent-metadata filename
