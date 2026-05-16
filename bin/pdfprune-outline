@@ -1,0 +1,153 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["pikepdf"]
+# ///
+"""Prune the outline (bookmark tree) of an extracted PDF to a page range.
+
+After qpdf extracts pages, the original outline is carried along verbatim;
+entries pointing to pages that no longer exist become dangling, leaving the
+sidebar TOC showing the whole book. This script rewrites the outline in
+OUTPUT_PDF to keep only entries whose destination resolves to a page within
+[PHYS_START, PHYS_END] in SOURCE_PDF (1-based, inclusive), remapping each
+kept entry to the corresponding page index in OUTPUT_PDF.
+
+Children of dropped entries are promoted to the dropped entry's level so a
+chapter that lives under a part heading still shows when the part is pruned.
+
+Usage: pdfprune-outline SOURCE_PDF OUTPUT_PDF PHYS_START PHYS_END
+"""
+
+import sys
+import pikepdf
+from pikepdf import OutlineItem, Name, String
+
+
+def error(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+if len(sys.argv) != 5:
+    error("Usage: pdfprune-outline SOURCE_PDF OUTPUT_PDF PHYS_START PHYS_END")
+
+src_path = sys.argv[1]
+out_path = sys.argv[2]
+try:
+    phys_start = int(sys.argv[3])
+    phys_end = int(sys.argv[4])
+except ValueError:
+    error("PHYS_START and PHYS_END must be integers")
+
+if phys_start < 1 or phys_end < phys_start:
+    error(f"Invalid range: {phys_start}-{phys_end}")
+
+
+def resolve_named_dest(pdf, name):
+    """Resolve a /Dest name to a destination array, or None."""
+    try:
+        root = pdf.Root
+        # PDF 1.1 style: /Dests dict at root
+        if "/Dests" in root:
+            dests = root["/Dests"]
+            if name in dests:
+                d = dests[name]
+                if "/D" in d:
+                    return d["/D"]
+                return d
+        # PDF 1.2+ style: /Names /Dests name tree
+        if "/Names" in root and "/Dests" in root["/Names"]:
+            try:
+                tree = pikepdf.NameTree(root["/Names"]["/Dests"])
+                if name in tree:
+                    d = tree[name]
+                    if isinstance(d, pikepdf.Dictionary) and "/D" in d:
+                        return d["/D"]
+                    return d
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def dest_to_page_index(pdf, dest, idx_by_objgen):
+    """Resolve an outline destination to 0-based page index in pdf, or None."""
+    if dest is None:
+        return None
+    # Named destination (string or Name)
+    if isinstance(dest, (str, String, Name)):
+        name = str(dest)
+        resolved = resolve_named_dest(pdf, name)
+        if resolved is None:
+            return None
+        dest = resolved
+    # Integer = direct page index
+    if isinstance(dest, int):
+        return dest if 0 <= dest < len(pdf.pages) else None
+    # Array: [page_ref, /XYZ, ...]
+    try:
+        page_ref = dest[0]
+        if isinstance(page_ref, int):
+            return page_ref if 0 <= page_ref < len(pdf.pages) else None
+        return idx_by_objgen.get(page_ref.objgen)
+    except Exception:
+        return None
+
+
+def action_to_page_index(pdf, action, idx_by_objgen):
+    """Some outline items use /A (action) instead of /Dest. Handle GoTo actions."""
+    if action is None:
+        return None
+    try:
+        if action.get("/S") == Name("/GoTo"):
+            d = action.get("/D")
+            return dest_to_page_index(pdf, d, idx_by_objgen)
+    except Exception:
+        pass
+    return None
+
+
+with pikepdf.open(src_path) as src, pikepdf.open(out_path, allow_overwriting_input=True) as out:
+    idx_by_objgen = {p.obj.objgen: i for i, p in enumerate(src.pages)}
+    n_out = len(out.pages)
+    lo = phys_start - 1
+    hi = phys_end - 1
+
+    def resolve_item(it):
+        idx = dest_to_page_index(src, it.destination, idx_by_objgen)
+        if idx is None:
+            idx = action_to_page_index(src, it.action, idx_by_objgen)
+        return idx
+
+    def build(items):
+        kept = []
+        for it in items:
+            child_kept = build(list(it.children))
+            idx = resolve_item(it)
+            if idx is not None and lo <= idx <= hi:
+                new_idx = idx - lo
+                if 0 <= new_idx < n_out:
+                    new_item = OutlineItem(
+                        it.title,
+                        destination=new_idx,
+                        page_location="XYZ",
+                    )
+                    for ck in child_kept:
+                        new_item.children.append(ck)
+                    kept.append(new_item)
+                    continue
+            # Drop this entry; promote any kept children
+            kept.extend(child_kept)
+        return kept
+
+    with src.open_outline() as src_outline:
+        src_items = list(src_outline.root)
+
+    with out.open_outline() as out_outline:
+        new_items = build(src_items)
+        out_outline.root.clear()
+        for itm in new_items:
+            out_outline.root.append(itm)
+
+    out.save()
