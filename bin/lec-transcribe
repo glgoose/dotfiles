@@ -1,19 +1,53 @@
 #!/usr/bin/env bash
-# lec-process — transcribe lecture WAV files, optionally renaming, correcting, diarizing
-# Usage: lec-process [-r|--rename] [-e|--engine whisper|parakeet] [-l|--lang LANGCODE] [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]
-# Run from inside the lecture folder (e.g. "260402 feminism")
+# lec-transcribe — transcribe lecture audio, optionally rename/correct/diarize, always paragraph
+# Usage: lec-transcribe [-r|--rename] [-e|--engine whisper|parakeet] [-l|--lang LANGCODE]
+#                       [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]
+#                       [-s|--smooth | --no-smooth] [--gap SECONDS] <files...>
+# Audio files are required (paths relative to cwd). Accepted: any container/codec
+# ffmpeg can decode (mlx-whisper and parakeet-mlx both pipe through ffmpeg).
+# Auto-discovery from cwd is not supported — pass the file(s) explicitly.
+#
+# Pipeline: transcribe → (correct: rewrites .srt) → (diarize: rewrites .srt)
+#         → paragraph (always; reads final .srt, writes .txt). The paragraph
+#           step is the single writer of .txt. Smooth (LLM topic breaks) is on
+#           by default; falls back to pause-based when no API key is set.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+USAGE="Usage: lec-transcribe [-r|--rename] [-e|--engine whisper|parakeet] [-l|--lang LANGCODE]
+                     [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]
+                     [-s|--smooth | --no-smooth] [--gap SECONDS] <files...>
+       LANGCODE examples: nl (Dutch), fr (French), de (German), es (Spanish), it (Italian),
+                          zh (Chinese), ko (Korean), ja (Japanese)
+       Accepted audio extensions: wav, flac, mp3, m4a, mp4, aac, ogg, oga, opus,
+                                  webm, weba, mpeg, mpga, wma, aiff, aif, mka, amr.
+       Auto-discovery from cwd is not supported.
+
+       Whisper engine emits .<base>.words.json sidecars (hidden dotfiles) used
+       as input by /improve-transcript. Safe to delete if you don't plan to run
+       improve; the skill auto-archives them after it runs."
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 RENAME=false
 LANG_CODE="en"
 CORRECT=false
 DIARIZE=false
-PROVIDER="openai"
+PROVIDER=""
+PROVIDER_SET=false
 LANG_SET=false
 ENGINE="whisper"
+SMOOTH=true
+PARAGRAPH_GAP=1.5
+INPUT_FILES=()
+
+# Background job tracking for per-file post-processing pipeline.
+# BG_MAX caps concurrent LLM jobs (lec-correct + lec-paragraph --smooth) to
+# avoid rate limits and memory pressure.
+BG_PIDS=()
+BG_LOGS=()
+BG_FAILED=0
+BG_MAX=2
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -39,6 +73,9 @@ while [[ $# -gt 0 ]]; do
     --provider|-p)
       [[ $# -lt 2 ]] && { echo "Error: --provider requires openai or anthropic"; exit 1; }
       PROVIDER="$2"
+      [[ "$PROVIDER" != "openai" && "$PROVIDER" != "anthropic" ]] && {
+        echo "Error: --provider must be 'openai' or 'anthropic'"; exit 1; }
+      PROVIDER_SET=true
       shift 2
       ;;
     --engine|-e)
@@ -48,17 +85,34 @@ while [[ $# -gt 0 ]]; do
         echo "Error: --engine must be 'whisper' or 'parakeet'"; exit 1; }
       shift 2
       ;;
+    --smooth|-s)
+      SMOOTH=true
+      shift
+      ;;
+    --no-smooth)
+      SMOOTH=false
+      shift
+      ;;
+    --gap)
+      [[ $# -lt 2 ]] && { echo "Error: --gap requires a number (seconds)"; exit 1; }
+      PARAGRAPH_GAP="$2"
+      shift 2
+      ;;
     -h|--help)
-      echo "Usage: lec-process [-r|--rename] [-e|--engine whisper|parakeet] [-l|--lang LANGCODE] [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]"
-      echo "       LANGCODE examples: nl (Dutch), fr (French), de (German), es (Spanish), it (Italian), zh (Chinese), ko (Korean), ja (Japanese)"
+      echo "$USAGE"
       exit 0
       ;;
-    *)
-      echo "Unknown option: $1"
-      echo "Usage: lec-process [-r|--rename] [-e|--engine whisper|parakeet] [-l|--lang LANGCODE] [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]"
-      echo "       LANGCODE examples: nl (Dutch), fr (French), de (German), es (Spanish), it (Italian), zh (Chinese), ko (Korean), ja (Japanese)"
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do INPUT_FILES+=("$1"); shift; done
+      ;;
+    -*)
+      echo "Error: unknown option: $1"
+      echo "$USAGE"
       exit 1
       ;;
+    *)
+      INPUT_FILES+=("$1"); shift ;;
   esac
 done
 
@@ -68,37 +122,73 @@ if [[ "$ENGINE" == "parakeet" && "$LANG_SET" == true ]]; then
   exit 1
 fi
 
+# ── Provider resolution (correct + smooth share one provider) ─────────────────
+# When --provider is not given, auto-detect from env: prefer OPENAI_API_KEY,
+# else ANTHROPIC_API_KEY. --correct requires a key (hard error). --smooth
+# without a key falls back silently to pause-based paragraphs.
+if [[ "$PROVIDER_SET" == false ]]; then
+  if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+    PROVIDER="openai"
+  elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    PROVIDER="anthropic"
+  else
+    PROVIDER=""
+  fi
+fi
+
+provider_key_present() {
+  case "$1" in
+    openai)    [[ -n "${OPENAI_API_KEY:-}"    ]] ;;
+    anthropic) [[ -n "${ANTHROPIC_API_KEY:-}" ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+if [[ "$CORRECT" == true ]]; then
+  if [[ -z "$PROVIDER" ]] || ! provider_key_present "$PROVIDER"; then
+    echo "Error: --correct requires OPENAI_API_KEY or ANTHROPIC_API_KEY in env"
+    echo "Hint: export OPENAI_API_KEY=\$(security find-generic-password -a \"\$USER\" -s \"openai-api-key\" -w)"
+    exit 1
+  fi
+fi
+
+if [[ "$SMOOTH" == true ]]; then
+  if [[ -z "$PROVIDER" ]] || ! provider_key_present "$PROVIDER"; then
+    echo "Warning: no API key for --smooth; falling back to pause-based paragraphs."
+    SMOOTH=false
+  fi
+fi
+
 # ── Dependency checks ──────────────────────────────────────────────────────────
 if ! command -v uv &>/dev/null; then
   echo "Error: uv not found. Install with: brew install uv"
   exit 1
 fi
 
-# ── Collect FLAC/WAV files, prefer FLAC when both share a stem ────────────────
-AUDIO_FILES=()
-FLAC_STEMS=()
-
-while IFS= read -r f; do
-  AUDIO_FILES+=("$f")
-  FLAC_STEMS+=("${f%.*}")
-done < <(find . -maxdepth 1 -iname "*.flac" | sed 's|^\./||' | sort)
-
-while IFS= read -r f; do
-  stem="${f%.*}"
-  skip=false
-  for s in "${FLAC_STEMS[@]+"${FLAC_STEMS[@]}"}"; do
-    [[ "$s" == "$stem" ]] && { skip=true; break; }
-  done
-  [[ "$skip" == false ]] && AUDIO_FILES+=("$f")
-done < <(find . -maxdepth 1 -iname "*.wav" | sed 's|^\./||' | sort)
-
-IFS=$'\n' AUDIO_FILES=($(printf '%s\n' "${AUDIO_FILES[@]+"${AUDIO_FILES[@]}"}" | sort))
-unset IFS
-
-if [[ ${#AUDIO_FILES[@]} -eq 0 ]]; then
-  echo "Error: no .wav or .flac files found in the current directory."
+# ── Validate explicit input files ─────────────────────────────────────────────
+if [[ ${#INPUT_FILES[@]} -eq 0 ]]; then
+  echo "Error: no input files. Pass one or more audio files explicitly."
+  echo "$USAGE"
   exit 1
 fi
+
+# Accepted extensions: anything ffmpeg can decode. mlx-whisper and parakeet-mlx
+# both shell out to ffmpeg, so the underlying support is identical.
+for f in "${INPUT_FILES[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    echo "Error: not a file: $f"
+    exit 1
+  fi
+  case "$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')" in
+    *.wav|*.flac|*.mp3|*.m4a|*.mp4|*.aac|*.ogg|*.oga|*.opus|*.webm|*.weba|*.mpeg|*.mpga|*.wma|*.aiff|*.aif|*.mka|*.amr) ;;
+    *)
+      echo "Error: unsupported extension: $f"
+      echo "       Accepted: wav, flac, mp3, m4a, mp4, aac, ogg, oga, opus, webm, weba, mpeg, mpga, wma, aiff, aif, mka, amr"
+      exit 1 ;;
+  esac
+done
+
+AUDIO_FILES=("${INPUT_FILES[@]}")
 
 SCRIPT_START=$(date +%s)
 
@@ -130,6 +220,52 @@ if [[ "$RENAME" == true ]]; then
   done < <(printf '%s\n' "${RENAMED[@]}" | sort)
 fi
 
+# ── Background job helpers (pipeline-overlap post-processing) ─────────
+# macOS default bash is 3.2: no `wait -n`. Poll PIDs with `kill -0` instead.
+bg_wait_slot() {
+  while (( ${#BG_PIDS[@]} >= BG_MAX )); do
+    local new=()
+    local pid
+    for pid in "${BG_PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        new+=("$pid")
+      else
+        if ! wait "$pid"; then
+          echo "  [bg] post-processing job $pid failed" >&2
+          BG_FAILED=$((BG_FAILED + 1))
+        fi
+      fi
+    done
+    # bash 3.2 + set -u: "${empty[@]}" is "unbound"; guard with ${arr[@]+...}
+    BG_PIDS=( ${new[@]+"${new[@]}"} )
+    (( ${#BG_PIDS[@]} >= BG_MAX )) && sleep 0.5
+  done
+}
+
+bg_wait_all() {
+  [[ ${#BG_PIDS[@]} -eq 0 ]] && return 0
+  local pid
+  for pid in "${BG_PIDS[@]}"; do
+    if ! wait "$pid"; then
+      echo "  [bg] post-processing job $pid failed" >&2
+      BG_FAILED=$((BG_FAILED + 1))
+    fi
+  done
+  BG_PIDS=()
+}
+
+bg_dump_logs() {
+  [[ ${#BG_LOGS[@]} -eq 0 ]] && return 0
+  local log
+  for log in "${BG_LOGS[@]}"; do
+    if [[ -f "$log" ]]; then
+      cat "$log"
+      rm -f "$log"
+    fi
+  done
+  BG_LOGS=()
+}
+
 # ── Transcribe ────────────────────────────────────────────────────────
 echo ""
 echo "── Transcribe ──────────────────────────────────────────────────────"
@@ -150,42 +286,127 @@ FILES_PROCESSED=0
 TOTAL_AUDIO=0
 
 for FILE in "${AUDIO_FILES[@]}"; do
-  DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$FILE" 2>/dev/null | awk '{printf "%d", $1}')
-  TOTAL_AUDIO=$((TOTAL_AUDIO + DURATION))
   NAME="${FILE%.*}"
-  echo "  Transcribing $FILE..."
-  FILE_START=$(date +%s)
+  SRT="${NAME}.srt"
+  DO_TRANSCRIBE=true
 
-  if [[ "$ENGINE" == "whisper" ]]; then
-    # Output to a temp dir so we can pick only .srt and .txt
-    TMPDIR=$(mktemp -d)
-    uvx --from mlx-whisper mlx_whisper "$FILE" \
-      --model "$MLX_MODEL" \
-      --language "$LANG_CODE" \
-      --output-format all \
-      --output-name "$NAME" \
-      --output-dir "$TMPDIR" \
-      --condition-on-previous-text False \
-      --verbose False
-
-    mv "$TMPDIR/${NAME}.srt" "./${NAME}.srt"
-    mv "$TMPDIR/${NAME}.txt" "./${NAME}.txt"
-    rm -rf "$TMPDIR"
-  else
-    # parakeet-mlx writes srt/txt to cwd directly
-    uvx parakeet-mlx "$FILE" --output-format all
+  # Skip re-transcription if .srt and .txt both exist (per-file confirm).
+  # Non-interactive stdin defaults to skip — safer than clobbering.
+  if [[ -f "${NAME}.srt" && -f "${NAME}.txt" ]]; then
+    REPLY=""
+    if [[ -t 0 ]]; then
+      printf "  %s.srt and %s.txt exist. Re-transcribe? [y/N] " "$NAME" "$NAME"
+      read -r REPLY || true
+    fi
+    if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+      echo "  Skipping $FILE (keeping existing transcript)"
+      DO_TRANSCRIBE=false
+    fi
   fi
 
-  FILE_END=$(date +%s)
-  echo "  Done in $((FILE_END - FILE_START))s → ${NAME}.srt, ${NAME}.txt"
-  FILES_PROCESSED=$((FILES_PROCESSED + 1))
+  if [[ "$DO_TRANSCRIBE" == true ]]; then
+    DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$FILE" 2>/dev/null | awk '{printf "%d", $1}')
+    TOTAL_AUDIO=$((TOTAL_AUDIO + DURATION))
+    echo "  Transcribing $FILE..."
+    FILE_START=$(date +%s)
+
+    if [[ "$ENGINE" == "whisper" ]]; then
+      # Output to a temp dir so we can pick only .srt, .txt, .json
+      TMPDIR=$(mktemp -d)
+      uvx --from mlx-whisper mlx_whisper "$FILE" \
+        --model "$MLX_MODEL" \
+        --language "$LANG_CODE" \
+        --output-format all \
+        --output-name "$NAME" \
+        --output-dir "$TMPDIR" \
+        --condition-on-previous-text False \
+        --word-timestamps True \
+        --verbose False
+
+      mv "$TMPDIR/${NAME}.srt" "./${NAME}.srt"
+      mv "$TMPDIR/${NAME}.txt" "./${NAME}.txt"
+
+      # Emit .<base>.words.json sidecar (hidden dotfile): per-word probability
+      # flattened with cue_id mapping. Cue IDs are 1-indexed (segment.id + 1)
+      # to match SRT. Hidden because it's an intermediate consumed only by
+      # /improve-transcript.
+      python3 - "$TMPDIR/${NAME}.json" "./.${NAME}.words.json" <<'PYEOF'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    data = json.load(f)
+out = []
+for seg in data.get("segments", []):
+    cue_id = seg.get("id", 0) + 1
+    for w in seg.get("words", []) or []:
+        out.append({
+            "cue_id": cue_id,
+            "word": w.get("word", "").strip(),
+            "start": round(float(w.get("start", 0.0)), 3),
+            "end": round(float(w.get("end", 0.0)), 3),
+            "probability": round(float(w.get("probability", 0.0)), 4),
+        })
+with open(dst, "w") as f:
+    json.dump(out, f, ensure_ascii=False)
+PYEOF
+
+      rm -rf "$TMPDIR"
+    else
+      # parakeet-mlx writes srt/txt to cwd directly
+      uvx parakeet-mlx "$FILE" --output-format all
+    fi
+
+    FILE_END=$(date +%s)
+    if [[ "$ENGINE" == "whisper" ]]; then
+      echo "  Done in $((FILE_END - FILE_START))s → ${NAME}.srt, ${NAME}.txt, .${NAME}.words.json"
+    else
+      echo "  Done in $((FILE_END - FILE_START))s → ${NAME}.srt, ${NAME}.txt"
+    fi
+    FILES_PROCESSED=$((FILES_PROCESSED + 1))
+  fi
+
+  # Pipeline-overlap: while the next file transcribes on the GPU, run this
+  # file's post-processing (LLM/network-bound) in the background.
+  #
+  #   --diarize  : pipeline only correct here; diarize + paragraph stay batched
+  #                after the transcribe loop (diarize is GPU-bound, would contend).
+  #   no diarize : pipeline correct (if requested) AND paragraph here; no batched
+  #                blocks needed after the loop.
+  if [[ "$CORRECT" == true || "$DIARIZE" == false ]]; then
+    bg_wait_slot
+    BG_LOG="${SRT}.bglog"
+    (
+      if [[ "$CORRECT" == true ]]; then
+        "$SCRIPT_DIR/lec-correct" --provider "$PROVIDER" "$SRT"
+      fi
+      if [[ "$DIARIZE" == false ]]; then
+        PARA_ARGS=(--gap "$PARAGRAPH_GAP")
+        if [[ "$SMOOTH" == true ]]; then
+          PARA_ARGS+=(--smooth --provider "$PROVIDER")
+        fi
+        "$SCRIPT_DIR/lec-paragraph" "${PARA_ARGS[@]}" "$SRT"
+      fi
+    ) > "$BG_LOG" 2>&1 &
+    BG_PIDS+=($!)
+    BG_LOGS+=("$BG_LOG")
+  fi
 done
 
-# ── Correct (optional) ────────────────────────────────────────────────
-if [[ "$CORRECT" == true ]]; then
+TRANSCRIBE_END=$(date +%s)
+
+# ── Post-process wait ─────────────────────────────────────────────────
+# Drain the per-file background jobs spawned in the transcribe loop. When
+# --diarize is off, this covers correct + paragraph end-to-end. When --diarize
+# is on, this only covers correct; diarize + batched paragraph follow below.
+if [[ ${#BG_PIDS[@]} -gt 0 || ${#BG_LOGS[@]} -gt 0 ]]; then
   echo ""
-  echo "── Correct ─────────────────────────────────────────────────────────"
-  "$SCRIPT_DIR/lec-correct" --provider "$PROVIDER"
+  echo "── Post-process ────────────────────────────────────────────────────"
+  bg_wait_all
+  bg_dump_logs
+  if [[ "$BG_FAILED" -gt 0 ]]; then
+    echo "Error: $BG_FAILED background post-processing job(s) failed" >&2
+    exit 1
+  fi
 fi
 
 # ── Diarize (optional) ────────────────────────────────────────────────
@@ -198,14 +419,41 @@ if [[ "$DIARIZE" == true ]]; then
   done
 fi
 
+# ── Paragraph (only when --diarize; otherwise paragraph ran per-file above) ───
+if [[ "$DIARIZE" == true ]]; then
+echo ""
+echo "── Paragraph ───────────────────────────────────────────────────────"
+SRT_INPUTS=()
+for FILE in "${AUDIO_FILES[@]}"; do
+  NAME="${FILE%.*}"
+  if [[ "$DIARIZE" == true && -f "${NAME}.diarized.srt" ]]; then
+    SRT_INPUTS+=("${NAME}.diarized.srt")
+  else
+    SRT_INPUTS+=("${NAME}.srt")
+  fi
+done
+PARA_ARGS=(--gap "$PARAGRAPH_GAP")
+if [[ "$SMOOTH" == true ]]; then
+  PARA_ARGS+=(--smooth --provider "$PROVIDER")
+fi
+"$SCRIPT_DIR/lec-paragraph" "${PARA_ARGS[@]}" "${SRT_INPUTS[@]}"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 SCRIPT_END=$(date +%s)
 TOTAL=$((SCRIPT_END - SCRIPT_START))
+TRANSCRIBE_TIME=$((TRANSCRIBE_END - SCRIPT_START))
+POSTPROCESS_TIME=$((SCRIPT_END - TRANSCRIBE_END))
 
 STEPS="transcribe"
-[[ "$RENAME"   == true ]] && STEPS="rename, $STEPS"
-[[ "$CORRECT"  == true ]] && STEPS="$STEPS, correct"
-[[ "$DIARIZE"  == true ]] && STEPS="$STEPS, diarize"
+[[ "$RENAME"  == true ]] && STEPS="rename, $STEPS"
+[[ "$CORRECT" == true ]] && STEPS="$STEPS, correct"
+[[ "$DIARIZE" == true ]] && STEPS="$STEPS, diarize"
+if [[ "$SMOOTH" == true ]]; then
+  STEPS="$STEPS, paragraph (smooth, $PROVIDER)"
+else
+  STEPS="$STEPS, paragraph (pause)"
+fi
 
 echo ""
 echo "── Summary ─────────────────────────────────────────────────────────────────"
@@ -216,4 +464,6 @@ printf "  %-18s %s\n" "Engine:"          "$ENGINE"
 [[ "$ENGINE" == "whisper" ]] && printf "  %-18s %s\n" "Model:" "$MLX_MODEL"
 printf "  %-18s %s\n" "Total audio:"     "$(format_duration "$TOTAL_AUDIO")"
 printf "  %-18s %s\n" "Speed:"           "$(awk -v a="$TOTAL_AUDIO" -v p="$TOTAL" 'BEGIN{printf "x%.1f", a/p}')"
+printf "  %-18s %s\n" "Transcribe time:" "$(awk -v t="$TRANSCRIBE_TIME" 'BEGIN{printf "%.1fm (%ds)", t/60, t}')"
+printf "  %-18s %s\n" "Post-process:"    "$(awk -v t="$POSTPROCESS_TIME" 'BEGIN{printf "%.1fm (%ds)", t/60, t}')"
 printf "  %-18s %s\n" "Total time:"      "$(awk -v t="$TOTAL" 'BEGIN{printf "%.1fm (%ds)", t/60, t}')"
