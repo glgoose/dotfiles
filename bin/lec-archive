@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lec-archive — archive lecture WAVs as mono FLAC and/or mono Opus
-# Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-r|--rename] [-l|--strict-lossless] <files...>
+# Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-l|--strict-lossless] <files...>
 # Files are required (paths relative to cwd). Auto-discovery from cwd is no longer supported.
 # Default FLAC: mono, s16, sample rate capped at 48 kHz (functionally lossless for speech).
 # --strict-lossless: bit-perfect FLAC of source (no channel/depth/rate changes).
@@ -11,7 +11,6 @@ set -euo pipefail
 OUTPUT_MODE="both" # both | flac | opus
 MODE_SET=false
 SKIP_NORMALIZE=false
-RENAME=false
 STRICT_LOSSLESS=false
 INPUT_FILES=()
 
@@ -37,7 +36,6 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --skip-normalize|-s)  SKIP_NORMALIZE=true;  shift ;;
-    --rename|-r)          RENAME=true;          shift ;;
     --strict-lossless|-l) STRICT_LOSSLESS=true; shift ;;
     --)
       shift
@@ -45,7 +43,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -*)
       echo "Error: unknown option: $1"
-      echo "Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-r|--rename] [-l|--strict-lossless] <files...>"
+      echo "Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-l|--strict-lossless] <files...>"
       exit 1
       ;;
     *)
@@ -71,7 +69,7 @@ done
 # ── Resolve input files: explicit args required ───────────────────────────────
 if [[ ${#INPUT_FILES[@]} -eq 0 ]]; then
   echo "Error: no input files. Pass one or more .flac/.wav files explicitly."
-  echo "Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-r|--rename] [-l|--strict-lossless] <files...>"
+  echo "Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-l|--strict-lossless] <files...>"
   exit 1
 fi
 
@@ -89,7 +87,6 @@ for f in "${INPUT_FILES[@]}"; do
 done
 
 SCRIPT_START=$(date +%s)
-FOLDER=$(basename "$PWD")
 IS_TTY=0
 [[ -t 1 ]] && IS_TTY=1
 
@@ -334,11 +331,7 @@ for FILE in "${INPUT_FILES[@]}"; do
 
   NAME="${FILE%.[Ff][Ll][Aa][Cc]}"
   NAME="${NAME%.[Ww][Aa][Vv]}"
-  if [[ "$RENAME" == true ]]; then
-    BASE_NAME="${FOLDER}_$((FILES_PROCESSED + 1))"
-  else
-    BASE_NAME="$NAME"
-  fi
+  BASE_NAME="$NAME"
 
   OUTPUT_FLAC="${BASE_NAME}.flac"
   OUTPUT_OPUS="${BASE_NAME}.opus"
