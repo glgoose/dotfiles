@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+# lec-paragraph — restructure transcript .txt with paragraph breaks
+# Usage: lec-paragraph <srt-files...> [-L|--no-llm] [--gap SECONDS]
+#                     [--provider openai|anthropic] [--no-speakers] [--stdout]
+#
+# Modes:
+#   default (LLM-based)   paragraph break on topic shifts. Uses OPENAI_API_KEY or
+#                         ANTHROPIC_API_KEY. LLM only returns sentence indices
+#                         (never text); output is validated against input tokens
+#                         and falls back to pause-based on any mismatch. If no
+#                         API key is in env, warns and falls back to pause-based.
+#   --no-llm (pause-based) paragraph break on SRT pause gaps + speaker turns.
+#                         Free, deterministic.
+#
+# SRT files are required (one or more, paths relative to cwd). Each may be a plain
+# .srt or a .diarized.srt. Auto-discovery from cwd is not supported.
+# .txt is overwritten in place; rely on pre-improve/ (improve-transcript) for backups.
+set -euo pipefail
+
+# ── Defaults ───────────────────────────────────────────────────────────────────
+GAP=1.5
+SHOW_SPEAKERS=true
+TO_STDOUT=false
+SMOOTH=true
+PROVIDER=""
+INPUT_FILES=()
+
+usage() {
+  cat <<'EOF'
+Usage: lec-paragraph <srt-files...> [-L|--no-llm] [--gap SECONDS]
+                    [--provider openai|anthropic] [--no-speakers] [--stdout]
+
+Restructure transcript .txt with paragraph breaks based on SRT timing,
+diarization speaker turns, and (by default) LLM-detected topic shifts.
+
+SRT files are required (one or more). Each may be a plain .srt or a .diarized.srt
+path. Auto-discovery from cwd is not supported.
+
+Options:
+  -L, --no-llm          skip LLM and use pause-based breaks only (free, deterministic)
+  --gap SECONDS         pause threshold for paragraph break (default: 1.5)
+  --provider PROV       openai|anthropic (auto-detect from env by default)
+  --no-speakers         use diarization for breaks but omit speaker labels
+  --stdout              print to stdout, do not touch .txt
+  -h, --help            show this help
+
+Note: .txt is overwritten in place. Use pre-improve/ snapshots
+(from the improve-transcript skill) if you need to roll back.
+EOF
+}
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gap)
+      [[ $# -lt 2 ]] && { echo "Error: --gap requires a number (seconds)" >&2; exit 1; }
+      GAP="$2"; shift 2 ;;
+    --no-llm|-L)   SMOOTH=false;        shift ;;
+    --provider)
+      [[ $# -lt 2 ]] && { echo "Error: --provider requires openai or anthropic" >&2; exit 1; }
+      PROVIDER="$2"
+      [[ "$PROVIDER" != "openai" && "$PROVIDER" != "anthropic" ]] && {
+        echo "Error: --provider must be 'openai' or 'anthropic'" >&2; exit 1; }
+      shift 2 ;;
+    --no-speakers) SHOW_SPEAKERS=false; shift ;;
+    --stdout)      TO_STDOUT=true;      shift ;;
+    -h|--help)     usage; exit 0 ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do INPUT_FILES+=("$1"); shift; done
+      ;;
+    -*)
+      echo "Error: unknown option: $1" >&2
+      usage >&2
+      exit 1 ;;
+    *)
+      INPUT_FILES+=("$1"); shift ;;
+  esac
+done
+
+# ── Dependency check ───────────────────────────────────────────────────────────
+if ! command -v python3 &>/dev/null; then
+  echo "Error: python3 not found." >&2
+  exit 1
+fi
+
+# ── Provider auto-detect for LLM mode ─────────────────────────────────────────
+# LLM (smooth) is on by default. Missing API key warns and falls back to
+# pause-based rather than hard-erroring. To force pause-based, pass --no-llm.
+if [[ "$SMOOTH" == true ]]; then
+  if [[ -z "$PROVIDER" ]]; then
+    if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+      PROVIDER="openai"
+    elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+      PROVIDER="anthropic"
+    else
+      echo "Warning: no OPENAI_API_KEY or ANTHROPIC_API_KEY in env; falling back to pause-based paragraphs. Pass --no-llm to silence." >&2
+      SMOOTH=false
+    fi
+  fi
+  if [[ "$SMOOTH" == true && "$PROVIDER" == "openai" && -z "${OPENAI_API_KEY:-}" ]]; then
+    echo "Error: --provider openai but OPENAI_API_KEY is not set." >&2
+    exit 1
+  fi
+  if [[ "$SMOOTH" == true && "$PROVIDER" == "anthropic" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "Error: --provider anthropic but ANTHROPIC_API_KEY is not set." >&2
+    exit 1
+  fi
+fi
+
+# ── Validate explicit SRT inputs ──────────────────────────────────────────────
+if [[ ${#INPUT_FILES[@]} -eq 0 ]]; then
+  echo "Error: no input files. Pass one or more .srt/.diarized.srt files explicitly." >&2
+  usage >&2
+  exit 1
+fi
+
+declare -a SRT_PATHS=()
+declare -a TXT_PATHS=()
+
+for f in "${INPUT_FILES[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    if [[ -d "$f" ]]; then
+      echo "Error: '$f' is a directory; pass explicit .srt files (auto-discovery is not supported)" >&2
+    else
+      echo "Error: not a file: $f" >&2
+    fi
+    exit 1
+  fi
+  case "$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')" in
+    *.srt) ;;
+    *)
+      echo "Error: unsupported extension: $f (need .srt or .diarized.srt)" >&2
+      exit 1 ;;
+  esac
+  base="${f%.srt}"
+  base="${base%.diarized}"
+  SRT_PATHS+=("$f")
+  TXT_PATHS+=("${base}.txt")
+done
+
+# ── Embedded Python ────────────────────────────────────────────────────────────
+# Args: srt_path gap_sec show_speakers smooth provider
+# Env (when smooth): OPENAI_API_KEY or ANTHROPIC_API_KEY
+run_paragraph() {
+  local srt="$1" gap="$2" show="$3" smooth="$4" provider="$5"
+  python3 - "$srt" "$gap" "$show" "$smooth" "$provider" <<'PYEOF'
+import json, os, re, sys, urllib.request, urllib.error
+from pathlib import Path
+
+srt_path       = sys.argv[1]
+gap_threshold  = float(sys.argv[2])
+show_speakers  = sys.argv[3] == "true"
+smooth         = sys.argv[4] == "true"
+provider       = sys.argv[5]
+
+TS_RE   = re.compile(r'^(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*'
+                     r'(\d{2}):(\d{2}):(\d{2}),(\d{3})')
+SPK_RE  = re.compile(r'^\[([^\]]+)\]\s*')
+SENT_RE = re.compile(r'(?<=[.!?])\s+(?=[A-ZÀ-ŸÄÖÜ"\'])')
+
+SMOOTH_PROMPT = (
+    "You will receive N numbered sentences from an academic lecture transcript. "
+    "Return ONLY a JSON array of sentence indices where a NEW paragraph should "
+    "begin. Sentence 1 is implicitly the start; do not include 1.\n"
+    "\n"
+    "Rules:\n"
+    "- Aim for 5 sentences per paragraph. For N input sentences, return "
+    "approximately N/5 break indices. Paragraphs of 3-7 sentences are good; "
+    "paragraphs over 10 sentences are too long and should be split.\n"
+    "- Minimum 3 sentences per paragraph; the final paragraph may be shorter.\n"
+    "- Place breaks at topic shifts: a new concept is introduced, an example "
+    "begins or ends, the argument moves from setup to conclusion, the speaker "
+    "turns to a new author or case, or a digression closes.\n"
+    "- Do NOT place a break right before a coordinating conjunction (and, but, "
+    "so, or, yet) unless that conjunction signals a real topic shift and the "
+    "prior paragraph already contains at least 5 sentences.\n"
+    "\n"
+    "Return JSON only, no commentary. Example for 60 sentences: "
+    "[6, 12, 18, 24, 30, 36, 42, 48, 54]"
+)
+
+# ── SRT parsing ────────────────────────────────────────────────────────────────
+def parse_srt(path):
+    blocks = []
+    lines = Path(path).read_text().splitlines()
+    i = 0
+    while i < len(lines):
+        m = TS_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        start_ms = sum(int(m.group(k)) * f for k, f in zip((1,2,3,4),(3_600_000,60_000,1000,1)))
+        end_ms   = sum(int(m.group(k)) * f for k, f in zip((5,6,7,8),(3_600_000,60_000,1000,1)))
+        i += 1
+        parts, speaker = [], None
+        while i < len(lines) and lines[i].strip():
+            t = lines[i]
+            if not parts:
+                sm = SPK_RE.match(t)
+                if sm:
+                    speaker = sm.group(1)
+                    t = SPK_RE.sub('', t, count=1)
+            parts.append(t.strip())
+            i += 1
+        text = ' '.join(p for p in parts if p)
+        if text:
+            blocks.append((start_ms, end_ms, speaker, text))
+    return blocks
+
+SENT_END_RE = re.compile(r'[.!?…]["\')\]]?\s*$')
+
+def merge_split_sentences(blocks):
+    """Repair SRT block boundaries so each block is at least one whole sentence.
+
+    Two distinct artefacts to handle:
+    1. Prev block has no terminal punctuation (.!?…). It is genuinely mid-
+       sentence — stitch the next block onto it.
+    2. Prev block ends with .!? but the next block starts lowercase. That is a
+       transcription casing slip, not a mid-sentence split. Keep them as
+       separate blocks but capitalise the next block's first letter so the
+       sentence splitter and paragraph renderer treat it as a real new sentence.
+
+    A speaker change blocks both repairs — a diarisation turn is always a real
+    boundary.
+    """
+    if not blocks:
+        return blocks
+    merged = [blocks[0]]
+    for s, e, spk, text in blocks[1:]:
+        prev_s, prev_e, prev_spk, prev_text = merged[-1]
+        if prev_spk != spk:
+            merged.append((s, e, spk, text))
+            continue
+        if not SENT_END_RE.search(prev_text):
+            merged[-1] = (prev_s, e, prev_spk, prev_text.rstrip() + ' ' + text.lstrip())
+            continue
+        cleaned = text.lstrip()
+        if cleaned and cleaned[0].isalpha() and cleaned[0].islower():
+            cleaned = cleaned[0].upper() + cleaned[1:]
+        merged.append((s, e, spk, cleaned))
+    return merged
+
+def pretty_speaker(raw):
+    if raw is None:
+        return None
+    m = re.match(r'SPEAKER_(\d+)$', raw)
+    return f"Speaker {int(m.group(1)) + 1}" if m else raw
+
+# ── Pause-based paragraph builder ──────────────────────────────────────────────
+def paragraphs_pause(blocks, gap_ms):
+    paragraphs = []
+    for idx, (s, e, spk, text) in enumerate(blocks):
+        if idx == 0:
+            paragraphs.append((spk, [text])); continue
+        prev_s, prev_e, prev_spk, _ = blocks[idx - 1]
+        speaker_change = (spk is not None and prev_spk is not None and spk != prev_spk)
+        pause_break    = (s - prev_e > gap_ms)
+        if speaker_change or pause_break:
+            paragraphs.append((spk, [text]))
+        else:
+            paragraphs[-1][1].append(text)
+    return paragraphs
+
+# ── LLM API helpers ────────────────────────────────────────────────────────────
+def call_openai(api_key, system, user):
+    payload = json.dumps({
+        "model": "gpt-5.4",
+        "max_completion_tokens": 4096,
+        "reasoning_effort": "low",
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=180) as r:
+        body = json.loads(r.read())
+    return body["choices"][0]["message"]["content"]
+
+def call_anthropic(api_key, system, user):
+    payload = json.dumps({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 4096,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=180) as r:
+        body = json.loads(r.read())
+    return body["content"][0]["text"]
+
+# ── Smooth (LLM topic-based) paragraph builder ─────────────────────────────────
+def normalize_tokens(s):
+    s = re.sub(r'\s+', ' ', s).strip().lower()
+    out = []
+    for w in s.split():
+        w = w.strip(".,;:!?\"'()[]…—–-")
+        if w:
+            out.append(w)
+    return out
+
+def split_sentences_with_speaker(blocks):
+    """Each sentence inherits its source block's speaker."""
+    sentences = []
+    for s, e, spk, text in blocks:
+        for part in SENT_RE.split(text.strip()):
+            part = part.strip()
+            if part:
+                sentences.append((part, spk))
+    return sentences
+
+def paragraphs_smooth(blocks, provider):
+    sentences = split_sentences_with_speaker(blocks)
+    if len(sentences) < 4:
+        return None  # too few to bother — pause-based handles it
+
+    numbered = "\n".join(f"{i}. {s}" for i, (s, _) in enumerate(sentences, 1))
+
+    if provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        try:
+            raw = call_openai(api_key, SMOOTH_PROMPT, numbered)
+        except urllib.error.HTTPError as e:
+            sys.stderr.write(f"[smooth] OpenAI API error {e.code}: {e.read().decode()[:200]}\n")
+            return None
+        except Exception as e:
+            sys.stderr.write(f"[smooth] OpenAI call failed: {e}\n")
+            return None
+    else:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        try:
+            raw = call_anthropic(api_key, SMOOTH_PROMPT, numbered)
+        except urllib.error.HTTPError as e:
+            sys.stderr.write(f"[smooth] Anthropic API error {e.code}: {e.read().decode()[:200]}\n")
+            return None
+        except Exception as e:
+            sys.stderr.write(f"[smooth] Anthropic call failed: {e}\n")
+            return None
+
+    m = re.search(r'\[[\d,\s]*\]', raw)
+    if not m:
+        sys.stderr.write(f"[smooth] LLM did not return a JSON array: {raw[:200]}\n")
+        return None
+    try:
+        breaks = set(json.loads(m.group(0)))
+    except json.JSONDecodeError:
+        sys.stderr.write(f"[smooth] could not parse JSON: {m.group(0)}\n")
+        return None
+
+    breaks = {b for b in breaks if isinstance(b, int) and 1 < b <= len(sentences)}
+
+    # Force speaker-change as additional breaks
+    for i in range(1, len(sentences)):
+        if sentences[i][1] is not None and sentences[i-1][1] is not None \
+                and sentences[i][1] != sentences[i-1][1]:
+            breaks.add(i + 1)  # 1-indexed: break STARTS at sentence i+1
+
+    # Group sentences into paragraphs by break indices (1-indexed start)
+    sorted_breaks = sorted(breaks)
+    paragraphs = []
+    current_speaker = sentences[0][1]
+    current = [sentences[0][0]]
+    next_break_idx = 0
+    for i in range(1, len(sentences)):
+        if next_break_idx < len(sorted_breaks) and (i + 1) == sorted_breaks[next_break_idx]:
+            paragraphs.append((current_speaker, current))
+            current_speaker = sentences[i][1]
+            current = [sentences[i][0]]
+            next_break_idx += 1
+        else:
+            current.append(sentences[i][0])
+    if current:
+        paragraphs.append((current_speaker, current))
+
+    # Soepel validation: token-set must match input modulo whitespace/punct/case
+    full_input = " ".join(b[3] for b in blocks)
+    full_output = " ".join(" ".join(p[1]) for p in paragraphs)
+    in_tokens  = normalize_tokens(full_input)
+    out_tokens = normalize_tokens(full_output)
+    if in_tokens != out_tokens:
+        diffs = sum(1 for a, b in zip(in_tokens, out_tokens) if a != b)
+        sys.stderr.write(
+            f"[smooth] token mismatch — falling back to pause-based "
+            f"(len {len(in_tokens)}→{len(out_tokens)}, {diffs} positional diffs)\n"
+        )
+        return None
+
+    return paragraphs
+
+# ── Render ─────────────────────────────────────────────────────────────────────
+def render(paragraphs):
+    out = []
+    for spk, parts in paragraphs:
+        body = re.sub(r'\s+', ' ', ' '.join(parts)).strip()
+        if body:
+            body = body[0].upper() + body[1:]
+        label = pretty_speaker(spk) if show_speakers else None
+        out.append(f"**{label}:** {body}" if label else body)
+    return '\n\n'.join(out) + '\n'
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+blocks = merge_split_sentences(parse_srt(srt_path))
+if not blocks:
+    sys.exit(0)
+
+paragraphs = None
+if smooth:
+    paragraphs = paragraphs_smooth(blocks, provider)
+    if paragraphs is None:
+        sys.stderr.write("[smooth] using pause-based fallback\n")
+
+if paragraphs is None:
+    paragraphs = paragraphs_pause(blocks, int(gap_threshold * 1000))
+
+sys.stdout.write(render(paragraphs))
+PYEOF
+}
+
+# ── Process each pair ──────────────────────────────────────────────────────────
+for i in "${!SRT_PATHS[@]}"; do
+  SRT="${SRT_PATHS[$i]}"
+  TXT="${TXT_PATHS[$i]}"
+
+  if [[ ! -f "$SRT" ]]; then
+    echo "Error: SRT not found: $SRT" >&2
+    exit 1
+  fi
+
+  if [[ "$TO_STDOUT" == true ]]; then
+    run_paragraph "$SRT" "$GAP" "$SHOW_SPEAKERS" "$SMOOTH" "$PROVIDER"
+  else
+    run_paragraph "$SRT" "$GAP" "$SHOW_SPEAKERS" "$SMOOTH" "$PROVIDER" > "$TXT"
+    MODE_LABEL="pause"
+    [[ "$SMOOTH" == true ]] && MODE_LABEL="smooth ($PROVIDER)"
+    echo "  Paragraphed → $TXT  (source: $(basename "$SRT"), mode: $MODE_LABEL)"
+  fi
+done
