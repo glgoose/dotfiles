@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# lec-transcribe — transcribe lecture audio, optionally rename/correct/diarize, always paragraph
-# Usage: lec-transcribe [-r|--rename] [-e|--engine whisper|parakeet] [-l|--lang LANGCODE]
+# lec-transcribe — transcribe lecture audio, optionally correct/diarize, always paragraph
+# Usage: lec-transcribe [-e|--engine whisper|parakeet] [-l|--lang LANGCODE]
 #                       [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]
 #                       [-s|--smooth | --no-smooth] [--gap SECONDS] <files...>
 # Audio files are required (paths relative to cwd). Accepted: any container/codec
@@ -15,7 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-USAGE="Usage: lec-transcribe [-r|--rename] [-e|--engine whisper|parakeet] [-l|--lang LANGCODE]
+USAGE="Usage: lec-transcribe [-e|--engine whisper|parakeet] [-l|--lang LANGCODE]
                      [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]
                      [-s|--smooth | --no-smooth] [--gap SECONDS] <files...>
        LANGCODE examples: nl (Dutch), fr (French), de (German), es (Spanish), it (Italian),
@@ -29,7 +29,6 @@ USAGE="Usage: lec-transcribe [-r|--rename] [-e|--engine whisper|parakeet] [-l|--
        improve; the skill auto-archives them after it runs."
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
-RENAME=false
 LANG_CODE="en"
 CORRECT=false
 DIARIZE=false
@@ -52,10 +51,6 @@ BG_MAX=2
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --rename|-r)
-      RENAME=true
-      shift
-      ;;
     --lang|-l)
       [[ $# -lt 2 ]] && { echo "Error: --lang requires a language code (e.g. --lang nl, --lang fr, --lang de)"; exit 1; }
       LANG_CODE="$2"
@@ -191,34 +186,6 @@ done
 AUDIO_FILES=("${INPUT_FILES[@]}")
 
 SCRIPT_START=$(date +%s)
-
-# ── Rename (optional) ─────────────────────────────────────────────────
-if [[ "$RENAME" == true ]]; then
-  FOLDER_NAME="$(basename "$PWD")"
-  echo ""
-  echo "── Rename ──────────────────────────────────────────────────────────"
-
-  INDEX=1
-  RENAMED=()
-  for FILE in "${AUDIO_FILES[@]}"; do
-    EXT="${FILE##*.}"
-    TARGET="${FOLDER_NAME}_${INDEX}.${EXT}"
-    if [[ "$FILE" == "$TARGET" ]]; then
-      echo "  [skip] $FILE"
-    else
-      mv "$FILE" "$TARGET"
-      echo "  $FILE → $TARGET"
-    fi
-    RENAMED+=("$TARGET")
-    INDEX=$((INDEX + 1))
-  done
-
-  # Re-sort after rename (names are now deterministic)
-  AUDIO_FILES=()
-  while IFS= read -r f; do
-    AUDIO_FILES+=("$f")
-  done < <(printf '%s\n' "${RENAMED[@]}" | sort)
-fi
 
 # ── Background job helpers (pipeline-overlap post-processing) ─────────
 # macOS default bash is 3.2: no `wait -n`. Poll PIDs with `kill -0` instead.
@@ -446,7 +413,6 @@ TRANSCRIBE_TIME=$((TRANSCRIBE_END - SCRIPT_START))
 POSTPROCESS_TIME=$((SCRIPT_END - TRANSCRIBE_END))
 
 STEPS="transcribe"
-[[ "$RENAME"  == true ]] && STEPS="rename, $STEPS"
 [[ "$CORRECT" == true ]] && STEPS="$STEPS, correct"
 [[ "$DIARIZE" == true ]] && STEPS="$STEPS, diarize"
 if [[ "$SMOOTH" == true ]]; then
