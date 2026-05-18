@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # lec-archive — archive lecture WAVs as mono FLAC and/or mono Opus
-# Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-r|--rename]
-# Run from inside the lecture folder (e.g. "260402 feminism")
+# Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-r|--rename] [-l|--strict-lossless] <files...>
+# Files are required (paths relative to cwd). Auto-discovery from cwd is no longer supported.
+# Default FLAC: mono, s16, sample rate capped at 48 kHz (functionally lossless for speech).
+# --strict-lossless: bit-perfect FLAC of source (no channel/depth/rate changes).
 # WAV files are never deleted — remove them manually once lec-process is done.
 set -euo pipefail
 
@@ -10,6 +12,8 @@ OUTPUT_MODE="both" # both | flac | opus
 MODE_SET=false
 SKIP_NORMALIZE=false
 RENAME=false
+STRICT_LOSSLESS=false
+INPUT_FILES=()
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -32,13 +36,20 @@ while [[ $# -gt 0 ]]; do
       MODE_SET=true
       shift
       ;;
-    --skip-normalize|-s) SKIP_NORMALIZE=true; shift ;;
-    --rename|-r)         RENAME=true;         shift ;;
-    *)
-      echo "Unknown option: $1"
-      echo "Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-r|--rename]"
+    --skip-normalize|-s)  SKIP_NORMALIZE=true;  shift ;;
+    --rename|-r)          RENAME=true;          shift ;;
+    --strict-lossless|-l) STRICT_LOSSLESS=true; shift ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do INPUT_FILES+=("$1"); shift; done
+      ;;
+    -*)
+      echo "Error: unknown option: $1"
+      echo "Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-r|--rename] [-l|--strict-lossless] <files...>"
       exit 1
       ;;
+    *)
+      INPUT_FILES+=("$1"); shift ;;
   esac
 done
 
@@ -57,25 +68,35 @@ for cmd in "${REQUIRED_CMDS[@]}"; do
   fi
 done
 
-# ── Collect input files: prefer FLAC, fall back to WAV ────────────────────────
-WAV_FILES=()
-while IFS= read -r f; do
-  WAV_FILES+=("$f")
-done < <(find . -maxdepth 1 -iname "*.flac" | sed 's|^\./||' | sort)
-
-if [[ ${#WAV_FILES[@]} -eq 0 ]]; then
-  while IFS= read -r f; do
-    WAV_FILES+=("$f")
-  done < <(find . -maxdepth 1 -iname "*.wav" | sed 's|^\./||' | sort)
-fi
-
-if [[ ${#WAV_FILES[@]} -eq 0 ]]; then
-  echo "Error: no .flac or .wav files found in the current directory."
+# ── Resolve input files: explicit args required ───────────────────────────────
+if [[ ${#INPUT_FILES[@]} -eq 0 ]]; then
+  echo "Error: no input files. Pass one or more .flac/.wav files explicitly."
+  echo "Usage: lec-archive [-f|--flac] [-o|--opus] [-s|--skip-normalize] [-r|--rename] [-l|--strict-lossless] <files...>"
   exit 1
 fi
 
+for f in "${INPUT_FILES[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    echo "Error: not a file: $f"
+    exit 1
+  fi
+  case "$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')" in
+    *.flac|*.wav) ;;
+    *)
+      echo "Error: unsupported extension: $f (need .flac or .wav)"
+      exit 1 ;;
+  esac
+done
+
 SCRIPT_START=$(date +%s)
 FOLDER=$(basename "$PWD")
+IS_TTY=0
+[[ -t 1 ]] && IS_TTY=1
+
+# Per-task timing (parallel arrays, one entry per processed file)
+FILE_LABELS=()
+FLAC_TIMES=()
+OPUS_TIMES=()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 file_bytes() { wc -c < "$1" | tr -d ' '; }
@@ -97,6 +118,10 @@ format_duration() {
   }'
 }
 
+format_mmss() {
+  awk -v s="$1" 'BEGIN{ printf "%d:%02d", int(s/60), int(s%60) }'
+}
+
 percent_of() {
   awk -v n="$1" -v d="$2" 'BEGIN {
     if (d == 0) printf "n/a"
@@ -104,23 +129,198 @@ percent_of() {
   }'
 }
 
+# ── Live progress helpers ─────────────────────────────────────────────────────
+SPINNER_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+write_phase() { printf '%s' "$2" >"$1"; }
+read_phase()  { local p=""; [[ -f "$1" ]] && p=$(<"$1"); printf '%s' "$p"; }
+
+# render_line <label> <mark> <elapsed_secs> <phase>
+render_line() {
+  printf '\e[2K\r    %-4s  %s  %s  %s\n' "$1" "$2" "$(format_mmss "$3")" "$4"
+}
+
+truncate_label() {
+  local max="$1" s="$2"
+  if (( ${#s} > max )); then
+    printf '%s…' "${s:0:$((max - 1))}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# live_progress_both <flac_pid> <opus_pid> <flac_start> <opus_start> <flac_phase> <opus_phase>
+# Polls until both PIDs exit. Redraws two status lines in place at ~5 Hz.
+# Sets globals LIVE_FLAC_ELAPSED, LIVE_OPUS_ELAPSED. Leaves cursor below the area.
+live_progress_both() {
+  local fp="$1" op="$2" fstart="$3" ostart="$4" fphase_f="$5" ophase_f="$6"
+  local fstate=running ostate=running
+  local felapsed=0 oelapsed=0
+  local spin_idx=0 now spin fmark omark fphase ophase
+
+  printf '    %-4s  ⠋  0:00  starting\n' "FLAC"
+  printf '    %-4s  ⠋  0:00  starting\n' "Opus"
+
+  while [[ "$fstate" == running || "$ostate" == running ]]; do
+    sleep 0.2
+    now=$(date +%s)
+    spin="${SPINNER_FRAMES[$spin_idx]}"
+    spin_idx=$(( (spin_idx + 1) % 10 ))
+
+    if [[ "$fstate" == running ]]; then
+      felapsed=$((now - fstart))
+      kill -0 "$fp" 2>/dev/null || fstate=done
+    fi
+    if [[ "$ostate" == running ]]; then
+      oelapsed=$((now - ostart))
+      kill -0 "$op" 2>/dev/null || ostate=done
+    fi
+
+    fphase=$(read_phase "$fphase_f"); [[ -z "$fphase" ]] && fphase="encoding"
+    ophase=$(read_phase "$ophase_f"); [[ -z "$ophase" ]] && ophase="starting"
+    if [[ "$fstate" == running ]]; then fmark="$spin"; else fmark="✓"; fi
+    if [[ "$ostate" == running ]]; then omark="$spin"; else omark="✓"; fi
+
+    printf '\e[2A'
+    render_line "FLAC" "$fmark" "$felapsed" "$fphase"
+    render_line "Opus" "$omark" "$oelapsed" "$ophase"
+  done
+
+  LIVE_FLAC_ELAPSED=$felapsed
+  LIVE_OPUS_ELAPSED=$oelapsed
+  return 0
+}
+
+# Poll-only (no rendering) — used in non-TTY both mode to capture per-task elapsed.
+poll_until_both_exit() {
+  local fp="$1" op="$2" fstart="$3" ostart="$4"
+  POLL_FLAC_ELAPSED=""
+  POLL_OPUS_ELAPSED=""
+  local now
+  while [[ -z "$POLL_FLAC_ELAPSED" || -z "$POLL_OPUS_ELAPSED" ]]; do
+    now=$(date +%s)
+    if [[ -z "$POLL_FLAC_ELAPSED" ]] && ! kill -0 "$fp" 2>/dev/null; then
+      POLL_FLAC_ELAPSED=$((now - fstart))
+    fi
+    if [[ -z "$POLL_OPUS_ELAPSED" ]] && ! kill -0 "$op" 2>/dev/null; then
+      POLL_OPUS_ELAPSED=$((now - ostart))
+    fi
+    [[ -z "$POLL_FLAC_ELAPSED" || -z "$POLL_OPUS_ELAPSED" ]] && sleep 0.5
+  done
+  return 0
+}
+
 # ── Encode (+ optional normalize for Opus) ────────────────────────────────────
 echo ""
+if [[ "$STRICT_LOSSLESS" == true ]]; then
+  FLAC_BANNER="FLAC (strict bit-perfect, level 8)"
+else
+  FLAC_BANNER="FLAC (mono, s16, ≤48 kHz, level 8)"
+fi
+
 case "$OUTPUT_MODE" in
   both)
     if [[ "$SKIP_NORMALIZE" == false ]]; then
-      echo "── Encode FLAC (mono, level 8) + normalize+encode Opus (mono, 96 kbps) ───────"
+      echo "── Encode $FLAC_BANNER + normalize+encode Opus (mono, 96 kbps) ──"
     else
-      echo "── Encode FLAC (mono, level 8) + encode Opus (mono, 96 kbps; normalize skipped) ─"
+      echo "── Encode $FLAC_BANNER + encode Opus (mono, 96 kbps; normalize skipped) ──"
     fi
     ;;
   flac)
-    echo "── Encode to FLAC (mono, compression level 8) ─────────────────────────────────"
+    echo "── Encode to $FLAC_BANNER ──"
     ;;
   opus)
-    echo "── Encode to Opus (mono, 96 kbps)$([[ "$SKIP_NORMALIZE" == true ]] && echo '; normalize skipped') ─────────────────────"
+    echo "── Encode to Opus (mono, 96 kbps)$([[ "$SKIP_NORMALIZE" == true ]] && echo '; normalize skipped') ──"
     ;;
 esac
+
+encode_flac() {
+  local START_T=$(date +%s)
+  local ELAPSED
+  [[ -n "${FLAC_PHASE_FILE:-}" ]] && write_phase "$FLAC_PHASE_FILE" "encoding"
+  if [[ "$FILE" == "$OUTPUT_FLAC" && "$STRICT_LOSSLESS" == false ]]; then
+    local SOURCE_SR SOURCE_CH SIZE_FLAC TARGET_SR TMP_FLAC SAVED_FLAC
+    SOURCE_SR=$(ffprobe -v error -show_entries stream=sample_rate -of csv=p=0 "$FILE")
+    SOURCE_CH=$(ffprobe -v error -show_entries stream=channels -of csv=p=0 "$FILE")
+    if [[ "$SOURCE_SR" -le 48000 && "$SOURCE_CH" -eq 1 ]]; then
+      SIZE_FLAC=$(file_bytes "$OUTPUT_FLAC")
+      ELAPSED=$(( $(date +%s) - START_T ))
+      echo "    FLAC [$(format_mmss "$ELAPSED")]: $OUTPUT_FLAC  (already FLAC mono ≤48 kHz, skipped re-encode)"
+    else
+      TARGET_SR=$(( SOURCE_SR > 48000 ? 48000 : SOURCE_SR ))
+      TMP_FLAC="${OUTPUT_FLAC}.tmp.flac"
+      ffmpeg -y -i "$FILE" -c:a flac -sample_fmt s16 -compression_level 8 -ac 1 -ar "$TARGET_SR" "$TMP_FLAC" 2>/dev/null
+      mv "$TMP_FLAC" "$OUTPUT_FLAC"
+      SIZE_FLAC=$(file_bytes "$OUTPUT_FLAC")
+      SAVED_FLAC=$((SIZE_BEFORE - SIZE_FLAC))
+      ELAPSED=$(( $(date +%s) - START_T ))
+      echo "    FLAC [$(format_mmss "$ELAPSED")]: $OUTPUT_FLAC  ($(human_size "$SIZE_BEFORE") → $(human_size "$SIZE_FLAC"), saved $(human_size "$SAVED_FLAC"); ${SOURCE_SR}→${TARGET_SR} Hz, ${SOURCE_CH}ch→1ch)"
+    fi
+  elif [[ "$FILE" == "$OUTPUT_FLAC" && "$STRICT_LOSSLESS" == true ]]; then
+    ELAPSED=$(( $(date +%s) - START_T ))
+    echo "    FLAC [$(format_mmss "$ELAPSED")]: $OUTPUT_FLAC  (already FLAC, strict-lossless preserves source, skipped re-encode)"
+  elif [[ "$STRICT_LOSSLESS" == true ]]; then
+    local SIZE_FLAC SAVED_FLAC
+    ffmpeg -y -i "$FILE" -c:a flac -compression_level 8 "$OUTPUT_FLAC" 2>/dev/null
+    SIZE_FLAC=$(file_bytes "$OUTPUT_FLAC")
+    SAVED_FLAC=$((SIZE_BEFORE - SIZE_FLAC))
+    ELAPSED=$(( $(date +%s) - START_T ))
+    echo "    FLAC [$(format_mmss "$ELAPSED")]: $OUTPUT_FLAC  ($(human_size "$SIZE_BEFORE") → $(human_size "$SIZE_FLAC"), saved $(human_size "$SAVED_FLAC"); bit-perfect of source)"
+  else
+    local SOURCE_SR TARGET_SR SIZE_FLAC SAVED_FLAC
+    SOURCE_SR=$(ffprobe -v error -show_entries stream=sample_rate -of csv=p=0 "$FILE")
+    TARGET_SR=$(( SOURCE_SR > 48000 ? 48000 : SOURCE_SR ))
+    ffmpeg -y -i "$FILE" -c:a flac -sample_fmt s16 -compression_level 8 -ac 1 -ar "$TARGET_SR" "$OUTPUT_FLAC" 2>/dev/null
+    SIZE_FLAC=$(file_bytes "$OUTPUT_FLAC")
+    SAVED_FLAC=$((SIZE_BEFORE - SIZE_FLAC))
+    ELAPSED=$(( $(date +%s) - START_T ))
+    echo "    FLAC [$(format_mmss "$ELAPSED")]: $OUTPUT_FLAC  ($(human_size "$SIZE_BEFORE") → $(human_size "$SIZE_FLAC"), saved $(human_size "$SAVED_FLAC"); ${TARGET_SR} Hz mono s16)"
+  fi
+  [[ -n "${FLAC_PHASE_FILE:-}" ]] && write_phase "$FLAC_PHASE_FILE" "done"
+  return 0
+}
+
+encode_opus() {
+  local START_T=$(date +%s)
+  local ELAPSED
+  local SIZE_OPUS SAVED_OPUS
+  if [[ "$SKIP_NORMALIZE" == false ]]; then
+    [[ -n "${OPUS_PHASE_FILE:-}" ]] && write_phase "$OPUS_PHASE_FILE" "analyzing loudness"
+    local STATS JSON input_i input_tp input_lra input_thresh target_offset LOUDNORM_AF
+    STATS=$(ffmpeg -i "$FILE" \
+      -af "loudnorm=I=-16:TP=-1:LRA=9:print_format=json" \
+      -f null - 2>&1)
+
+    JSON=$(echo "$STATS" | grep -A20 'Parsed_loudnorm' \
+      | awk '/\{/{p=1} p{print; if(/\}/)exit}' \
+      | sed 's/: *-inf/: "-999.0"/g; s/: *nan/: "0.0"/g' \
+      | jq '.')
+
+    input_i=$(      echo "$JSON" | jq -r '.input_i')
+    input_tp=$(     echo "$JSON" | jq -r '.input_tp')
+    input_lra=$(    echo "$JSON" | jq -r '.input_lra')
+    input_thresh=$( echo "$JSON" | jq -r '.input_thresh')
+    target_offset=$(echo "$JSON" | jq -r '.target_offset')
+
+    LOUDNORM_AF="loudnorm=I=-16:TP=-1:LRA=9:\
+measured_I=${input_i}:measured_TP=${input_tp}:measured_LRA=${input_lra}:\
+measured_thresh=${input_thresh}:offset=${target_offset}:\
+linear=true:print_format=summary"
+
+    [[ -n "${OPUS_PHASE_FILE:-}" ]] && write_phase "$OPUS_PHASE_FILE" "encoding"
+    ffmpeg -y -i "$FILE" -af "$LOUDNORM_AF" -c:a libopus -ac 1 -b:a 96k "$OUTPUT_OPUS" 2>/dev/null
+  else
+    [[ -n "${OPUS_PHASE_FILE:-}" ]] && write_phase "$OPUS_PHASE_FILE" "encoding"
+    ffmpeg -y -i "$FILE" -c:a libopus -ac 1 -b:a 96k "$OUTPUT_OPUS" 2>/dev/null
+  fi
+
+  SIZE_OPUS=$(file_bytes "$OUTPUT_OPUS")
+  SAVED_OPUS=$((SIZE_BEFORE - SIZE_OPUS))
+  ELAPSED=$(( $(date +%s) - START_T ))
+  echo "    Opus [$(format_mmss "$ELAPSED")]: $OUTPUT_OPUS  ($(human_size "$SIZE_BEFORE") → $(human_size "$SIZE_OPUS"), saved $(human_size "$SAVED_OPUS"))"
+  [[ -n "${OPUS_PHASE_FILE:-}" ]] && write_phase "$OPUS_PHASE_FILE" "done"
+  return 0
+}
 
 FILES_PROCESSED=0
 TOTAL_AUDIO=0
@@ -128,7 +328,7 @@ TOTAL_INPUT=0
 TOTAL_FLAC=0
 TOTAL_OPUS=0
 
-for FILE in "${WAV_FILES[@]}"; do
+for FILE in "${INPUT_FILES[@]}"; do
   DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$FILE" 2>/dev/null | awk '{printf "%d", $1}')
   TOTAL_AUDIO=$((TOTAL_AUDIO + DURATION))
 
@@ -147,53 +347,73 @@ for FILE in "${WAV_FILES[@]}"; do
 
   echo "  $FILE  ($(human_size "$SIZE_BEFORE"))"
 
-  if [[ "$OUTPUT_MODE" == "both" || "$OUTPUT_MODE" == "flac" ]]; then
-    if [[ "$FILE" == "$OUTPUT_FLAC" ]]; then
+  FILE_LABELS+=("$FILE")
+  FLAC_T=""
+  OPUS_T=""
+
+  case "$OUTPUT_MODE" in
+    both)
+      FLAC_LOG=$(mktemp)
+      OPUS_LOG=$(mktemp)
+      FLAC_PHASE_FILE=$(mktemp)
+      OPUS_PHASE_FILE=$(mktemp)
+      FLAC_START=$(date +%s)
+      OPUS_START=$FLAC_START
+      encode_flac >"$FLAC_LOG" 2>&1 &
+      FLAC_PID=$!
+      encode_opus >"$OPUS_LOG" 2>&1 &
+      OPUS_PID=$!
+
+      if [[ "$IS_TTY" == 1 ]]; then
+        live_progress_both "$FLAC_PID" "$OPUS_PID" "$FLAC_START" "$OPUS_START" "$FLAC_PHASE_FILE" "$OPUS_PHASE_FILE"
+        FLAC_T=$LIVE_FLAC_ELAPSED
+        OPUS_T=$LIVE_OPUS_ELAPSED
+      else
+        poll_until_both_exit "$FLAC_PID" "$OPUS_PID" "$FLAC_START" "$OPUS_START"
+        FLAC_T=$POLL_FLAC_ELAPSED
+        OPUS_T=$POLL_OPUS_ELAPSED
+      fi
+
+      FLAC_RC=0; wait "$FLAC_PID" || FLAC_RC=$?
+      OPUS_RC=0; wait "$OPUS_PID" || OPUS_RC=$?
+
+      # Clear live area (TTY only) so size-info logs occupy the same screen real estate.
+      [[ "$IS_TTY" == 1 ]] && printf '\e[2A\e[J'
+
+      cat "$FLAC_LOG"
+      cat "$OPUS_LOG"
+
+      if [[ $FLAC_RC -ne 0 || $OPUS_RC -ne 0 ]]; then
+        echo "Error: one or more parallel encodes failed for $FILE"
+        rm -f "$FLAC_LOG" "$OPUS_LOG" "$FLAC_PHASE_FILE" "$OPUS_PHASE_FILE"
+        exit 1
+      fi
+      rm -f "$FLAC_LOG" "$OPUS_LOG" "$FLAC_PHASE_FILE" "$OPUS_PHASE_FILE"
+      unset FLAC_PHASE_FILE OPUS_PHASE_FILE
+
       SIZE_FLAC=$(file_bytes "$OUTPUT_FLAC")
       TOTAL_FLAC=$((TOTAL_FLAC + SIZE_FLAC))
-      echo "    FLAC: $OUTPUT_FLAC  (already FLAC, skipped re-encode)"
-    else
-      ffmpeg -y -i "$FILE" -c:a flac -sample_fmt s16 -compression_level 8 -ac 1 "$OUTPUT_FLAC" 2>/dev/null
+      SIZE_OPUS=$(file_bytes "$OUTPUT_OPUS")
+      TOTAL_OPUS=$((TOTAL_OPUS + SIZE_OPUS))
+      ;;
+    flac)
+      FLAC_START=$(date +%s)
+      encode_flac
+      FLAC_T=$(( $(date +%s) - FLAC_START ))
       SIZE_FLAC=$(file_bytes "$OUTPUT_FLAC")
-      SAVED_FLAC=$((SIZE_BEFORE - SIZE_FLAC))
       TOTAL_FLAC=$((TOTAL_FLAC + SIZE_FLAC))
-      echo "    FLAC: $OUTPUT_FLAC  ($(human_size "$SIZE_BEFORE") → $(human_size "$SIZE_FLAC"), saved $(human_size "$SAVED_FLAC"))"
-    fi
-  fi
+      ;;
+    opus)
+      OPUS_START=$(date +%s)
+      encode_opus
+      OPUS_T=$(( $(date +%s) - OPUS_START ))
+      SIZE_OPUS=$(file_bytes "$OUTPUT_OPUS")
+      TOTAL_OPUS=$((TOTAL_OPUS + SIZE_OPUS))
+      ;;
+  esac
 
-  if [[ "$OUTPUT_MODE" == "both" || "$OUTPUT_MODE" == "opus" ]]; then
-    if [[ "$SKIP_NORMALIZE" == false ]]; then
-      echo "    Opus: analyzing loudness..."
-      STATS=$(ffmpeg -i "$FILE" \
-        -af "loudnorm=I=-16:TP=-1:LRA=9:print_format=json" \
-        -f null - 2>&1)
-
-      JSON=$(echo "$STATS" | grep -A20 'Parsed_loudnorm' \
-        | awk '/\{/{p=1} p{print; if(/\}/)exit}' \
-        | sed 's/: *-inf/: "-999.0"/g; s/: *nan/: "0.0"/g' \
-        | jq '.')
-
-      input_i=$(      echo "$JSON" | jq -r '.input_i')
-      input_tp=$(     echo "$JSON" | jq -r '.input_tp')
-      input_lra=$(    echo "$JSON" | jq -r '.input_lra')
-      input_thresh=$( echo "$JSON" | jq -r '.input_thresh')
-      target_offset=$(echo "$JSON" | jq -r '.target_offset')
-
-      LOUDNORM_AF="loudnorm=I=-16:TP=-1:LRA=9:\
-measured_I=${input_i}:measured_TP=${input_tp}:measured_LRA=${input_lra}:\
-measured_thresh=${input_thresh}:offset=${target_offset}:\
-linear=true:print_format=summary"
-
-      ffmpeg -y -i "$FILE" -af "$LOUDNORM_AF" -c:a libopus -ac 1 -b:a 96k "$OUTPUT_OPUS" 2>/dev/null
-    else
-      ffmpeg -y -i "$FILE" -c:a libopus -ac 1 -b:a 96k "$OUTPUT_OPUS" 2>/dev/null
-    fi
-
-    SIZE_OPUS=$(file_bytes "$OUTPUT_OPUS")
-    SAVED_OPUS=$((SIZE_BEFORE - SIZE_OPUS))
-    TOTAL_OPUS=$((TOTAL_OPUS + SIZE_OPUS))
-    echo "    Opus: $OUTPUT_OPUS  ($(human_size "$SIZE_BEFORE") → $(human_size "$SIZE_OPUS"), saved $(human_size "$SAVED_OPUS"))"
-  fi
+  FLAC_TIMES+=("$FLAC_T")
+  OPUS_TIMES+=("$OPUS_T")
 
   FILES_PROCESSED=$((FILES_PROCESSED + 1))
 done
@@ -202,18 +422,24 @@ done
 SCRIPT_END=$(date +%s)
 TOTAL=$((SCRIPT_END - SCRIPT_START))
 
+if [[ "$STRICT_LOSSLESS" == true ]]; then
+  FLAC_DESC="encode FLAC (strict bit-perfect)"
+else
+  FLAC_DESC="encode FLAC (mono, s16, ≤48 kHz)"
+fi
+
 case "$OUTPUT_MODE" in
   both)
-    MODE_LABEL="both (FLAC then Opus)"
+    MODE_LABEL="both (FLAC + Opus in parallel)"
     if [[ "$SKIP_NORMALIZE" == false ]]; then
-      STEPS="encode FLAC + normalize + encode Opus"
+      STEPS="$FLAC_DESC + normalize + encode Opus"
     else
-      STEPS="encode FLAC + encode Opus"
+      STEPS="$FLAC_DESC + encode Opus"
     fi
     ;;
   flac)
     MODE_LABEL="flac-only"
-    STEPS="encode FLAC"
+    STEPS="$FLAC_DESC"
     ;;
   opus)
     MODE_LABEL="opus-only"
@@ -227,24 +453,49 @@ esac
 
 echo ""
 echo "── Summary ─────────────────────────────────────────────────────────────────"
-printf "  %-18s %s\n" "Files processed:" "$FILES_PROCESSED"
-printf "  %-18s %s\n" "Steps run:"       "$STEPS"
-printf "  %-18s %s\n" "Output mode:"    "$MODE_LABEL"
-printf "  %-18s %s\n" "Channels:"       "mono (ac=1)"
-printf "  %-18s %s\n" "Total audio:"    "$(format_duration "$TOTAL_AUDIO")"
-printf "  %-18s %s\n" "Input total:"    "$(human_size "$TOTAL_INPUT")"
+if [[ $FILES_PROCESSED -ge 2 ]]; then
+  printf "  %-18s %s\n" "Files processed:" "$FILES_PROCESSED"
+  printf "  %-18s %s\n" "Steps run:"       "$STEPS"
+  printf "  %-18s %s\n" "Output mode:"    "$MODE_LABEL"
+  if [[ "$STRICT_LOSSLESS" == true && "$OUTPUT_MODE" == "flac" ]]; then
+    printf "  %-18s %s\n" "Channels:"     "preserved from source"
+  else
+    printf "  %-18s %s\n" "Channels:"     "mono (ac=1)"
+  fi
+  printf "  %-18s %s\n" "Total audio:"    "$(format_duration "$TOTAL_AUDIO")"
+  printf "  %-18s %s\n" "Input total:"    "$(human_size "$TOTAL_INPUT")"
 
-if [[ "$OUTPUT_MODE" == "both" || "$OUTPUT_MODE" == "flac" ]]; then
-  printf "  %-18s %s\n" "FLAC total:" "$(human_size "$TOTAL_FLAC") ($(percent_of "$TOTAL_FLAC" "$TOTAL_INPUT") of input)"
-fi
+  if [[ "$OUTPUT_MODE" == "both" || "$OUTPUT_MODE" == "flac" ]]; then
+    printf "  %-18s %s\n" "FLAC total:" "$(human_size "$TOTAL_FLAC") ($(percent_of "$TOTAL_FLAC" "$TOTAL_INPUT") of input)"
+  fi
 
-if [[ "$OUTPUT_MODE" == "both" || "$OUTPUT_MODE" == "opus" ]]; then
-  printf "  %-18s %s\n" "Opus total:" "$(human_size "$TOTAL_OPUS") ($(percent_of "$TOTAL_OPUS" "$TOTAL_INPUT") of input)"
-fi
+  if [[ "$OUTPUT_MODE" == "both" || "$OUTPUT_MODE" == "opus" ]]; then
+    printf "  %-18s %s\n" "Opus total:" "$(human_size "$TOTAL_OPUS") ($(percent_of "$TOTAL_OPUS" "$TOTAL_INPUT") of input)"
+  fi
 
-if [[ "$OUTPUT_MODE" == "both" ]]; then
-  COMBINED=$((TOTAL_FLAC + TOTAL_OPUS))
-  printf "  %-18s %s\n" "Combined total:" "$(human_size "$COMBINED") ($(percent_of "$COMBINED" "$TOTAL_INPUT") of input)"
+  if [[ "$OUTPUT_MODE" == "both" ]]; then
+    COMBINED=$((TOTAL_FLAC + TOTAL_OPUS))
+    printf "  %-18s %s\n" "Combined total:" "$(human_size "$COMBINED") ($(percent_of "$COMBINED" "$TOTAL_INPUT") of input)"
+  fi
 fi
 
 printf "  %-18s %s\n" "Total time:" "$(awk -v t="$TOTAL" 'BEGIN{printf "%.1fm (%ds)", t/60, t}')"
+
+# ── Per-file times ────────────────────────────────────────────────────────────
+if [[ $FILES_PROCESSED -ge 2 ]]; then
+  echo ""
+  echo "── Per-file times ──────────────────────────────────────────────────────────"
+  case "$OUTPUT_MODE" in
+    both) printf "  %-46s  %-6s  %-6s\n" "File" "FLAC" "Opus" ;;
+    flac) printf "  %-46s  %-6s\n"       "File" "FLAC" ;;
+    opus) printf "  %-46s  %-6s\n"       "File" "Opus" ;;
+  esac
+  for i in "${!FILE_LABELS[@]}"; do
+    LBL=$(truncate_label 46 "${FILE_LABELS[$i]}")
+    case "$OUTPUT_MODE" in
+      both) printf "  %-46s  %-6s  %-6s\n" "$LBL" "$(format_mmss "${FLAC_TIMES[$i]}")" "$(format_mmss "${OPUS_TIMES[$i]}")" ;;
+      flac) printf "  %-46s  %-6s\n"       "$LBL" "$(format_mmss "${FLAC_TIMES[$i]}")" ;;
+      opus) printf "  %-46s  %-6s\n"       "$LBL" "$(format_mmss "${OPUS_TIMES[$i]}")" ;;
+    esac
+  done
+fi
