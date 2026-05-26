@@ -9,6 +9,16 @@
 - Never require `pip install` or `uv tool install` — only `uv` itself needs to be present.
 - For every long flag, also define a short flag: e.g. `--rename, -r`, `--dry-run, -n`, `--force, -f`. Keep short flags unique within the command. Prefer conventional shorthands where they exist.
 
+## Zotero Actions & Tags scripts
+
+- Always define `function err(msg) { Zotero.log('[script-name] ' + msg); }` alongside `dbg`. Use `err()` for anything that ends a flow or signals a problem — it surfaces in the Error Console (`Tools → Error Console`). Use `dbg()` only for verbose trace that goes to Debug Output.
+- Always wrap the entire main body in `try { … } catch (e) { err('unexpected: ' + (e.message || e)); showToast('Error: ' + (e.message || e)); }` so Zotero never silently swallows an exception.
+- When calling external processes via `subprocess`, guard the result: `(result || '').trim()` — subprocess can return `undefined` if the process produces no stdout.
+
+## Citations
+
+When you encounter a citation key in the format `Author####` (e.g., `Stone2004`, `Smith2021`), use the `zotero-lookup` skill to resolve it. The skill will fetch bibliographic data and context from Zotero.
+
 ## Git commits
 
 - One commit per script or config file — never bundle unrelated files.
