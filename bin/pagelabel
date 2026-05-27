@@ -615,8 +615,11 @@ def extend_chains(
             v -= 1
 
         # Walk forward: extend chain end. Limit by blocked set and page count.
+        # Stop if MAX_CHAIN_SKIP consecutive empty pages pass with no confirmed match
+        # (symmetric with the chain-builder's per-step skip budget).
         p = ch.last_member_idx + 1
         v = ch.members[-1].value + 1
+        gap_since_confirmed = 0
         while p < len(pages_spans):
             if p in blocked:
                 break
@@ -631,9 +634,13 @@ def extend_chains(
                     if matching_val:
                         ch.members.append(matching_val[0])
                         blocked.add(p)
+                        gap_since_confirmed = 0
             else:
                 # No matching-style: infer and continue (empty or different-style)
                 ch.inferred_end_pages.append(p)
+                gap_since_confirmed += 1
+                if gap_since_confirmed >= MAX_CHAIN_SKIP:
+                    break
             p += 1
             v += 1
     return chains
@@ -678,6 +685,18 @@ def confidence_gate(
                 continue
             # Must be within the chain's physical span to count as "missed by this chain"
             if c.page_idx < ch.start_phys_idx or c.page_idx > ch.end_phys_idx_effective:
+                continue
+            # Exempt: falls inside a valid chain-builder skip (≤ MAX_CHAIN_SKIP between
+            # two adjacent members). The builder attempted it, bbox-rejected it at that
+            # centroid, then used a k>1 step. Centroid drift after extend_chains can make
+            # it appear compatible here — suppress the false-positive refusal.
+            member_pages = sorted(m.page_idx for m in ch.members)
+            in_valid_skip = any(
+                member_pages[i] < c.page_idx < member_pages[i + 1]
+                and member_pages[i + 1] - member_pages[i] <= MAX_CHAIN_SKIP
+                for i in range(len(member_pages) - 1)
+            )
+            if in_valid_skip:
                 continue
             # Exact value match: candidate has the value expected by chain at this position
             expected_value = ch.start_value + (c.page_idx - ch.start_phys_idx)
