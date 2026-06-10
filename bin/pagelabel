@@ -1,0 +1,952 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pymupdf>=1.24", "pikepdf>=8"]
+# ///
+"""pagelabel - detect and write PDF /PageLabels deterministically.
+
+Spec: ~/projects/identify-pagesnr/DESIGN.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal, Optional
+
+import fitz  # pymupdf
+import pikepdf
+
+
+# ---------- constants ----------
+
+MARGIN_FRACTION = 0.18
+BBOX_TOL_X = 0.05  # fraction of page width
+BBOX_TOL_Y = 0.02  # fraction of page height (tighter than x to avoid footnote refs)
+ROMAN_MAX = 600
+DENSITY_FLOOR = 0.30
+MIN_PAGES = 5
+TEXT_LAYER_SAMPLE = 10
+MIN_ANCHORS = 2
+MAX_CHAIN_SKIP = 5  # allow up to k physical-page skips while requiring Δv == k
+
+ARABIC_RE = re.compile(r"^\d{1,4}$")
+ROMAN_RE = re.compile(r"^[ivxlcdmIVXLCDM]{1,5}$")
+BULLET_TRAIL_RE = re.compile(r"^[•·|—–]\s*(\d{1,4})\s*$")
+BULLET_LEAD_RE = re.compile(r"^(\d{1,4})\s*[•·|—–]")
+
+
+# ---------- dataclasses ----------
+
+@dataclass(frozen=True)
+class Span:
+    text: str
+    bbox: tuple[float, float, float, float]
+    zone: Literal["top", "bottom"]
+    page_w: float
+    page_h: float
+
+
+@dataclass(frozen=True)
+class Candidate:
+    page_idx: int
+    raw_text: str
+    value: int
+    style: Literal["arabic", "roman_lower", "roman_upper"]
+    parity: Literal["even", "odd"]
+    zone: Literal["top", "bottom"]
+    bbox: tuple[float, float, float, float]
+    page_w: float
+    page_h: float
+
+    @property
+    def cx(self) -> float:
+        return (self.bbox[0] + self.bbox[2]) / 2.0
+
+    @property
+    def cy(self) -> float:
+        return (self.bbox[1] + self.bbox[3]) / 2.0
+
+
+@dataclass
+class Chain:
+    style: Literal["arabic", "roman_lower", "roman_upper"]
+    members: list[Candidate]
+    inferred_pages: list[int] = field(default_factory=list)
+    inferred_end_pages: list[int] = field(default_factory=list)
+    centroid_even: Optional[tuple[float, float]] = None
+    centroid_odd: Optional[tuple[float, float]] = None
+    zone: Literal["top", "bottom"] = "top"
+
+    @property
+    def confirmed_count(self) -> int:
+        return len(self.members)
+
+    @property
+    def first_member_idx(self) -> int:
+        return self.members[0].page_idx
+
+    @property
+    def last_member_idx(self) -> int:
+        return self.members[-1].page_idx
+
+    @property
+    def start_phys_idx(self) -> int:
+        if self.inferred_pages:
+            return min(self.inferred_pages + [self.first_member_idx])
+        return self.first_member_idx
+
+    @property
+    def end_phys_idx(self) -> int:
+        return self.last_member_idx
+
+    @property
+    def end_phys_idx_effective(self) -> int:
+        if self.inferred_end_pages:
+            return max(self.inferred_end_pages + [self.last_member_idx])
+        return self.last_member_idx
+
+    @property
+    def start_value(self) -> int:
+        # value at start_phys_idx, walking back from first confirmed
+        first = self.members[0]
+        return first.value - (first.page_idx - self.start_phys_idx)
+
+    @property
+    def length(self) -> int:
+        return self.end_phys_idx - self.start_phys_idx + 1
+
+    @property
+    def anchor_density(self) -> float:
+        confirmed_span = self.last_member_idx - self.first_member_idx + 1
+        return self.confirmed_count / confirmed_span if confirmed_span else 0.0
+
+
+@dataclass
+class Options:
+    dry_run: bool
+    verbose: bool
+    force: bool
+
+
+class Refused(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class Errored(Exception):
+    def __init__(self, msg: str):
+        super().__init__(msg)
+        self.msg = msg
+
+
+# ---------- pure helpers ----------
+
+_UNICODE_ROMAN = {
+    "Ⅰ": "I", "Ⅱ": "II", "Ⅲ": "III", "Ⅳ": "IV", "Ⅴ": "V",
+    "Ⅵ": "VI", "Ⅶ": "VII", "Ⅷ": "VIII", "Ⅸ": "IX", "Ⅹ": "X",
+    "Ⅺ": "XI", "Ⅻ": "XII", "Ⅼ": "L", "Ⅽ": "C", "Ⅾ": "D", "Ⅿ": "M",
+    "ⅰ": "i", "ⅱ": "ii", "ⅲ": "iii", "ⅳ": "iv", "ⅴ": "v",
+    "ⅵ": "vi", "ⅶ": "vii", "ⅷ": "viii", "ⅸ": "ix", "ⅹ": "x",
+    "ⅺ": "xi", "ⅻ": "xii", "ⅼ": "l", "ⅽ": "c", "ⅾ": "d", "ⅿ": "m",
+}
+
+_ROMAN_VALS = [
+    (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+    (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+    (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+]
+
+
+def normalize_roman(s: str) -> str:
+    return "".join(_UNICODE_ROMAN.get(ch, ch) for ch in s)
+
+
+def encode_roman(n: int) -> str:
+    out = []
+    for v, sym in _ROMAN_VALS:
+        while n >= v:
+            out.append(sym)
+            n -= v
+    return "".join(out)
+
+
+def parse_roman(raw: str) -> Optional[int]:
+    s = normalize_roman(raw)
+    if not s or not re.fullmatch(r"[ivxlcdmIVXLCDM]+", s):
+        return None
+    upper = s.upper()
+    vals = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    total = 0
+    prev = 0
+    for ch in reversed(upper):
+        v = vals[ch]
+        if v < prev:
+            total -= v
+        else:
+            total += v
+            prev = v
+    if total < 1 or total > ROMAN_MAX:
+        return None
+    if encode_roman(total) != upper:
+        return None
+    return total
+
+
+def has_alpha_outside_roman(s: str) -> bool:
+    norm = normalize_roman(s)
+    for ch in norm:
+        if ch.isalpha() and ch not in "ivxlcdmIVXLCDM":
+            return True
+    return False
+
+
+def parity_of(page_idx: int) -> Literal["even", "odd"]:
+    return "even" if page_idx % 2 == 0 else "odd"
+
+
+# ---------- step 0: deps ----------
+
+def check_qpdf() -> None:
+    if shutil.which("qpdf") is None:
+        print("pagelabel: qpdf not found (brew install qpdf)", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------- step 1: open + validate ----------
+
+def open_and_validate(path: Path) -> fitz.Document:
+    try:
+        doc = fitz.open(str(path))
+    except fitz.FileDataError as e:
+        raise Refused(f"corrupted PDF: {e}")
+    except Exception as e:
+        raise Errored(f"could not open: {e}")
+
+    if doc.is_encrypted:
+        if not doc.authenticate(""):
+            raise Refused("encrypted PDF")
+
+    if doc.page_count < MIN_PAGES:
+        raise Refused(f"fewer than {MIN_PAGES} pages, insufficient signal")
+
+    sample = min(TEXT_LAYER_SAMPLE, doc.page_count)
+    all_empty = True
+    for i in range(sample):
+        if doc[i].get_text("text").strip():
+            all_empty = False
+            break
+    if all_empty:
+        raise Refused("no text layer (likely image-only PDF)")
+
+    return doc
+
+
+# ---------- step 2: existing labels ----------
+
+def has_page_labels(path: Path) -> bool:
+    try:
+        with pikepdf.open(str(path)) as p:
+            pl = p.Root.get("/PageLabels")
+            if pl is None:
+                return False
+            nums = pl.get("/Nums")
+            if nums is None:
+                return False
+            return len(nums) > 0
+    except Exception:
+        return False
+
+
+# ---------- step 3: margin extraction ----------
+
+def extract_margin_spans(doc: fitz.Document) -> list[list[Span]]:
+    pages_spans: list[list[Span]] = []
+    for page in doc:
+        r = page.rect
+        w, h = r.width, r.height
+        top_rect = fitz.Rect(r.x0, r.y0, r.x1, r.y0 + h * MARGIN_FRACTION)
+        bot_rect = fitz.Rect(r.x0, r.y1 - h * MARGIN_FRACTION, r.x1, r.y1)
+
+        spans: list[Span] = []
+        for zone, rect in (("top", top_rect), ("bottom", bot_rect)):
+            try:
+                d = page.get_text("dict", clip=rect)
+            except Exception:
+                continue
+            for block in d.get("blocks", []):
+                if block.get("type", 0) != 0:
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span.get("text", "").strip()
+                        if not text:
+                            continue
+                        bb = span.get("bbox")
+                        if not bb or len(bb) != 4:
+                            continue
+                        spans.append(Span(
+                            text=text,
+                            bbox=tuple(bb),
+                            zone=zone,
+                            page_w=w,
+                            page_h=h,
+                        ))
+        pages_spans.append(spans)
+    return pages_spans
+
+
+# ---------- step 4: candidate generation ----------
+
+def candidate_from_span(page_idx: int, span: Span) -> Optional[Candidate]:
+    text = span.text.strip()
+    if not text:
+        return None
+
+    # Bullet-separated: "• 5" or "4 •"
+    m = BULLET_TRAIL_RE.fullmatch(text)
+    if m:
+        value = int(m.group(1))
+        if value < 1 or value > 9999:
+            return None
+        return Candidate(
+            page_idx=page_idx,
+            raw_text=text,
+            value=value,
+            style="arabic",
+            parity=parity_of(page_idx),
+            zone=span.zone,
+            bbox=span.bbox,
+            page_w=span.page_w,
+            page_h=span.page_h,
+        )
+
+    m = BULLET_LEAD_RE.match(text)
+    if m:
+        value = int(m.group(1))
+        if value < 1 or value > 9999:
+            return None
+        return Candidate(
+            page_idx=page_idx,
+            raw_text=text,
+            value=value,
+            style="arabic",
+            parity=parity_of(page_idx),
+            zone=span.zone,
+            bbox=span.bbox,
+            page_w=span.page_w,
+            page_h=span.page_h,
+        )
+
+    # Arabic
+    if ARABIC_RE.fullmatch(text):
+        value = int(text)
+        if value < 1 or value > 9999:
+            return None
+        return Candidate(
+            page_idx=page_idx,
+            raw_text=text,
+            value=value,
+            style="arabic",
+            parity=parity_of(page_idx),
+            zone=span.zone,
+            bbox=span.bbox,
+            page_w=span.page_w,
+            page_h=span.page_h,
+        )
+
+    # Roman (ASCII + unicode block via normalize)
+    norm = normalize_roman(text)
+    if ROMAN_RE.fullmatch(norm) and not has_alpha_outside_roman(text):
+        value = parse_roman(text)
+        if value is None:
+            return None
+        is_upper = norm.isupper()
+        is_lower = norm.islower()
+        if not (is_upper or is_lower):
+            return None  # mixed case is suspicious
+        style: Literal["roman_lower", "roman_upper"] = (
+            "roman_upper" if is_upper else "roman_lower"
+        )
+        return Candidate(
+            page_idx=page_idx,
+            raw_text=text,
+            value=value,
+            style=style,
+            parity=parity_of(page_idx),
+            zone=span.zone,
+            bbox=span.bbox,
+            page_w=span.page_w,
+            page_h=span.page_h,
+        )
+
+    return None
+
+
+def generate_candidates(pages_spans: list[list[Span]]) -> list[Candidate]:
+    cands: list[Candidate] = []
+    for page_idx, spans in enumerate(pages_spans):
+        for sp in spans:
+            c = candidate_from_span(page_idx, sp)
+            if c is not None:
+                cands.append(c)
+    return cands
+
+
+# ---------- step 5: chain inference ----------
+
+def _bbox_compatible(chain: Chain, n: Candidate, toc_pages: set[int]) -> bool:
+    if n.zone != chain.zone:
+        return False
+
+    tol_x = n.page_w * BBOX_TOL_X
+    tol_y = n.page_h * BBOX_TOL_Y
+
+    same_centroid = chain.centroid_even if n.parity == "even" else chain.centroid_odd
+    opp_centroid = chain.centroid_odd if n.parity == "even" else chain.centroid_even
+
+    if same_centroid is not None:
+        cx, cy = same_centroid
+        if abs(n.cx - cx) < tol_x and abs(n.cy - cy) < tol_y:
+            return True
+
+    if opp_centroid is not None:
+        ox, oy = opp_centroid
+        mirrored = n.page_w - n.cx
+        if abs(mirrored - ox) < tol_x and abs(n.cy - oy) < tol_y:
+            return True
+
+    # bootstrap: no centroids yet (only the seed itself qualifies)
+    if same_centroid is None and opp_centroid is None:
+        return True
+
+    if n.page_idx in toc_pages:
+        return True
+
+    return False
+
+
+def _update_centroid(chain: Chain, c: Candidate) -> None:
+    if c.parity == "even":
+        if chain.centroid_even is None:
+            chain.centroid_even = (c.cx, c.cy)
+        else:
+            ex, ey = chain.centroid_even
+            count = sum(1 for m in chain.members if m.parity == "even")
+            chain.centroid_even = (
+                (ex * (count - 1) + c.cx) / count,
+                (ey * (count - 1) + c.cy) / count,
+            )
+    else:
+        if chain.centroid_odd is None:
+            chain.centroid_odd = (c.cx, c.cy)
+        else:
+            ox, oy = chain.centroid_odd
+            count = sum(1 for m in chain.members if m.parity == "odd")
+            chain.centroid_odd = (
+                (ox * (count - 1) + c.cx) / count,
+                (oy * (count - 1) + c.cy) / count,
+            )
+
+
+def _find_at(
+    candidates: list[Candidate],
+    consumed: set[int],
+    chain: Chain,
+    page_idx: int,
+    value: int,
+    toc_pages: set[int],
+) -> Optional[Candidate]:
+    for c in candidates:
+        if id(c) in consumed:
+            continue
+        if c.page_idx != page_idx:
+            continue
+        if c.value != value:
+            continue
+        if c.style != chain.style:
+            continue
+        if _bbox_compatible(chain, c, toc_pages):
+            return c
+    return None
+
+
+def _page_has_candidate(candidates: list[Candidate], consumed: set[int], page_idx: int) -> bool:
+    for c in candidates:
+        if id(c) in consumed:
+            continue
+        if c.page_idx == page_idx:
+            return True
+    return False
+
+
+def infer_chains(candidates: list[Candidate], doc: fitz.Document) -> list[Chain]:
+    toc = doc.get_toc(simple=True) or []
+    toc_pages: set[int] = {entry[2] - 1 for entry in toc if entry[2] >= 1}
+
+    # Sort seeds (page_idx asc, value asc); growth uses the global list
+    seeds = sorted(candidates, key=lambda c: (c.page_idx, c.value))
+    consumed: set[int] = set()
+    chains: list[Chain] = []
+
+    for seed in seeds:
+        if id(seed) in consumed:
+            continue
+
+        chain = Chain(style=seed.style, members=[seed], zone=seed.zone)
+        _update_centroid(chain, seed)
+        consumed.add(id(seed))
+
+        # walk forward — search for (P+k, V+k) for smallest k in 1..MAX_CHAIN_SKIP
+        while True:
+            last = chain.members[-1]
+            match: Optional[Candidate] = None
+            for k in range(1, MAX_CHAIN_SKIP + 1):
+                match = _find_at(candidates, consumed, chain, last.page_idx + k, last.value + k, toc_pages)
+                if match is not None:
+                    break
+            if match is None:
+                break
+            chain.members.append(match)
+            _update_centroid(chain, match)
+            consumed.add(id(match))
+
+        # walk backward — symmetric
+        while True:
+            first = chain.members[0]
+            if first.value <= 1 or first.page_idx <= 0:
+                break
+            match = None
+            for k in range(1, MAX_CHAIN_SKIP + 1):
+                if first.value - k < 1 or first.page_idx - k < 0:
+                    break
+                match = _find_at(candidates, consumed, chain, first.page_idx - k, first.value - k, toc_pages)
+                if match is not None:
+                    break
+            if match is None:
+                break
+            chain.members.insert(0, match)
+            _update_centroid(chain, match)
+            consumed.add(id(match))
+
+        chains.append(chain)
+
+    return chains
+
+
+# ---------- step 6: chain selection ----------
+
+def select_chains(chains: list[Chain]) -> list[Chain]:
+    # Drop singleton (length-1) chains before selection: they cannot satisfy the
+    # 2-anchor gate and would only generate tied "equal length" refusals.
+    non_singletons = [c for c in chains if c.confirmed_count >= MIN_ANCHORS]
+
+    ordered = sorted(non_singletons, key=lambda c: (-c.length, -c.anchor_density, c.start_phys_idx))
+    accepted: list[Chain] = []
+    for ch in ordered:
+        overlap = None
+        for ac in accepted:
+            if not (ch.end_phys_idx < ac.start_phys_idx or ch.start_phys_idx > ac.end_phys_idx):
+                overlap = ac
+                break
+        if overlap is None:
+            accepted.append(ch)
+            continue
+        if ch.length == overlap.length and ch.anchor_density == overlap.anchor_density:
+            raise Refused(
+                f"competing chains at p{ch.start_phys_idx + 1} with equal length and density"
+            )
+        # else: reject silently (a worse chain overlaps a better one)
+
+    return sorted(accepted, key=lambda c: c.start_phys_idx)
+
+
+# ---------- step 7: walk-back and walk-forward ----------
+
+def extend_chains(
+    chains: list[Chain],
+    pages_spans: list[list[Span]],
+    all_candidates: list[Candidate],
+    doc: fitz.Document,
+) -> list[Chain]:
+    # Pre-index candidates by physical page.
+    by_page: dict[int, list[Candidate]] = {}
+    for c in all_candidates:
+        by_page.setdefault(c.page_idx, []).append(c)
+    # Blocked: pages claimed by any chain (members + inferred pages)
+    blocked: set[int] = set()
+    for ch in chains:
+        for m in ch.members:
+            blocked.add(m.page_idx)
+        for p in ch.inferred_pages:
+            blocked.add(p)
+
+    toc = doc.get_toc(simple=True) or []
+    toc_pages = {entry[2] - 1 for entry in toc if entry[2] >= 1}
+
+    for ch in chains:
+        # Walk backward: extend chain start. Limit backward extension to ~5-6 pages (front matter heuristic).
+        p = ch.first_member_idx - 1
+        v = ch.members[0].value - 1
+        while p >= 0 and v >= 1 and ch.first_member_idx - p <= 5:
+            if p in blocked:
+                break
+            page_cands = by_page.get(p, [])
+            matching_style_zone = [c for c in page_cands
+                                   if c.style == ch.style and c.zone == ch.zone]
+            if matching_style_zone:
+                # Page has matching-style candidate(s)
+                compatible = [c for c in matching_style_zone if _bbox_compatible(ch, c, toc_pages)]
+                if compatible:
+                    matching_val = [c for c in compatible if c.value == v]
+                    if matching_val:
+                        ch.members.insert(0, matching_val[0])
+                        blocked.add(p)
+            else:
+                # No matching-style: infer and continue (empty or different-style)
+                ch.inferred_pages.insert(0, p)
+            p -= 1
+            v -= 1
+
+        # Walk forward: extend chain end. Limit by blocked set and page count.
+        # Stop if MAX_CHAIN_SKIP consecutive empty pages pass with no confirmed match
+        # (symmetric with the chain-builder's per-step skip budget).
+        p = ch.last_member_idx + 1
+        v = ch.members[-1].value + 1
+        gap_since_confirmed = 0
+        while p < len(pages_spans):
+            if p in blocked:
+                break
+            page_cands = by_page.get(p, [])
+            matching_style_zone = [c for c in page_cands
+                                   if c.style == ch.style and c.zone == ch.zone]
+            if matching_style_zone:
+                # Page has matching-style candidate(s)
+                compatible = [c for c in matching_style_zone if _bbox_compatible(ch, c, toc_pages)]
+                if compatible:
+                    matching_val = [c for c in compatible if c.value == v]
+                    if matching_val:
+                        ch.members.append(matching_val[0])
+                        blocked.add(p)
+                        gap_since_confirmed = 0
+            else:
+                # No matching-style: infer and continue (empty or different-style)
+                ch.inferred_end_pages.append(p)
+                gap_since_confirmed += 1
+                if gap_since_confirmed >= MAX_CHAIN_SKIP:
+                    break
+            p += 1
+            v += 1
+    return chains
+
+
+# ---------- step 8: confidence gate ----------
+
+def confidence_gate(
+    chains: list[Chain],
+    all_candidates: list[Candidate],
+    doc: fitz.Document,
+) -> None:
+    # 1. >=2 confirmed anchors per chain
+    for ch in chains:
+        if ch.confirmed_count < MIN_ANCHORS:
+            raise Refused(
+                f"chain at p{ch.start_phys_idx + 1} has only {ch.confirmed_count} confirmed anchor"
+            )
+
+    # 2. density >= 30%
+    for ch in chains:
+        d = ch.anchor_density
+        if d < DENSITY_FLOOR:
+            raise Refused(
+                f"chain at p{ch.start_phys_idx + 1} has density {int(d * 100)}% (below 30% floor)"
+            )
+
+    # 3. loose-candidate check: refuse only when a loose candidate has exact-value
+    # match to a chain's expected value (indicating a detection miss).
+    # Random margin numerals (years, footnote refs) with non-matching values
+    # are tolerated as noise.
+    accepted_ids = {id(c) for ch in chains for c in ch.members}
+    toc = doc.get_toc(simple=True) or []
+    toc_pages = {entry[2] - 1 for entry in toc if entry[2] >= 1}
+    for c in all_candidates:
+        if id(c) in accepted_ids:
+            continue
+        for ch in chains:
+            if c.style != ch.style:
+                continue
+            if c.zone != ch.zone:
+                continue
+            # Must be within the chain's physical span to count as "missed by this chain"
+            if c.page_idx < ch.start_phys_idx or c.page_idx > ch.end_phys_idx_effective:
+                continue
+            # Exempt: falls inside a valid chain-builder skip (≤ MAX_CHAIN_SKIP between
+            # two adjacent members). The builder attempted it, bbox-rejected it at that
+            # centroid, then used a k>1 step. Centroid drift after extend_chains can make
+            # it appear compatible here — suppress the false-positive refusal.
+            member_pages = sorted(m.page_idx for m in ch.members)
+            in_valid_skip = any(
+                member_pages[i] < c.page_idx < member_pages[i + 1]
+                and member_pages[i + 1] - member_pages[i] <= MAX_CHAIN_SKIP
+                for i in range(len(member_pages) - 1)
+            )
+            if in_valid_skip:
+                continue
+            # Exact value match: candidate has the value expected by chain at this position
+            expected_value = ch.start_value + (c.page_idx - ch.start_phys_idx)
+            if c.value == expected_value and _bbox_compatible(ch, c, toc_pages):
+                raise Refused(f"candidate at p{c.page_idx + 1} matches no chain")
+
+    # 4. structural coverage (defensive — build_spec emits contiguous ranges)
+    # nothing to check explicitly here
+
+    # 5. TOC alignment — validate against the first *confirmed* anchor, not the
+    # inferred walk-back start. Walk-back extends into unnumbered front matter
+    # that has no TOC entry; the confirmed anchor is where numbering was observed.
+    toc = doc.get_toc(simple=True) or []
+    if toc:
+        toc_pages = {entry[2] - 1 for entry in toc}
+        for ch in chains:
+            check_idx = ch.first_member_idx
+            if check_idx <= 1:
+                continue  # front matter exemption
+            if not any(abs(check_idx - tp) <= 1 for tp in toc_pages):
+                raise Refused(
+                    f"chain restart at p{check_idx + 1} does not align with TOC entry"
+                )
+
+
+# ---------- step 9: build spec + write ----------
+
+def _kind_for(style: str) -> str:
+    return {"arabic": "D", "roman_lower": "r", "roman_upper": "R"}[style]
+
+
+def build_spec(chains: list[Chain], page_count: int) -> str:
+    chains_sorted = sorted(chains, key=lambda c: c.start_phys_idx)
+    entries: list[str] = []
+
+    cursor = 0  # next 0-based physical page to cover
+    for ch in chains_sorted:
+        # Use the first *confirmed* anchor as the chain start in the spec.
+        # Inferred walk-back pages (unnumbered front matter) are left unlabeled.
+        chain_start = ch.first_member_idx
+        sv = ch.members[0].value
+        if chain_start > cursor:
+            entries.append(f"{cursor + 1}:")
+        kind = _kind_for(ch.style)
+        if sv == 1:
+            entries.append(f"{chain_start + 1}:{kind}")
+        else:
+            entries.append(f"{chain_start + 1}:{kind}/{sv}")
+        cursor = ch.end_phys_idx_effective + 1
+
+    if cursor < page_count:
+        entries.append(f"{cursor + 1}:")
+
+    # Guarantee first entry starts at page 1
+    if not entries or not entries[0].startswith("1:"):
+        entries.insert(0, "1:")
+
+    return " ".join(entries)
+
+
+def write_labels(path: Path, spec: str) -> None:
+    label_args = spec.split()
+    res = subprocess.run(
+        ["qpdf", "--replace-input", "--set-page-labels"] + label_args + ["--", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        last = (res.stderr or "").strip().splitlines()
+        msg = last[-1] if last else f"exit {res.returncode}"
+        raise Errored(f"qpdf failed: {msg}")
+
+
+# ---------- step 10: post-write verification ----------
+
+def _name_to_kind(name) -> str:
+    if name is None:
+        return ""
+    s = str(name)
+    return {"/D": "D", "/r": "r", "/R": "R", "/a": "a", "/A": "A"}.get(s, "?")
+
+
+def read_pagelabels_spec(path: Path) -> str:
+    with pikepdf.open(str(path)) as p:
+        pl = p.Root["/PageLabels"]
+        nums = pl["/Nums"]
+        triples: list[tuple[int, str, Optional[int]]] = []
+        for i in range(0, len(nums), 2):
+            phys_0 = int(nums[i])
+            d = nums[i + 1]
+            s = d.get("/S")
+            st_val = d.get("/St")
+            st = int(st_val) if st_val is not None else 1
+            prefix = d.get("/P")
+            if prefix is not None and str(prefix):
+                raise Errored("unexpected /P prefix in /PageLabels")
+            kind = _name_to_kind(s)
+            triples.append((phys_0 + 1, kind, st if kind else None))
+
+    parts: list[str] = []
+    for phys, kind, st in triples:
+        if kind == "":
+            parts.append(f"{phys}:")
+        elif st in (None, 1):
+            parts.append(f"{phys}:{kind}")
+        else:
+            parts.append(f"{phys}:{kind}/{st}")
+    return " ".join(parts)
+
+
+def verify_written_spec(path: Path, expected: str) -> None:
+    actual = read_pagelabels_spec(path)
+    if actual != expected:
+        raise Errored(f"verification failed: expected {expected!r} got {actual!r}")
+
+
+# ---------- verbose ----------
+
+def vlog(opts: Options, msg: str) -> None:
+    if opts.verbose:
+        print(msg, file=sys.stderr)
+
+
+def vlog_chain(opts: Options, ch: Chain) -> None:
+    if not opts.verbose:
+        return
+    members_str = ", ".join(f"p{m.page_idx + 1}={m.raw_text}" for m in ch.members)
+    inf_str = ",".join(f"p{p + 1}" for p in ch.inferred_pages)
+    print(
+        f"[chain] {ch.style} zone={ch.zone} "
+        f"start_phys={ch.start_phys_idx + 1} end_phys={ch.end_phys_idx + 1} "
+        f"start_value={ch.start_value} confirmed={ch.confirmed_count} "
+        f"density={ch.anchor_density:.2f} "
+        f"inferred=[{inf_str}] anchors=[{members_str}]",
+        file=sys.stderr,
+    )
+
+
+def vlog_candidates(opts: Options, cands: list[Candidate]) -> None:
+    if not opts.verbose:
+        return
+    for c in cands:
+        print(
+            f"[chain] candidate p{c.page_idx + 1} {c.style} v={c.value} "
+            f"zone={c.zone} parity={c.parity} "
+            f"bbox=({c.bbox[0]:.1f},{c.bbox[1]:.1f},{c.bbox[2]:.1f},{c.bbox[3]:.1f}) "
+            f"page=({c.page_w:.0f}x{c.page_h:.0f}) raw={c.raw_text!r}",
+            file=sys.stderr,
+        )
+
+
+# ---------- orchestrator ----------
+
+def process(path: Path, opts: Options) -> int:
+    basename = path.name
+
+    if not path.exists():
+        print(f"{basename}: error, file not found", file=sys.stderr)
+        return 1
+
+    # step 2 first (cheap) — but design ordering is open then check
+    doc = open_and_validate(path)
+
+    if has_page_labels(path) and not opts.force:
+        if opts.dry_run:
+            # Still emit the current spec for round-trip checking? No — design
+            # says skip path exits 0 with the skip line, even for dry-run.
+            pass
+        print(
+            f"{basename}: already labeled, skipping (use --force to overwrite)",
+            file=sys.stderr,
+        )
+        return 0
+
+    pages_spans = extract_margin_spans(doc)
+    candidates = generate_candidates(pages_spans)
+    vlog_candidates(opts, candidates)
+
+    chains = infer_chains(candidates, doc)
+    vlog(opts, f"[chain] inferred {len(chains)} raw chains")
+    if opts.verbose:
+        for ch in chains:
+            members_str = ", ".join(f"p{m.page_idx + 1}={m.raw_text}" for m in ch.members)
+            print(
+                f"[chain] raw {ch.style} zone={ch.zone} "
+                f"start={ch.start_phys_idx + 1} end={ch.end_phys_idx + 1} "
+                f"len={ch.length} confirmed={ch.confirmed_count} "
+                f"density={ch.anchor_density:.2f} "
+                f"anchors=[{members_str}]",
+                file=sys.stderr,
+            )
+    selected = select_chains(chains)
+    vlog(opts, f"[chain] selected {len(selected)} chains after non-overlap pruning")
+
+    selected = extend_chains(selected, pages_spans, candidates, doc)
+
+    for ch in selected:
+        vlog_chain(opts, ch)
+
+    if not selected:
+        raise Refused("no chains detected")
+
+    confidence_gate(selected, candidates, doc)
+
+    spec = build_spec(selected, doc.page_count)
+    doc.close()
+
+    if opts.dry_run:
+        print(spec)
+        return 0
+
+    write_labels(path, spec)
+    verify_written_spec(path, spec)
+    print(f"{basename}: labeled ({spec})", file=sys.stderr)
+    return 0
+
+
+# ---------- main ----------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="pagelabel",
+        description="Detect and write PDF /PageLabels deterministically.",
+    )
+    p.add_argument("--dry-run", action="store_true",
+                   help="Print proposed spec to stdout; do not write.")
+    p.add_argument("--verbose", action="store_true",
+                   help="Dump detector state to stderr.")
+    p.add_argument("--force", action="store_true",
+                   help="Overwrite existing /PageLabels.")
+    p.add_argument("file", help="PDF file to label.")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    check_qpdf()
+    path = Path(args.file).resolve()
+    opts = Options(dry_run=args.dry_run, verbose=args.verbose, force=args.force)
+    basename = path.name
+    try:
+        return process(path, opts)
+    except Refused as r:
+        print(f"{basename}: refused, {r.reason}", file=sys.stderr)
+        return 2
+    except Errored as e:
+        print(f"{basename}: error, {e.msg}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
