@@ -214,6 +214,50 @@ const newAttachment = await Zotero.Attachments.importFromFile({
     fileBaseName: fileBaseName,
 });
 
+// Copy annotations falling within the extracted range onto the chapter PDF.
+// Zotero stores PDF annotations as child items of the source attachment, keyed
+// by 0-based pageIndex. The chapter PDF reindexes pages, so each in-range
+// annotation is re-saved on the new attachment with its pageIndex (and the
+// leading segment of its sortIndex) shifted by the page offset. A FRESH key is
+// generated per copy: saveFromJSON requires a key and reuses any existing one,
+// so passing the source key would reparent (move) the original off the book.
+let copiedAnns = 0;
+try {
+    const offset = parseInt(physStart, 10) - 1;          // book pageIndex of chapter page 0
+    const hiIdx  = parseInt(physEnd, 10) - 1;
+    const srcAnns = bookPdf.getAnnotations();
+    for (const ann of srcAnns) {
+        const json = await Zotero.Annotations.toJSON(ann);
+        const idx = json.position && typeof json.position.pageIndex === 'number'
+            ? json.position.pageIndex : null;
+        if (idx === null || idx < offset || idx > hiIdx) continue;
+
+        const newIdx = idx - offset;
+        json.position.pageIndex = newIdx;
+        if (typeof json.sortIndex === 'string' && json.sortIndex.includes('|')) {
+            const seg = json.sortIndex.split('|');
+            seg[0] = String(newIdx).padStart(seg[0].length, '0');
+            json.sortIndex = seg.join('|');
+        }
+        json.key = Zotero.DataObjectUtilities.generateKey();   // fresh key → copy, not move
+        const newAnn = await Zotero.Annotations.saveFromJSON(newAttachment, json);
+
+        // image/ink annotations carry a cached preview PNG keyed by annotation key
+        if (json.image && ['image', 'ink'].includes(json.type)) {
+            try {
+                const blob = await (await fetch(json.image)).blob();
+                await Zotero.Annotations.saveCacheImage(newAnn, blob);
+            } catch (ie) {
+                dbg(`cache image copy failed for ${newAnn.key}: ${ie.message || String(ie)}`);
+            }
+        }
+        copiedAnns++;
+    }
+    dbg(`copied ${copiedAnns}/${srcAnns.length} annotation(s) into chapter PDF`);
+} catch (e) {
+    err(`annotation copy failed (non-fatal): ${e.message || String(e)}`);
+}
+
 // Clean up temp file (lives next to the parent book's PDF in its storage folder)
 try {
     await IOUtils.remove(outPath);
@@ -227,7 +271,8 @@ if (AUTO_OPEN) {
     await Zotero.Reader.open(newAttachment.id);
 }
 
-showToast(`Extracted pp. ${start}–${end} ✓`);
+const annNote = copiedAnns ? ` · ${copiedAnns} annotation${copiedAnns === 1 ? '' : 's'}` : '';
+showToast(`Extracted pp. ${start}–${end}${annNote} ✓`);
 
 } catch (e) {
     const msg = e.message || String(e);
