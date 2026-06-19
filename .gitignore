@@ -1,5 +1,10 @@
 .aider*
 .worktrees/
+.playwright-mcp/
+*.swp
+*.swo
+__pycache__/
+*.py[cod]
 
 # Claude Code runtime / ephemeral state — never back up
 claude/.claude/projects/
