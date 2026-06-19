@@ -24,6 +24,9 @@ git submodule update --init --recursive
 echo "Syncing vendored skill symlinks..."
 "$DOTFILES/bin/sync-vendor-skills"
 
+echo "Syncing Codex skill symlinks..."
+"$DOTFILES/bin/sync-codex-skills"
+
 # Stow all packages (agents/pi/copilot bridge ~/.claude, ~/.pi, ~/.copilot to ~/.agents/skills)
 echo "Stowing dotfiles..."
 stow zsh git vim vscode claude agents pi copilot

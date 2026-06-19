@@ -13,6 +13,13 @@ This will:
 2. Install packages from `Brewfile` (including `stow`)
 3. Symlink all config packages into `~/`
 
+## Agent skills
+
+`agents/.agents/skills` is the canonical shared skill directory for local agents.
+Claude, Pi, Copilot, and Gemini receive it through stowed symlinks. Codex keeps
+its own `~/.codex/skills/.system` directory, so `bin/sync-codex-skills` imports
+shared skills as per-skill symlinks without replacing Codex-owned entries.
+
 ## Adding new dotfiles
 
 Move the file into the appropriate package dir (mirroring its path from `~`), then re-run `stow <package>`.
@@ -32,6 +39,7 @@ Scripts are on `PATH` via `~/dotfiles/bin` (set in `.zshrc`).
 | `lec-normalize` | Two-pass loudnorm a single WAV (called by lec-archive) |
 | `lec-correct` | Post-process transcripts via Anthropic API |
 | `lec-benchmark` | Compare mlx-whisper vs lightning-whisper-mlx speed |
+| `sync-codex-skills` | Import shared agent skills into `~/.codex/skills` as per-skill symlinks |
 
 ### Extra dependencies for scripts
 

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Import shared agent skills into Codex without replacing Codex-owned skills.
+
+set -euo pipefail
+
+DOT="${DOTFILES:-$HOME/dotfiles}"
+SHARED_SKILLS="$DOT/agents/.agents/skills"
+CODEX_SKILLS="${CODEX_SKILLS:-$HOME/.codex/skills}"
+
+if [ ! -d "$SHARED_SKILLS" ]; then
+  echo "ERROR: $SHARED_SKILLS not found" >&2
+  exit 1
+fi
+
+mkdir -p "$CODEX_SKILLS"
+
+linked=0
+unchanged=0
+skipped=0
+
+for src in "$SHARED_SKILLS"/*; do
+  [ -d "$src" ] || continue
+  name=$(basename "$src")
+  target="$CODEX_SKILLS/$name"
+
+  if [ -L "$target" ]; then
+    current=$(readlink "$target")
+    if [ "$current" = "$src" ]; then
+      unchanged=$((unchanged + 1))
+      continue
+    fi
+    echo "WARN: $target already points to $current; skipping" >&2
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  if [ -e "$target" ]; then
+    echo "WARN: $target already exists and is not a symlink; skipping" >&2
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  ln -s "$src" "$target"
+  linked=$((linked + 1))
+done
+
+echo "sync-codex-skills: linked=$linked unchanged=$unchanged skipped=$skipped"
