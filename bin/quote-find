@@ -1,0 +1,529 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""quote-find — verify a quoted passage against its cited source in one call.
+
+Usage:
+  quote-find <citekey|path> --phrase "..." [--page N] [--context N] [--max-chars N]
+  quote-find <citekey|path> --page N            just show the page
+  quote-find -h
+
+Resolves the citekey via `zotero-lookup`, corrects the printed-to-physical page
+offset via `pdflabels`, extracts text via `doc-read`, then matches the phrase
+against *normalized* text so that line-wrapped, hyphen-split, and curly-quoted
+sources still match what a human typed.
+
+Verdicts and exit codes:
+  0  VERBATIM   phrase found, word for word
+  3  DRIFT      close match found; the word-level difference is reported
+  4  NOT FOUND  no close match anywhere in the source
+  2  NO TEXT    scanned PDF with no text layer, or EPUB without pagination
+  1  error
+
+With --page, the cited page is searched first and the whole document only on a
+miss, in which case the true printed page is reported. Whole-document text is
+never printed.
+"""
+
+import argparse
+import difflib
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+
+PUNCT_MAP = {
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",
+    "“": '"', "”": '"', "„": '"', "‟": '"',
+    "′": "'", "″": '"', "«": '"', "»": '"',
+    "–": "-", "—": "-", "―": "-", "−": "-",
+    "…": "...", " ": " ", "​": "", "­": "",
+    "ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi",
+    "ﬄ": "ffl", "ﬅ": "st", "ﬆ": "st",
+}
+
+DRIFT_THRESHOLD = 0.78
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"quote-find: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(args: list[str]) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(args, capture_output=True, text=True)
+    except FileNotFoundError:
+        die(f"{args[0]} not found on PATH")
+
+
+# ------------------------------------------------------- normalization
+
+
+def normalize(s: str, loose: bool = False) -> str:
+    """Casefolded, dehyphenated, whitespace-collapsed form used for matching only."""
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join(PUNCT_MAP.get(ch, ch) for ch in s)
+    # join words split by an end-of-line hyphen: "intrascien-\ntific" -> "intrascientific"
+    s = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", s)
+    if loose:
+        s = "".join(c for c in s if c.isalnum() or c.isspace())
+    s = re.sub(r"\s+", " ", s)
+    return s.casefold().strip()
+
+
+def build_index(
+    raw: str, loose: bool = False, furniture: bool = True
+) -> tuple[str, list[int]]:
+    """Normalized text plus a map from each normalized char to its raw offset.
+
+    `loose` additionally drops punctuation, so a phrase typed without the
+    source's surrounding quote marks still matches. Sources routinely weld
+    quotes and commas onto words ("called 'sensorimotor contingencies'."),
+    which otherwise defeats both substring and word-level comparison.
+
+    `furniture` drops running heads and page numbers from the haystack. Off for
+    the needle, which is a bare phrase with no page structure to strip.
+    """
+    s = unicodedata.normalize("NFKC", raw)
+    # NFKC can change length; rebuild the map against `s` and track back via a
+    # second pass over the original only when lengths agree, else fall back to s.
+    src = s if len(s) == len(raw) else s
+    out: list[str] = []
+    idx: list[int] = []
+    i = 0
+    n = len(src)
+    pending_space = False
+    # Page furniture is skipped rather than matched, so a quote running from the
+    # foot of one page to the head of the next is still one contiguous phrase.
+    skips = furniture_spans(src) if furniture else []
+    skip_i = 0
+    while i < n:
+        while skip_i < len(skips) and skips[skip_i][1] <= i:
+            skip_i += 1
+        if skip_i < len(skips) and skips[skip_i][0] <= i < skips[skip_i][1]:
+            pending_space = True
+            i = skips[skip_i][1]
+            continue
+        ch = src[i]
+        # hyphen + newline: drop both
+        if ch == "-" and i + 1 < n:
+            j = i + 1
+            while j < n and src[j] in " \t":
+                j += 1
+            if j < n and src[j] == "\n":
+                k = j + 1
+                while k < n and src[k] in " \t":
+                    k += 1
+                if k < n and src[k].isalnum() and i > 0 and src[i - 1].isalnum():
+                    i = k
+                    continue
+        mapped = PUNCT_MAP.get(ch, ch)
+        if loose:
+            mapped = "".join(c for c in mapped if c.isalnum() or c.isspace())
+        if mapped == "":
+            i += 1
+            continue
+        if mapped.isspace():
+            pending_space = True
+            i += 1
+            continue
+        if pending_space and out:
+            out.append(" ")
+            idx.append(i)
+        pending_space = False
+        for c in mapped:
+            out.append(c.casefold())
+            idx.append(i)
+        i += 1
+    return "".join(out), idx
+
+
+def words(s: str) -> list[str]:
+    return re.findall(r"\S+", s)
+
+
+# A page number at either edge of the line, or a bare arabic/roman numeral.
+RUNNING_HEAD = re.compile(
+    r"^(?:\d{1,4}\s+\S.*|.*\S\s+\d{1,4}|\d{1,4}|[ivxlcdm]{1,7})$", re.I
+)
+
+
+def furniture_spans(raw: str, edges: bool = True) -> list[tuple[int, int]]:
+    """Character ranges holding page furniture: form feeds, running heads, bare
+    page numbers. A quote continuing across a page break has this text wedged
+    between its halves, which otherwise makes a verbatim quote unmatchable.
+
+    Only the outermost lines of each page are candidates, so body text that
+    happens to end in a numeral is never dropped.
+    """
+    spans: list[tuple[int, int]] = [(m.start(), m.end()) for m in re.finditer(r"\f", raw)]
+
+    # A line repeated verbatim at a page edge across pages is a running head even
+    # when it carries no page number, as happens when the numeral sits in an outer
+    # margin the extraction drops.
+    seen: dict[str, set[int]] = {}
+    for pg, page in enumerate(re.finditer(r"[^\f]+", raw)):
+        for line in page.group().splitlines():
+            stripped = line.strip()
+            if stripped:
+                seen.setdefault(stripped, set()).add(pg)
+    repeated = {k for k, v in seen.items() if len(v) > 1 and len(k) < 120}
+
+    for page in re.finditer(r"[^\f]+", raw):
+        base, chunk = page.start(), page.group()
+        lines: list[tuple[int, int, str]] = []
+        pos = 0
+        for line in chunk.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped:
+                lines.append((base + pos, base + pos + len(line), stripped))
+            pos += len(line)
+        # Head and foot only: at most the two outermost non-blank lines per edge,
+        # stopping as soon as one does not look like furniture. With edges=False a
+        # chunk boundary that is the string's own end, not a form feed, is left
+        # alone: in an arbitrary slice that line is truncated body text.
+        head = lines[:2] if edges or base > 0 else []
+        foot = lines[-2:] if edges or page.end() < len(raw) else []
+        for edge in (head, list(reversed(foot))):
+            for start, end, stripped in edge:
+                furniture_line = len(stripped) < 120 and (
+                    RUNNING_HEAD.match(stripped) or stripped in repeated
+                )
+                if furniture_line:
+                    spans.append((start, end))
+                else:
+                    break
+
+    return sorted(set(spans))
+
+
+# ------------------------------------------------------- source access
+
+
+def resolve(target: str) -> str:
+    if os.path.sep in target or os.path.isfile(os.path.expanduser(target)):
+        p = os.path.expanduser(target)
+        if not os.path.isfile(p):
+            die(f"no such file: {p}")
+        return p
+    key = target.lstrip("@")
+    res = run(["zotero-lookup", key])
+    paths = [l for l in res.stdout.splitlines() if l.strip()]
+    if res.returncode != 0 or not paths:
+        err = res.stderr.strip()
+        # An unresolvable citekey is an error, not a verdict about the quote.
+        die(f"citekey '@{key}' did not resolve to an attachment" + (f" ({err})" if err else ""))
+    pdfs = [p for p in paths if p.lower().endswith(".pdf")]
+    return (pdfs or paths)[0]
+
+
+def page_offset(path: str) -> tuple[int, str]:
+    """Physical-minus-printed offset for a PDF, plus a human note."""
+    res = run(["pdflabels", "--check", path])
+    out = (res.stdout or "") + (res.stderr or "")
+    if not out.lstrip().startswith("yes"):
+        return 0, "no page labels, assuming printed == physical"
+    samples = re.findall(r"p(\d+)='([^']*)'", out)
+    for phys, label in samples:
+        if label.isdigit():
+            return int(phys) - int(label), f"labels present (p{phys}='{label}')"
+    return 0, "labels present but non-numeric, assuming printed == physical"
+
+
+# Set when doc-read reports that an EPUB carries no pagebreak anchors. Without
+# this the tool would echo the *cited* page back as if it had been confirmed,
+# which is the fabricated-page failure this whole tool exists to prevent.
+STATE = {"unpaginated": False}
+
+
+def extract(path: str, first=None, last=None) -> str:
+    args = ["doc-read", path]
+    if first is not None:
+        args.append(str(first))
+        args.append(str(last if last is not None else first))
+    res = run(args)
+    if res.returncode == 2:
+        die(res.stderr.strip().replace("doc-read: ", ""), code=2)
+    if res.returncode != 0:
+        die(res.stderr.strip().replace("doc-read: ", "") or "extraction failed")
+    if res.stderr.strip():
+        if "no pagebreak anchors" in res.stderr:
+            STATE["unpaginated"] = True
+        print(res.stderr.strip(), file=sys.stderr)
+    return res.stdout
+
+
+# ------------------------------------------------------- matching
+
+
+def find(haystack_raw: str, needle: str) -> tuple[str, float, int, int] | None:
+    """Locate needle in haystack. Returns (verdict, ratio, raw_start, raw_end)."""
+    # Pass 1: strict, punctuation included.
+    hay, idx = build_index(haystack_raw)
+    need = normalize(needle)
+    if not need or not hay:
+        return None
+    pos = hay.find(need)
+    if pos >= 0:
+        return "VERBATIM", 1.0, idx[pos], idx[min(pos + len(need) - 1, len(idx) - 1)] + 1
+
+    # Pass 2: punctuation-insensitive. Still VERBATIM, since the words are
+    # identical and only the source's own quote marks or commas differ.
+    hay, idx = build_index(haystack_raw, loose=True)
+    need = normalize(needle, loose=True)
+    if not need or not hay:
+        return None
+    pos = hay.find(need)
+    if pos >= 0:
+        return "VERBATIM", 1.0, idx[pos], idx[min(pos + len(need) - 1, len(idx) - 1)] + 1
+
+    # Pass 3: fuzzy. Slide a window of the needle's word-length, keep the best ratio.
+    hw = words(hay)
+    nw = words(need)
+    if not hw:
+        return None
+    span = max(len(nw), 1)
+    best = (0.0, 0, 0)
+    sm = difflib.SequenceMatcher(autojunk=False)
+    sm.set_seq2(nw)
+    step = 1 if len(hw) < 40000 else 2
+    for start in range(0, max(len(hw) - span + 1, 1), step):
+        cand = hw[start:start + span]
+        sm.set_seq1(cand)
+        if sm.real_quick_ratio() <= best[0] or sm.quick_ratio() <= best[0]:
+            continue
+        r = sm.ratio()
+        if r > best[0]:
+            best = (r, start, start + span)
+    if best[0] < DRIFT_THRESHOLD:
+        return None
+
+    # Widen the window, then clip to the aligned region. Without this the span is
+    # pinned to the needle's word count and slides off by a word, which hides the
+    # very substitution the caller needs to see.
+    lo = max(best[1] - 3, 0)
+    hi = min(best[2] + 3, len(hw))
+    cand = hw[lo:hi]
+    blocks = [
+        b for b in difflib.SequenceMatcher(a=cand, b=nw, autojunk=False).get_matching_blocks()
+        if b.size
+    ]
+    if blocks:
+        # Anchor on the first aligned word, then take the needle's own word count.
+        # Clipping to the last *matching* block would cut off a substituted tail
+        # word, which is precisely the difference worth reporting.
+        s_word = lo + blocks[0].a - blocks[0].b
+        s_word = max(s_word, 0)
+        best = (best[0], s_word, min(s_word + len(nw), len(hw)))
+
+    # Map the winning word span back to raw character offsets.
+    starts: list[int] = []
+    for m in re.finditer(r"\S+", hay):
+        starts.append(m.start())
+    if not starts:
+        return None
+    s_word = min(best[1], len(starts) - 1)
+    e_word = min(best[2] - 1, len(starts) - 1)
+    s_char = starts[s_word]
+    e_char = starts[e_word] + len(hw[e_word])
+    return (
+        "DRIFT",
+        best[0],
+        idx[min(s_char, len(idx) - 1)],
+        idx[min(e_char - 1, len(idx) - 1)] + 1,
+    )
+
+
+def word_diff(mine: str, theirs: str) -> list[str]:
+    a, b = words(normalize(mine)), words(normalize(theirs))
+    notes = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_opcodes():
+        if tag == "replace":
+            notes.append(f"{' '.join(a[i1:i2])!r} -> {' '.join(b[j1:j2])!r}")
+        elif tag == "delete":
+            notes.append(f"{' '.join(a[i1:i2])!r} -> (absent)")
+        elif tag == "insert":
+            notes.append(f"(missing) -> {' '.join(b[j1:j2])!r}")
+    return notes
+
+
+def sentence_around(raw: str, start: int, end: int) -> str:
+    left = max(raw.rfind(". ", 0, start), raw.rfind("\n\n", 0, start))
+    left = 0 if left < 0 else left + 1
+    right = raw.find(". ", end)
+    right = len(raw) if right < 0 else right + 1
+    return display(raw[left:right])
+
+
+def display(s: str) -> str:
+    """Readable form: join line-broken hyphens, collapse whitespace. Words unchanged."""
+    s = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", s)
+    # Running heads and page numbers sitting between the halves of a passage are
+    # page furniture, not the author's words. Marked, not silently deleted.
+    if "\f" in s:
+        for a, b in reversed(furniture_spans(s, edges=False)):
+            s = s[:a] + (" / " if s[a:b] == "\f" else " ") + s[b:]
+    # Internal page markers are bookkeeping for locating the hit, not source text.
+    s = re.sub(r"\[\[(?:page|section:) [^\]]+\]\]", "", s)
+    return " ".join(s.split())
+
+
+def paragraph_around(raw: str, start: int, end: int, context: int) -> str:
+    """Context centered on the match, clipped to the enclosing paragraph."""
+    para_l = raw.rfind("\n\n", 0, start)
+    para_l = 0 if para_l < 0 else para_l + 2
+    para_r = raw.find("\n\n", end)
+    para_r = len(raw) if para_r < 0 else para_r
+
+    half = max(context // 2, 120)
+    left = max(para_l, start - half)
+    right = min(para_r, end + half)
+    prefix = "... " if left > para_l else ""
+    suffix = " ..." if right < para_r else ""
+    if left > para_l:
+        left = raw.find(" ", left) + 1 or left
+    return prefix + display(raw[left:right]) + suffix
+
+
+def printed_page_of(raw: str, offset: int, is_pdf: bool, off: int) -> str | None:
+    """For a whole-document PDF search, infer the printed page from form feeds."""
+    if not is_pdf:
+        m = None
+        for m2 in re.finditer(r"\[\[page ([^\]]+)\]\]", raw[:offset]):
+            m = m2
+        return m.group(1) if m else None
+    physical = raw.count("\f", 0, offset) + 1
+    return str(physical - off)
+
+
+# ------------------------------------------------------- main
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("target", nargs="?")
+    ap.add_argument("--phrase")
+    ap.add_argument("--page")
+    ap.add_argument("--context", type=int, default=700)
+    ap.add_argument("--max-chars", type=int, default=2000)
+    ap.add_argument("-h", "--help", action="store_true")
+    args = ap.parse_args()
+
+    if args.help or not args.target:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(1)
+
+    path = resolve(args.target)
+    is_pdf = path.lower().endswith(".pdf")
+    label = os.path.basename(path)
+
+    off, off_note = page_offset(path) if is_pdf else (0, "EPUB: printed pages come from pagebreak anchors")
+
+    # --- no phrase: just show the page
+    if not args.phrase:
+        if not args.page:
+            die("give --phrase, --page, or both")
+        if is_pdf:
+            p = int(args.page) + off
+            text = extract(path, p, p)
+            print(f"{label}\nprinted p.{args.page} = physical {p} ({off_note})\n")
+        else:
+            text = extract(path, args.page, args.page)
+            print(f"{label}\nprinted p.{args.page} (EPUB pagebreak anchor)\n")
+        sys.stdout.write(text[: args.max_chars])
+        return
+
+    scope = "page"
+    raw = ""
+    base_physical = 1  # physical page the extracted text starts on
+    if args.page:
+        if is_pdf:
+            p = int(args.page) + off
+            base_physical = max(p - 1, 1)
+            raw = extract(path, base_physical, p + 1)
+        else:
+            raw = extract(path, args.page, args.page)
+            if STATE["unpaginated"]:
+                # The page argument was ignored, so this is a whole-document
+                # search after all. Re-extract with markers to name the section.
+                res = run(["doc-read", path, "--with-page-markers"])
+                if res.returncode == 0 and res.stdout.strip():
+                    raw = res.stdout
+
+    hit = find(raw, args.phrase) if raw else None
+
+    if hit is None:
+        scope = "document"
+        base_physical = 1
+        raw = extract(path, None, None)
+        if not is_pdf:
+            res = run(["doc-read", path, "--with-page-markers"])
+            if res.returncode == 0 and res.stdout.strip():
+                raw = res.stdout
+        hit = find(raw, args.phrase)
+
+    if hit is None:
+        where = f"printed p.{args.page} and then the whole document" if args.page else "the whole document"
+        print(f"NOT FOUND  {label}")
+        print(f"  searched: {where}")
+        print(f"  phrase:   {args.phrase!r}")
+        print("  The passage is not in this source as quoted. Do not interpret it.")
+        sys.exit(4)
+
+    verdict, ratio, s, e = hit
+    found_raw = raw[s:e]
+    sentence = sentence_around(raw, s, e)
+    para = paragraph_around(raw, s, e, args.context)
+
+    page_note = ""
+    if not is_pdf and STATE["unpaginated"]:
+        page_note = (
+            f"EPUB has no pagination: cited p.{args.page} UNVERIFIABLE"
+            if args.page else "EPUB has no pagination"
+        )
+        head = None
+        for m in re.finditer(r"\[\[section: ([^\]]+)\]\]", raw[:s]):
+            head = m.group(1)
+        if head:
+            page_note += f"; located in {head!r}"
+    elif args.page and scope == "page":
+        page_note = (
+            f"printed p.{args.page} = physical {int(args.page) + off}"
+            if is_pdf else f"printed p.{args.page} (EPUB anchor)"
+        )
+    else:
+        true_page = printed_page_of(raw, s, is_pdf, off)
+        if args.page and true_page:
+            page_note = f"NOT on cited p.{args.page}; actually printed p.{true_page}"
+        elif true_page:
+            page_note = f"printed p.{true_page}"
+        elif not is_pdf:
+            page_note = "EPUB has no pagination: page cite unverifiable"
+        else:
+            page_note = "page not determined"
+
+    if "\f" in found_raw and is_pdf:
+        # sources-review wants these cited as N-N+1, so name the span.
+        first = base_physical + raw.count("\f", 0, s) - off
+        page_note += f"; spans a page break, cite as {first}–{first + found_raw.count(chr(12))}"
+
+    print(f"{verdict}  {label}")
+    print(f"  {page_note}  [{'pdf' if is_pdf else 'epub'}]  match {ratio:.2f}")
+    if verdict == "DRIFT":
+        print(f"  source: {display(found_raw)[:400]!r}")
+        print(f"  yours:  {args.phrase.strip()[:400]!r}")
+        for note in word_diff(args.phrase, display(found_raw))[:8]:
+            print(f"  diff:   {note}")
+    else:
+        print(f"  source: {sentence[:400]!r}")
+    print()
+    print("  context:", para[: args.max_chars])
+    sys.exit(0 if verdict == "VERBATIM" else 3)
+
+
+if __name__ == "__main__":
+    main()

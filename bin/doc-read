@@ -1,0 +1,372 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""doc-read — extract text from a PDF or EPUB, optionally a page range.
+
+Usage:
+  doc-read <file> [first-page] [last-page]
+  doc-read <file> --with-page-markers      emit [[page N]] markers inline
+  doc-read <file> --list-pages             list available printed page labels
+  doc-read -h
+
+PDF  -> pdftotext -layout [-f first] [-l last]. Page numbers are *physical*
+        indices, as pdftotext counts them. Use `pdflabels --check` to get the
+        printed-to-physical offset, or use `quote-find`, which does it for you.
+
+EPUB -> spine-ordered text extracted from the XHTML. Page arguments are honored
+        only when the file carries `epub:type="pagebreak"` anchors, whose printed
+        labels are used directly (so 'vii' and '163' both work). Without anchors
+        the whole text is printed and a warning goes to stderr; EPUBs have no
+        intrinsic pagination and no page number is ever invented.
+
+Formerly `pdf-read`, which remains as a symlink.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import zipfile
+from html.parser import HTMLParser
+from urllib.parse import unquote, urljoin
+from xml.etree import ElementTree
+
+BLOCK_TAGS = {
+    "p", "div", "br", "li", "tr", "blockquote", "section", "article",
+    "h1", "h2", "h3", "h4", "h5", "h6", "figcaption", "td", "th", "dd", "dt",
+}
+SKIP_TAGS = {"script", "style", "head"}
+HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"doc-read: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- PDF
+
+
+def read_pdf(path: str, first: str | None, last: str | None) -> str:
+    args = ["pdftotext", "-layout"]
+    if first:
+        args += ["-f", first]
+    if last:
+        args += ["-l", last]
+    args += [path, "-"]
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        die("pdftotext not found (brew install poppler)")
+    except subprocess.CalledProcessError as e:
+        die(f"pdftotext failed: {e.stderr.strip()}")
+    return out.stdout
+
+
+# ---------------------------------------------------------------- EPUB
+
+
+class XHTMLText(HTMLParser):
+    """Strip tags to text, recording page-anchor labels and headings by offset."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.pages: list[tuple[str, int]] = []      # (printed label, char offset)
+        self.headings: list[tuple[str, int]] = []   # (heading text, char offset)
+        self._skip = 0
+        self._heading: list[str] | None = None
+
+    @property
+    def _offset(self) -> int:
+        return sum(len(p) for p in self.parts)
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag in SKIP_TAGS:
+            self._skip += 1
+            return
+        etype = a.get("epub:type", "") or a.get("role", "")
+        if "pagebreak" in etype:
+            label = a.get("title") or a.get("aria-label") or ""
+            if not label:
+                # fall back to an id like "page_163"
+                m = re.search(r"page[_-]?(.+)$", a.get("id", ""), re.I)
+                label = m.group(1) if m else ""
+            if label:
+                self.pages.append((label.strip(), self._offset))
+        if tag in BLOCK_TAGS:
+            self.parts.append("\n")
+        if tag in HEADING_TAGS:
+            self._heading = []
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag in SKIP_TAGS:
+            self._skip -= 1
+
+    def handle_endtag(self, tag):
+        if tag in SKIP_TAGS:
+            self._skip = max(0, self._skip - 1)
+            return
+        if tag in HEADING_TAGS and self._heading is not None:
+            text = " ".join("".join(self._heading).split())
+            if text:
+                self.headings.append((text, self._offset))
+            self._heading = None
+        if tag in BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        self.parts.append(data)
+        if self._heading is not None:
+            self._heading.append(data)
+
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+def spine_documents(zf: zipfile.ZipFile) -> list[str]:
+    """Return spine-ordered XHTML member names, falling back to sorted order."""
+    try:
+        container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
+        root = ElementTree.fromstring(container)
+        rootfile = root.find(".//{*}rootfile")
+        opf_path = unquote(rootfile.get("full-path"))
+    except Exception:
+        opf_path = None
+
+    if opf_path:
+        try:
+            opf = ElementTree.fromstring(zf.read(opf_path).decode("utf-8", "replace"))
+            base = os.path.dirname(opf_path)
+            manifest = {}
+            for item in opf.findall(".//{*}manifest/{*}item"):
+                href = unquote(item.get("href", ""))
+                target = os.path.normpath(os.path.join(base, href)) if base else href
+                manifest[item.get("id")] = target
+            ordered = []
+            for ref in opf.findall(".//{*}spine/{*}itemref"):
+                name = manifest.get(ref.get("idref"))
+                if name and name in zf.namelist():
+                    ordered.append(name)
+            if ordered:
+                return ordered
+        except Exception:
+            pass
+
+    return sorted(
+        n for n in zf.namelist()
+        if n.lower().endswith((".xhtml", ".html", ".htm"))
+    )
+
+
+def read_epub(path: str) -> tuple[str, list[tuple[str, int]], list[tuple[str, int]]]:
+    """Return (text, page anchors, headings). Offsets are into the returned text."""
+    try:
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError) as e:
+        die(f"cannot open EPUB: {e}")
+
+    chunks: list[str] = []
+    pages: list[tuple[str, int]] = []
+    headings: list[tuple[str, int]] = []
+    total = 0
+    with zf:
+        for name in spine_documents(zf):
+            try:
+                raw = zf.read(name).decode("utf-8", "replace")
+            except KeyError:
+                continue
+            parser = XHTMLText()
+            try:
+                parser.feed(raw)
+                parser.close()
+            except Exception:
+                continue
+            text = parser.text()
+            pages += [(label, total + off) for label, off in parser.pages]
+            headings += [(head, total + off) for head, off in parser.headings]
+            chunks.append(text)
+            total += len(text)
+
+    full = "".join(chunks)
+    # Collapse runs of blank lines, adjusting recorded offsets to match.
+    return _tidy(full, pages, headings)
+
+
+def _tidy(
+    text: str,
+    pages: list[tuple[str, int]],
+    headings: list[tuple[str, int]],
+) -> tuple[str, list[tuple[str, int]], list[tuple[str, int]]]:
+    """Squeeze whitespace, remapping offsets so anchors stay accurate."""
+    out: list[str] = []
+    remap: dict[int, int] = {}
+    marks = sorted({o for _, o in pages} | {o for _, o in headings})
+    mark_i = 0
+    blank_run = 0
+    for i, ch in enumerate(text):
+        while mark_i < len(marks) and marks[mark_i] == i:
+            remap[marks[mark_i]] = len(out)
+            mark_i += 1
+        if ch == "\n":
+            blank_run += 1
+            if blank_run > 2:
+                continue
+        elif ch in " \t":
+            if out and out[-1] in " \t":
+                continue
+            blank_run = 0
+        else:
+            blank_run = 0
+        out.append(ch)
+    tail = len(out)
+    while mark_i < len(marks):
+        remap[marks[mark_i]] = tail
+        mark_i += 1
+    return (
+        "".join(out),
+        [(l, remap.get(o, o)) for l, o in pages],
+        [(h, remap.get(o, o)) for h, o in headings],
+    )
+
+
+def slice_pages(
+    text: str,
+    pages: list[tuple[str, int]],
+    first: str | None,
+    last: str | None,
+) -> tuple[str, list[tuple[str, int]]] | None:
+    """Text from the `first` anchor up to the anchor after `last`, with anchors
+    rebased onto the slice. None if the requested label is not present."""
+    if not pages:
+        return None
+    labels = [l for l, _ in pages]
+    want_first = first if first is not None else labels[0]
+    want_last = last if last is not None else want_first
+    try:
+        i = labels.index(str(want_first))
+    except ValueError:
+        return None
+    try:
+        j = labels.index(str(want_last))
+    except ValueError:
+        j = i
+    start = pages[i][1]
+    end = pages[j + 1][1] if j + 1 < len(pages) else len(text)
+    kept = [(l, o - start) for l, o in pages if start <= o < end]
+    return text[start:end], kept
+
+
+def with_markers(
+    text: str,
+    pages: list[tuple[str, int]],
+    headings: list[tuple[str, int]] | None = None,
+) -> str:
+    """Insert [[page N]] and [[section: title]] markers so a caller can report
+    where a hit sits. Section markers matter for EPUBs with no pagination, where
+    naming the chapter is the only honest locator available."""
+    marks = [(off, f"[[page {label}]]") for label, off in pages]
+    marks += [(off, f"[[section: {h}]]") for h, off in (headings or [])]
+    marks.sort(key=lambda m: m[0])
+    out: list[str] = []
+    prev = 0
+    for off, mark in marks:
+        off = min(off, len(text))
+        if off < prev:
+            continue
+        out.append(text[prev:off])
+        out.append(f"\n{mark}\n")
+        prev = off
+    out.append(text[prev:])
+    return "".join(out)
+
+
+# ---------------------------------------------------------------- main
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("file", nargs="?")
+    ap.add_argument("first", nargs="?")
+    ap.add_argument("last", nargs="?")
+    ap.add_argument("--with-page-markers", action="store_true")
+    ap.add_argument("--list-pages", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    args = ap.parse_args()
+
+    if args.help or not args.file:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(1)
+
+    path = os.path.expanduser(args.file)
+    if not os.path.isfile(path):
+        die(f"no such file: {path}")
+
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".pdf":
+        if args.list_pages:
+            die("--list-pages is EPUB-only; for PDFs use `pdflabels --check`")
+        text = read_pdf(path, args.first, args.last)
+        if not text.strip():
+            die(
+                "no text layer (scanned PDF?). Read it with the multimodal Read "
+                "tool instead; an empty extraction is not an absent passage.",
+                code=2,
+            )
+        sys.stdout.write(text)
+        return
+
+    if ext != ".epub":
+        die(f"unsupported format '{ext}' (want .pdf or .epub)")
+
+    text, pages, headings = read_epub(path)
+    if not text.strip():
+        die("no extractable text in EPUB", code=2)
+
+    if args.list_pages:
+        if not pages:
+            die("EPUB carries no pagebreak anchors: no printed pages available", code=2)
+        print(" ".join(label for label, _ in pages))
+        return
+
+    if args.first is not None:
+        sliced = slice_pages(text, pages, args.first, args.last)
+        if sliced is None:
+            if pages:
+                die(
+                    f"printed page '{args.first}' not among this EPUB's anchors "
+                    f"(have {pages[0][0]}..{pages[-1][0]}); printing nothing",
+                    code=2,
+                )
+            print(
+                "doc-read: EPUB has no pagebreak anchors, so page arguments cannot "
+                "be honored. Printing the whole text; the cited page is unverifiable.",
+                file=sys.stderr,
+            )
+        else:
+            text, pages = sliced
+            # Heading offsets index the full text, not the slice. Section markers
+            # only matter for unpaginated EPUBs, which never reach this branch.
+            headings = []
+
+    if args.with_page_markers:
+        if not pages:
+            print(
+                "doc-read: no pagebreak anchors, emitting text without page markers",
+                file=sys.stderr,
+            )
+        text = with_markers(text, pages, headings)
+
+    sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()
