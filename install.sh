@@ -29,7 +29,7 @@ echo "Syncing Codex skill symlinks..."
 
 # Stow all packages (agents/pi/copilot bridge ~/.claude, ~/.pi, ~/.copilot to ~/.agents/skills)
 echo "Stowing dotfiles..."
-stow zsh git vim vscode claude agents pi copilot
+stow zsh git vim vscode claude agents pi copilot gemini
 
 # Configure Bitwarden server
 bw config server https://vault.bitwarden.eu

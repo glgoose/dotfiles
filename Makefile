@@ -1,7 +1,7 @@
 .PHONY: help install stow unstow update-skills sync-vendor-skills
 
 DOTFILES := $(shell pwd)
-PACKAGES := zsh git vim vscode claude agents pi copilot
+PACKAGES := zsh git vim vscode claude agents pi copilot gemini
 
 help:
 	@echo "Targets:"
