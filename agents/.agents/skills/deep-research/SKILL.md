@@ -121,6 +121,7 @@ Write your findings to:
 - Within a channel: start broad (short wide queries to map the landscape), then narrow (drill into specifics once you see what exists).
 - For Zotero hits: resolve to the local PDF path and read with the pdf-reader skill or `pdftotext`.
 - For academic-DB hits: prefer the OA PDF when available; otherwise log abstract + DOI and tag `[paywalled]`.
+- For web hits: use the `defuddle` skill to extract clean markdown from URLs instead of WebFetch. Defuddle removes clutter and saves ~20-30x tokens vs raw HTML rendering.
 - Prefer primary sources (papers, official docs, release notes) over commentary.
 - Fire 3+ tool calls in parallel whenever possible.
 - Use interleaved thinking after each result to spot gaps and refine your next query.

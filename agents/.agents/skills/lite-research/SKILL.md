@@ -104,7 +104,7 @@ Decide output shape via `note-architecture` skill:
 - Filename: lowercase noun-phrase, e.g. `real abstraction.md`. Use `<Author> - <Topic>.md` only when the topic is single-source-driven and no settled concept handle exists yet.
 - Per `note-architecture`, do **not** auto-create per-source satellite notes. Substantive Zotero sources that the user is likely to come back to may get a literature-note satellite (`@Citekey.md`) at lead's discretion, but the default is "all sources stay in the main note's References section."
 
-Apply `schematic-notes` style (symbols, lowercase headings, citekeys, wikilinks). Body structure:
+Apply `schematic-notes` style (symbols, lowercase headings, citekeys, wikilinks). The note is written directly into the vault, so per `schematic-notes`' citation-format rule, convert the subagents' `[Sn]` tags to Obsidian-native footnotes (`[^n]` inline, `[^n]: ...` definitions) at this step — `[Sn]` is only the pre-conversion handoff format from subagent to lead. Body structure:
 
 ```
 ---
@@ -117,10 +117,10 @@ status: draft
 <1-2 sentence framing of the topic>
 
 ## <angle 1 heading>
-<prose, every factual claim tagged [Sn]>
+<prose, every factual claim tagged [^n]>
 
 ## <angle 2 heading>
-<prose, every factual claim tagged [Sn]>
+<prose, every factual claim tagged [^n]>
 
 ## open questions
 <bullets — surfaced from subagents + your synthesis>
@@ -131,13 +131,13 @@ status: draft
 - [[@Citekey1]] (if literature-note satellite was created)
 
 ## References
-[S1] **Title** — Author/Org, year. <URL>. Provenance: [...]. Retrieved YYYY-MM-DD.
-[S2] ...
+[^1]: **Title** — Author/Org, year. <URL>. Provenance: [...]. Retrieved YYYY-MM-DD.
+[^2]: ...
 ```
 
 Constraints:
 - 1000-1500 words in the body (excluding frontmatter and References).
-- Every factual sentence carries an `[Sn]` tag. No bare claims.
+- Every factual sentence carries an `[^n]` footnote tag. No bare claims.
 - Use `[[wikilinks]]` for the first mention of any concept, person, or work that has (or plausibly should have) a vault note. Per `note-architecture`, link first mention only.
 - No em-dashes. Use commas, parentheses, colons.
 - No effort or duration estimates anywhere in the output.
@@ -145,10 +145,10 @@ Constraints:
 ### 5. Citation pass
 
 Walk every factual sentence in the draft:
-- Confirm it carries an `[Sn]` tag.
-- Confirm `[Sn]` resolves to an entry in the `## References` section.
-- Fix orphan tags (sentence with no `[Sn]`) by either adding the right tag or removing the claim.
-- Fix dangling tags (`[Sn]` with no matching reference entry) by adding the reference or deleting the tag.
+- Confirm it carries an `[^n]` tag.
+- Confirm `[^n]` resolves to a `[^n]:` definition in the `## References` section.
+- Fix orphan tags (sentence with no `[^n]`) by either adding the right tag or removing the claim.
+- Fix dangling tags (`[^n]` with no matching `[^n]:` definition) by adding the definition or deleting the tag.
 
 This is an inline read-through by the lead. **Do not spawn a subagent for this step**; do **not** re-fetch sources. Trust the subagent digests; the citation pass guards against tag-drift only.
 
