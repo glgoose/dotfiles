@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # lec-correct — post-process whisper transcriptions using OpenAI or Anthropic
-# Usage: lec-correct [-p|--provider openai|anthropic]
-# Run from inside the lecture folder containing .txt/.srt file pairs.
+# Usage: lec-correct [-p|--provider openai|anthropic] [-P|--no-paragraph] <files...>
+# Accepts .srt or .txt files; .txt is resolved to its sibling .srt (the .srt
+# carries the timestamps and is the source of truth for structure).
+# Auto-discovery from cwd is not supported, pass the file(s) explicitly.
 #
-# For each pair, sends the SRT text (one line per block) to the API, gets back
-# a corrected version with the same line structure, then rewrites both files.
-# One API call per pair. No separate call for .srt reconstruction.
+# For each .srt, sends the text (one line per block) to the API, gets back
+# a corrected version with the same line structure, then rewrites the .srt.
+# One API call per file. After correction, lec-paragraph is invoked on the
+# corrected .srt to regenerate the .txt (single writer of .txt), unless
+# --no-paragraph is passed.
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 PROVIDER="openai"
+RUN_PARAGRAPH=true
+INPUT_FILES=()
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -21,11 +29,35 @@ while [[ $# -gt 0 ]]; do
         echo "Error: --provider must be 'openai' or 'anthropic'"; exit 1; }
       shift 2
       ;;
-    *)
-      echo "Unknown option: $1"
-      echo "Usage: lec-correct [-p|--provider openai|anthropic]"
+    --no-paragraph|-P)
+      RUN_PARAGRAPH=false
+      shift
+      ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: lec-correct [-p|--provider openai|anthropic] [-P|--no-paragraph] <files...>
+
+Files may be .srt or .txt; a .txt input is resolved to its sibling .srt.
+After correcting the .srt in place, lec-paragraph is invoked to regenerate
+the .txt unless --no-paragraph (-P) is passed.
+
+  -p, --provider     openai (default) or anthropic
+  -P, --no-paragraph skip the lec-paragraph step (leaves .txt stale)
+  -h, --help         show this help
+EOF
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do INPUT_FILES+=("$1"); shift; done
+      ;;
+    -*)
+      echo "Error: unknown option: $1"
+      echo "Usage: lec-correct [-p|--provider openai|anthropic] [-P|--no-paragraph] <files...>"
       exit 1
       ;;
+    *)
+      INPUT_FILES+=("$1"); shift ;;
   esac
 done
 
@@ -55,7 +87,7 @@ else
 fi
 
 # ── Model selection & pricing (per million tokens) ────────────────────────────
-OPENAI_MODEL="gpt-5.5"
+OPENAI_MODEL="gpt-5.4"
 OPENAI_INPUT_PRICE=2.50
 OPENAI_OUTPUT_PRICE=15.00
 
@@ -63,19 +95,38 @@ ANTHROPIC_MODEL="claude-sonnet-4-6"
 ANTHROPIC_INPUT_PRICE=3.00
 ANTHROPIC_OUTPUT_PRICE=15.00
 
-SYSTEM_PROMPT="You are correcting an automatic speech recognition transcript of an academic lecture. Fix transcription errors: misheard words, wrong proper nouns, garbled technical terms. Rules: (1) Be conservative — if you are not certain a word is wrong, leave it exactly as-is. (2) Never substitute a similar-sounding or visually similar word unless the original is clearly a mishearing. (3) Be consistent across the whole document — if a name or term appears multiple times, use the same corrected form every time. (4) Do not paraphrase or summarize — preserve the speaker's exact words and sentence structure. (5) Return only the corrected text with the same number of lines as the input — one corrected line per input line. No commentary."
+SYSTEM_PROMPT="You are correcting an automatic speech recognition transcript of an academic lecture. Fix transcription errors: misheard words, wrong proper nouns, garbled technical terms. Rules: (1) Be conservative — if you are not certain a word is wrong, leave it exactly as-is. This applies especially to clearly garbled or unintelligible passages: preserve the gibberish verbatim rather than inventing plausible-sounding words to fill gaps. It is better to leave obvious nonsense than to introduce hallucinated content. (2) Never substitute a similar-sounding or visually similar word unless the original is clearly a mishearing. (3) Be consistent across the whole document — if a name or term appears multiple times, use the same corrected form every time. (4) Do not paraphrase or summarize — preserve the speaker's exact words and sentence structure. (5) Book and publication titles: wrap any clearly mentioned book, journal, or publication title in straight double quotes. Dutch titles use sentence case (only the first letter capitalized, plus proper nouns) — example: \"Het laatkapitalisme\", \"Inleiding in de marxistische economie\". English titles use Title Case (capitalize all major words; keep articles, short prepositions, and conjunctions lowercase except at the start) — example: \"Capital in the Twenty-First Century\", \"The Origin of Capitalism\". Detect language per title, not per document. Do not invent or expand abbreviated titles, and do not add quotes around generic references that are not actual titles. (6) Return only the corrected text with the same number of lines as the input — one corrected line per input line. No commentary."
 
-# ── Collect .txt/.srt file pairs ───────────────────────────────────────────────
-PAIRS=()
-while IFS= read -r txt; do
-  base="${txt%.txt}"
-  [[ -f "${base}.srt" ]] && PAIRS+=("$base")
-done < <(find . -maxdepth 1 -name "*.txt" -not -name "context.txt" | sed 's|^\./||' | sort)
-
-if [[ ${#PAIRS[@]} -eq 0 ]]; then
-  echo "Error: no .txt/.srt file pairs found in the current directory."
+# ── Validate explicit inputs (.srt or .txt → resolve to .srt) ─────────────────
+if [[ ${#INPUT_FILES[@]} -eq 0 ]]; then
+  echo "Error: no input files. Pass one or more .srt or .txt files explicitly."
+  echo "Usage: lec-correct [-p|--provider openai|anthropic] [-P|--no-paragraph] <files...>"
   exit 1
 fi
+
+PAIRS=()
+for f in "${INPUT_FILES[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    echo "Error: not a file: $f"
+    exit 1
+  fi
+  case "$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')" in
+    *.srt)
+      PAIRS+=("${f%.srt}")
+      ;;
+    *.txt)
+      base="${f%.txt}"
+      if [[ ! -f "${base}.srt" ]]; then
+        echo "Error: sibling .srt not found for $f (expected ${base}.srt)"
+        exit 1
+      fi
+      PAIRS+=("$base")
+      ;;
+    *)
+      echo "Error: unsupported extension: $f (need .srt or .txt)"
+      exit 1 ;;
+  esac
+done
 
 SCRIPT_START=$(date +%s)
 
@@ -106,7 +157,8 @@ call_api() {
       --arg model  "$OPENAI_MODEL" \
       --arg system "$SYSTEM_PROMPT" \
       --arg text   "$content" \
-      '{model: $model, max_completion_tokens: 8192,
+      '{model: $model, max_completion_tokens: 65536,
+        reasoning_effort: "low",
         messages: [{role: "system", content: $system},
                    {role: "user",   content: $text}]}')
 
@@ -183,7 +235,6 @@ declare -a PAIR_CHANGES=()
 TOKENS_FILE=$(mktemp)   # accumulates "input_tok\toutput_tok" per API call
 
 for BASE in "${PAIRS[@]}"; do
-  TXT="${BASE}.txt"
   SRT="${BASE}.srt"
 
   echo "  Correcting ${BASE}..."
@@ -194,7 +245,7 @@ for BASE in "${PAIRS[@]}"; do
   extract_srt_text_lines "$SRT" > "$SRT_LINES"
   TOTAL_BLOCKS=$(wc -l < "$SRT_LINES" | tr -d ' ')
 
-  WORD_COUNT=$(wc -w < "$TXT" | tr -d ' ')
+  WORD_COUNT=$(wc -w < "$SRT_LINES" | tr -d ' ')
   CHUNK_LIMIT=15000
 
   CORRECTED=$(mktemp)
@@ -202,6 +253,7 @@ for BASE in "${PAIRS[@]}"; do
   if [[ $WORD_COUNT -le $CHUNK_LIMIT ]]; then
     # ── Single API call ────────────────────────────────────────────────────────
     call_api "$(cat "$SRT_LINES")" > "$CORRECTED"
+    [[ -s "$CORRECTED" ]] || { echo "Error: API returned empty content for $BASE" >&2; exit 1; }
   else
     # ── Chunked: split by block count, 2-block overlap between chunks ──────────
     WORDS_PER_BLOCK=$(( (WORD_COUNT / TOTAL_BLOCKS) + 1 ))
@@ -235,17 +287,20 @@ for BASE in "${PAIRS[@]}"; do
   PAIR_NAMES+=("$BASE")
   PAIR_CHANGES+=("$CHANGED")
 
-  # Rewrite .srt with corrected text, timestamps untouched
+  # Rewrite .srt with corrected text, timestamps untouched.
   rebuild_srt "$SRT" "$CORRECTED" > "${SRT}.tmp" && mv "${SRT}.tmp" "$SRT"
-
-  # Rewrite .txt as corrected lines joined into continuous text
-  tr '\n' ' ' < "$CORRECTED" | sed 's/  */ /g; s/^ //; s/ $//' > "$TXT"
 
   rm "$SRT_LINES" "$CORRECTED"
 
   PAIR_END=$(date +%s)
   echo "  Done in $((PAIR_END - PAIR_START))s — ${CHANGED} $( [[ $CHANGED -eq 1 ]] && echo line || echo lines ) changed"
   TOTAL_LINES_CHANGED=$(( TOTAL_LINES_CHANGED + CHANGED ))
+
+  # Regenerate .txt from the corrected .srt (lec-paragraph is the single
+  # writer of .txt). Skipped with --no-paragraph.
+  if [[ "$RUN_PARAGRAPH" == true ]]; then
+    "$SCRIPT_DIR/lec-paragraph" --provider "$PROVIDER" "$SRT"
+  fi
 done
 
 # ── Cost calculation ──────────────────────────────────────────────────────────
