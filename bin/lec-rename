@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
 # lec-rename — rename files in the current folder to <foldername>_N.<ext>
+# Numbers per recording (stem): all extensions of one recording share one slot.
+# Sidecars (.glossary.txt, .words.json, .notes.txt) follow their parent.
+# Existing ${FOLDER}_N names preserve slot N (idempotent re-runs).
+# Two-phase rename + pre-flight collision check.
 # Usage: lec-rename [-e|--ext EXT]... [-n|--dry-run]
-# Run from inside the lecture folder.
 # Default extensions: wav opus flac srt txt
-# Files within each extension group are sorted alphabetically before numbering.
 set -euo pipefail
 
-# ── Argument parsing ───────────────────────────────────────────────────────────
+# ── Argument parsing ──────────────────────────────────────────────────────────
 DRY_RUN=false
 EXTS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ext|-e)
-      [[ $# -lt 2 ]] && { echo "Error: --ext requires a value"; exit 1; }
+      [[ $# -lt 2 ]] && { echo "Error: --ext requires a value" >&2; exit 1; }
       EXTS+=("$2"); shift 2 ;;
     --dry-run|-n) DRY_RUN=true; shift ;;
+    -h|--help)
+      sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
     *)
-      echo "Unknown option: $1"
-      echo "Usage: lec-rename [-e|--ext EXT]... [-n|--dry-run]"
+      echo "Unknown option: $1" >&2
+      echo "Usage: lec-rename [-e|--ext EXT]... [-n|--dry-run]" >&2
       exit 1 ;;
   esac
 done
@@ -27,44 +32,266 @@ if [[ ${#EXTS[@]} -eq 0 ]]; then
   EXTS=(wav opus flac srt txt)
 fi
 
-# ── Rename ─────────────────────────────────────────────────────────────────────
+SIDECARS=(.glossary.txt .words.json .notes.txt)
 FOLDER=$(basename "$PWD")
-TOTAL_RENAMES=0
 
-echo ""
-[[ "$DRY_RUN" == true ]] && PREFIX="[dry run] " || PREFIX=""
-echo "── ${PREFIX}Rename → \"$FOLDER\" ─────────────────────────────────────────────────"
+# ── Helpers ───────────────────────────────────────────────────────────────────
+contains_str() {  # contains_str needle arr_name
+  local needle="$1" name="$2"
+  eval "local n=\${#$name[@]}; local i; for ((i=0;i<n;i++)); do [[ \"\${$name[\$i]}\" == \"\$needle\" ]] && return 0; done; return 1"
+}
+
+index_of_str() {  # index_of_str needle arr_name → prints index or empty
+  local needle="$1" name="$2"
+  eval "local n=\${#$name[@]}; local i; for ((i=0;i<n;i++)); do if [[ \"\${$name[\$i]}\" == \"\$needle\" ]]; then printf '%s' \"\$i\"; return; fi; done"
+}
+
+# ── Collect candidate files ───────────────────────────────────────────────────
+CANDIDATES=()
 
 for EXT in "${EXTS[@]}"; do
-  FILES=()
-  while IFS= read -r f; do
-    FILES+=("$f")
-  done < <(find . -maxdepth 1 -iname "*.${EXT}" | sed 's|^\./||' | sort)
+  while IFS= read -r f; do CANDIDATES+=("$f"); done \
+    < <(find . -maxdepth 1 -type f -iname "*.${EXT}" | sed 's|^\./||')
+done
 
-  [[ ${#FILES[@]} -eq 0 ]] && continue
+for SC in "${SIDECARS[@]}"; do
+  while IFS= read -r f; do CANDIDATES+=("$f"); done \
+    < <(find . -maxdepth 1 -type f -name "*${SC}" | sed 's|^\./||')
+done
 
-  N=1
-  for FILE in "${FILES[@]}"; do
-    ORIG_EXT="${FILE##*.}"
-    NEW="${FOLDER}_${N}.${ORIG_EXT}"
-    if [[ "$FILE" == "$NEW" ]]; then
-      echo "  $FILE (unchanged)"
-    else
-      echo "  $FILE → $NEW"
-      if [[ "$DRY_RUN" == false ]]; then
-        mv -- "$FILE" "$NEW"
-      fi
-      TOTAL_RENAMES=$((TOTAL_RENAMES + 1))
+FILES=()
+for f in "${CANDIDATES[@]:-}"; do
+  [[ -z "$f" ]] && continue
+  contains_str "$f" FILES || FILES+=("$f")
+done
+
+if [[ ${#FILES[@]} -eq 0 ]]; then
+  echo "No candidate files in $PWD"
+  exit 0
+fi
+
+# Sort FILES
+IFS=$'\n' read -rd '' -a FILES < <(printf '%s\n' "${FILES[@]}" | sort && printf '\0')
+
+# ── Classify each file ────────────────────────────────────────────────────────
+F_VSTEM=()
+F_EXT=()
+F_HIDDEN=()    # 1=hidden
+F_SIDECAR=()   # 1=sidecar
+
+for i in "${!FILES[@]}"; do
+  base="${FILES[$i]}"
+  hidden=0
+  [[ "$base" == .* ]] && hidden=1
+  matched=0
+  for SC in "${SIDECARS[@]}"; do
+    if [[ "$base" == *"$SC" ]]; then
+      stem="${base%$SC}"
+      [[ "$stem" == .* ]] && vstem="${stem#.}" || vstem="$stem"
+      F_VSTEM[$i]="$vstem"
+      F_EXT[$i]="$SC"
+      F_HIDDEN[$i]="$hidden"
+      F_SIDECAR[$i]=1
+      matched=1
+      break
     fi
-    N=$((N + 1))
+  done
+  if [[ "$matched" == 0 ]]; then
+    stem="${base%.*}"
+    ext=".${base##*.}"
+    [[ "$stem" == .* ]] && vstem="${stem#.}" || vstem="$stem"
+    F_VSTEM[$i]="$vstem"
+    F_EXT[$i]="$ext"
+    F_HIDDEN[$i]="$hidden"
+    F_SIDECAR[$i]=0
+  fi
+done
+
+# ── Build unique stem list + per-stem flags (parallel arrays) ────────────────
+S_NAME=()
+S_HAS_PRIMARY=()  # 1 if any primary file with this stem
+S_KEEP=()         # 1 if should be renamed
+S_EXISTING=()     # existing slot N (preserved), or empty
+S_SLOT=()         # assigned slot
+
+for i in "${!FILES[@]}"; do
+  v="${F_VSTEM[$i]}"
+  idx="$(index_of_str "$v" S_NAME)"
+  if [[ -z "$idx" ]]; then
+    idx="${#S_NAME[@]}"
+    S_NAME[$idx]="$v"
+    S_HAS_PRIMARY[$idx]=0
+    S_KEEP[$idx]=0
+    S_EXISTING[$idx]=""
+    S_SLOT[$idx]=""
+  fi
+  [[ "${F_SIDECAR[$i]}" == 0 ]] && S_HAS_PRIMARY[$idx]=1
+done
+
+# ── Determine which stems to keep + existing slots ────────────────────────────
+PREFIX="${FOLDER}_"
+for s in "${!S_NAME[@]}"; do
+  v="${S_NAME[$s]}"
+  matches=0
+  if [[ "$v" == "$PREFIX"* ]]; then
+    rest="${v#$PREFIX}"
+    if [[ "$rest" =~ ^[0-9]+$ ]]; then
+      matches=1
+      S_EXISTING[$s]="$rest"
+    fi
+  fi
+  if [[ "${S_HAS_PRIMARY[$s]}" == 1 || "$matches" == 1 ]]; then
+    S_KEEP[$s]=1
+  else
+    echo "Warning: orphan sidecar group '$v' (no primary file in batch). Skipping." >&2
+  fi
+done
+
+# ── Assign slots ──────────────────────────────────────────────────────────────
+# Pass 1: existing
+USED_SLOTS=()
+for s in "${!S_NAME[@]}"; do
+  [[ "${S_KEEP[$s]}" == 1 ]] || continue
+  if [[ -n "${S_EXISTING[$s]}" ]]; then
+    S_SLOT[$s]="${S_EXISTING[$s]}"
+    USED_SLOTS+=("${S_EXISTING[$s]}")
+  fi
+done
+
+# Pass 2: new stems, alphabetical order
+NEW_STEMS=()
+for s in "${!S_NAME[@]}"; do
+  [[ "${S_KEEP[$s]}" == 1 ]] || continue
+  [[ -z "${S_SLOT[$s]}" ]] || continue
+  NEW_STEMS+=("${S_NAME[$s]}")
+done
+
+if [[ ${#NEW_STEMS[@]} -gt 0 ]]; then
+  IFS=$'\n' read -rd '' -a NEW_STEMS < <(printf '%s\n' "${NEW_STEMS[@]}" | sort && printf '\0')
+fi
+
+next=1
+for v in "${NEW_STEMS[@]:-}"; do
+  [[ -z "$v" ]] && continue
+  while contains_str "$next" USED_SLOTS; do next=$((next + 1)); done
+  idx="$(index_of_str "$v" S_NAME)"
+  S_SLOT[$idx]="$next"
+  USED_SLOTS+=("$next")
+  next=$((next + 1))
+done
+
+# ── Build rename plan ─────────────────────────────────────────────────────────
+PLAN_SRC=()
+PLAN_DST=()
+PLAN_SLOT=()
+PLAN_VSTEM=()
+
+for i in "${!FILES[@]}"; do
+  v="${F_VSTEM[$i]}"
+  s_idx="$(index_of_str "$v" S_NAME)"
+  [[ "${S_KEEP[$s_idx]}" == 1 ]] || continue
+  slot="${S_SLOT[$s_idx]}"
+  ext="${F_EXT[$i]}"
+  if [[ "${F_HIDDEN[$i]}" == 1 ]]; then
+    dst=".${FOLDER}_${slot}${ext}"
+  else
+    dst="${FOLDER}_${slot}${ext}"
+  fi
+  PLAN_SRC+=("${FILES[$i]}")
+  PLAN_DST+=("$dst")
+  PLAN_SLOT+=("$slot")
+  PLAN_VSTEM+=("$v")
+done
+
+# ── Pre-flight collision check ────────────────────────────────────────────────
+abort=0
+for i in "${!PLAN_DST[@]}"; do
+  dst="${PLAN_DST[$i]}"
+  src="${PLAN_SRC[$i]}"
+  [[ "$src" == "$dst" ]] && continue
+  if [[ -e "$dst" ]] && ! contains_str "$dst" PLAN_SRC; then
+    echo "Error: target '$dst' already exists and is not in rename set." >&2
+    abort=1
+  fi
+done
+[[ "$abort" == 1 ]] && exit 1
+
+# ── Print plan grouped by slot ────────────────────────────────────────────────
+echo ""
+PR=""
+[[ "$DRY_RUN" == true ]] && PR="[dry run] "
+echo "── ${PR}Rename → \"$FOLDER\" ─────────────────────────────────────────────"
+
+# Collect unique slots in sorted order
+SLOTS_SORTED=()
+if [[ ${#PLAN_SLOT[@]} -gt 0 ]]; then
+  IFS=$'\n' read -rd '' -a SLOTS_SORTED < <(printf '%s\n' "${PLAN_SLOT[@]}" | sort -nu && printf '\0')
+fi
+
+TOTAL=0
+for slot in "${SLOTS_SORTED[@]:-}"; do
+  [[ -z "$slot" ]] && continue
+  # Find vstem for slot (first match)
+  v=""
+  for i in "${!PLAN_SLOT[@]}"; do
+    if [[ "${PLAN_SLOT[$i]}" == "$slot" ]]; then v="${PLAN_VSTEM[$i]}"; break; fi
+  done
+  echo "  slot $slot  (${v})"
+  for i in "${!PLAN_SLOT[@]}"; do
+    [[ "${PLAN_SLOT[$i]}" == "$slot" ]] || continue
+    src="${PLAN_SRC[$i]}"
+    dst="${PLAN_DST[$i]}"
+    if [[ "$src" == "$dst" ]]; then
+      echo "    $src  (unchanged)"
+    else
+      echo "    $src  →  $dst"
+      TOTAL=$((TOTAL + 1))
+    fi
   done
 done
+
+# ── Execute (two-phase) ───────────────────────────────────────────────────────
+if [[ "$DRY_RUN" == false && "$TOTAL" -gt 0 ]]; then
+  TEMPS=()
+
+  cleanup_trap() {
+    echo "" >&2
+    echo "ERROR mid-rename. Temp-name mapping for manual recovery:" >&2
+    for i in "${!TEMPS[@]}"; do
+      [[ -n "${TEMPS[$i]:-}" ]] && echo "  ${TEMPS[$i]}  →  ${PLAN_DST[$i]}" >&2
+    done
+  }
+  trap cleanup_trap ERR
+
+  for i in "${!PLAN_SRC[@]}"; do
+    src="${PLAN_SRC[$i]}"
+    dst="${PLAN_DST[$i]}"
+    if [[ "$src" == "$dst" ]]; then
+      TEMPS[$i]=""
+      continue
+    fi
+    tmp=".lec-rename-tmp-$$-${i}"
+    mv -- "$src" "$tmp"
+    TEMPS[$i]="$tmp"
+  done
+
+  for i in "${!TEMPS[@]}"; do
+    [[ -z "${TEMPS[$i]:-}" ]] && continue
+    if [[ -e "${PLAN_DST[$i]}" ]]; then
+      echo "Internal error: target ${PLAN_DST[$i]} unexpectedly exists between phases" >&2
+      exit 1
+    fi
+    mv -- "${TEMPS[$i]}" "${PLAN_DST[$i]}"
+  done
+
+  trap - ERR
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "── Summary ─────────────────────────────────────────────────────────────────"
 if [[ "$DRY_RUN" == true ]]; then
-  printf "  %-18s %s\n" "Would rename:" "$TOTAL_RENAMES file(s)"
+  printf "  %-18s %s\n" "Would rename:" "$TOTAL file(s)"
 else
-  printf "  %-18s %s\n" "Renamed:" "$TOTAL_RENAMES file(s)"
+  printf "  %-18s %s\n" "Renamed:" "$TOTAL file(s)"
 fi
