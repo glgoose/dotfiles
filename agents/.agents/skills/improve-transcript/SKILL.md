@@ -100,7 +100,11 @@ Plus deze prompt:
 > 8. Sentence-start capitalization at cue boundaries: if cue N ends with `.`, `!`, or `?` (definite sentence terminator), and cue N+1 starts with a lowercase letter, capitalize the first letter of cue N+1. Skip if the previous cue ends with ellipsis, comma, or any non-sentence-terminating mark.
 > 9. Speaker false-starts and self-corrections: if a cue contains an abandoned noun phrase or clause immediately followed by a restart of the same idea, delete the abandoned fragment. Conservative: only when the restart clearly reformulates the same point with overlapping content. Do not smooth filler words ("um", "uh", "well"), do not delete repeated discourse markers, do not merge cues. The cue stays one cue. Example: `this bureaucratic the dominance of bureaucracy favors` becomes `the dominance of bureaucracy favors`. Rule 1.5 still applies: if the abandoned fragment's words have high ASR confidence and your `llm_confidence` in the deletion is below 0.85, propose it in `review` instead.
 > 10. Glossary harmonization in-pass: enforce rule 3 across the whole document in this same pass. The `glossary` field in the output JSON is for the user-facing report only; corrections are already applied in `cues`. Only list entries where at least two distinct surface forms appeared in the input for what is clearly the same entity, or where a user-provided glossary term was used to normalize variants.
-> 11. Paragraph breaks: emit indices into the cue array where a new paragraph begins. Use pause-cues (gap >= 1.5 seconds, provided per cue), speaker turns (provided per cue for diarized input), and topic shifts. First index always 0. Indices strictly increasing, all in `[0, n_cues)`.
+> 11. Paragraph breaks: emit indices into the cue array where a new paragraph begins.
+>     - A break index MUST fall exactly at the start of a sentence (immediately after a `.`, `!`, or `?` in the previous cue, not mid-clause). Never split a paragraph inside a sentence.
+>     - Pauses (gap >= 1.5s) and speaker turns are *candidates*, not automatic breaks: only turn a candidate into a break if the text before and after it is actually a different topic, a different speaker's turn, or a new rhetorical move (question, answer, aside). A pause where the speaker merely takes a breath mid-argument is not a break.
+>     - Target paragraph length: roughly 40-180 words. A candidate break that would produce a paragraph under ~15 words must only be kept if it is a genuinely standalone unit (e.g. a short question or a one-line answer in dialogue) — otherwise merge it into the adjacent paragraph it belongs to topically. A run of text between two candidates that would exceed ~200 words must be split further at the clearest internal topic shift, even if no pause exists there.
+>     - First index always 0. Indices strictly increasing, all in `[0, n_cues)`.
 >
 > Output schema:
 > ```
@@ -138,7 +142,7 @@ Plus deze prompt:
 2. Elke `cues[i].id` matcht input cue-id i.
 3. `paragraph_breaks[0] == 0`, strictly increasing, alle waarden in `[0, n_cues)`.
 
-Bij validatie-fout op `paragraph_breaks` (maar `cues` ok): **fallback** naar deterministische pause-based breaks over de gecorrigeerde cues. Zet een break op cue-index 0, plus elke cue waar `gap >= 1.5s`, plus elke speaker-turn (diarized). Continue met write.
+Bij validatie-fout op `paragraph_breaks` (maar `cues` ok): **fallback** naar deterministische breaks over de gecorrigeerde cues: cue-index 0, plus voor elke cue met `gap >= 1.5s` of speaker-turn (diarized), de eerstvolgende zin-start op of na die cue (nooit midden in een zin — zoek het eerstvolgende cue-begin dat volgt op een `.`/`!`/`?` in de vorige cue). Merge een resulterende paragraaf van < 15 woorden in de vorige, tenzij het een losstaand vraag/antwoord-zinnetje is. Continue met write.
 
 **Decision matrix enforcement (writer-side)**. Voor elke cue, loop over `corrections`. Bepaal `asr_confidence` per correction door `from` op te zoeken in `low_confidence_words[cue_id]`:
 - als `from` (case-insensitive substring match) voorkomt in de low-conf set → `asr_confidence: low`;
@@ -273,6 +277,7 @@ Toon na afloop:
 - False-starts gedetecteerd (count + voorbeeld): aantal cues waar rule 9 een fragment heeft verwijderd.
 - Review queue: aantal entries in REVIEW.md, plus pad. Lege REVIEW.md = niet schrijven, melden als "geen review nodig".
 - Review verwerkt in stap 6: N van M cues afgehandeld, breakdown per actie (accept / pick / custom / keep / inaudible / quit). Bij M=0: regel weglaten. Lees uit `pre-improve/v<N>/REVIEW.applied.log` (entries van deze run sinds session-start).
+- Paragraaf-lengtes: min/max/gemiddeld aantal woorden. Flag elke paragraaf < 15 of > 200 woorden expliciet (kan wijzen op een gemiste merge/split).
 - Backup-locatie: `pre-improve/v<N>/`.
 
 ## Lange transcripts
