@@ -9,10 +9,24 @@ import pikepdf
 
 def error(msg):
     print(f"Error: {msg}", file=sys.stderr)
+    print(f"Error: {msg}")  # mirror to stdout so Zotero subprocess() callers see it too
     sys.exit(1)
 
+if len(sys.argv) == 3 and sys.argv[1] in ('-c', '--check'):
+    pdf_file = sys.argv[2]
+    try:
+        with pikepdf.open(pdf_file) as pdf:
+            if '/PageLabels' in pdf.Root:
+                samples = [(i + 1, pdf.pages[i].label) for i in (0, len(pdf.pages) // 2, len(pdf.pages) - 1)]
+                print(f"yes ({len(pdf.pages)} pages; samples " + ", ".join(f"p{p}='{l}'" for p, l in samples) + ")")
+                sys.exit(0)
+            print("no")
+            sys.exit(1)
+    except Exception as e:
+        error(str(e))
+
 if len(sys.argv) != 4:
-    error("Usage: pdflabels START_LABEL END_LABEL file.pdf")
+    error("Usage: pdflabels START_LABEL END_LABEL file.pdf\n       pdflabels --check file.pdf")
 
 start_label = sys.argv[1]
 end_label   = sys.argv[2]
@@ -20,15 +34,15 @@ pdf_file    = sys.argv[3]
 
 try:
     with pikepdf.open(pdf_file) as pdf:
+        if '/PageLabels' not in pdf.Root:
+            error("PDF has no /PageLabels — add them with qpdf first")
         labels = {}
         for i, page in enumerate(pdf.pages):
             labels.setdefault(page.label, i + 1)
+except SystemExit:
+    raise
 except Exception as e:
     error(str(e))
-
-# When a PDF has no /PageLabels, pikepdf returns '' for every page label
-if all(label == '' for label in labels):
-    error("PDF has no page labels — add them with qpdf first")
 
 if start_label not in labels:
     error(f"Label '{start_label}' not found in PDF")

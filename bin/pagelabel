@@ -600,17 +600,28 @@ def extend_chains(
             page_cands = by_page.get(p, [])
             matching_style_zone = [c for c in page_cands
                                    if c.style == ch.style and c.zone == ch.zone]
-            if matching_style_zone:
-                # Page has matching-style candidate(s)
-                compatible = [c for c in matching_style_zone if _bbox_compatible(ch, c, toc_pages)]
-                if compatible:
-                    matching_val = [c for c in compatible if c.value == v]
-                    if matching_val:
-                        ch.members.insert(0, matching_val[0])
-                        blocked.add(p)
-            else:
-                # No matching-style: infer and continue (empty or different-style)
+            compatible = [c for c in matching_style_zone if _bbox_compatible(ch, c, toc_pages)]
+            matching_val = [c for c in compatible if c.value == v]
+            drop_folio = next(
+                (c for c in page_cands if c.style == ch.style and c.value == v),
+                None,
+            ) if p in toc_pages else None
+            if matching_val:
+                # Exact same-zone match: confirmed member.
+                ch.members.insert(0, matching_val[0])
+                blocked.add(p)
+            elif drop_folio is not None:
+                # Drop-folio promotion: a chapter opener (TOC-corroborated) often
+                # prints its folio at foot-center while the body uses head-outer.
+                # Promote the same-style, expected-value candidate from the
+                # opposite zone to a confirmed member. Do NOT update the centroid
+                # — one foot-center point would skew the head-outer cluster.
+                ch.members.insert(0, drop_folio)
+                blocked.add(p)
+            elif not matching_style_zone:
+                # No same-zone same-style candidate: unnumbered front matter.
                 ch.inferred_pages.insert(0, p)
+            # else: same-zone candidate with wrong value/bbox — skip (unchanged).
             p -= 1
             v -= 1
 
