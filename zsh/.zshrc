@@ -179,3 +179,11 @@ export BIB="$HOME/.local/share/bib"
 
 # Added by Copilot CLI setup: include local skills
 export COPILOT_CUSTOM_INSTRUCTIONS_DIRS="$HOME/.copilot/skills"
+
+# ── Installer-added (Antigravity CLI, bun) ───────────────────────────────────
+# New installers append below this block; fold anything worth keeping into it.
+export PATH="$HOME/.local/bin:$PATH"
+
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+[ -s "$BUN_INSTALL/_bun" ] && source "$BUN_INSTALL/_bun"
