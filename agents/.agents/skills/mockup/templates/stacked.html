@@ -34,6 +34,7 @@
       font-size: 0.78rem;
       color: #94a3b8;
       margin: 0 0 1.5rem;
+      max-width: 960px;
     }
     .hint code {
       background: #fff;
@@ -42,18 +43,21 @@
       padding: 0.05rem 0.35rem;
       font-size: 0.72rem;
     }
-    .variants-grid {
+    .variants-stacked {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-      gap: 1rem;
+      gap: 1.5rem;
+      align-items: start;
     }
-    .variant-card {
+    .stacked-variant {
+      width: min(100%, 1080px);
       background: #fff;
       border: 1px solid #e5e2e2;
       border-radius: 10px;
       padding: 1rem;
-      display: flex;
-      flex-direction: column;
+    }
+    .variant-meta {
+      max-width: 760px;
+      margin-bottom: 0.85rem;
     }
     .variant-label {
       font-size: 0.7rem;
@@ -73,16 +77,17 @@
       font-size: 0.72rem;
       color: #94a3b8;
       font-style: italic;
-      margin-bottom: 0.85rem;
       line-height: 1.4;
     }
     .variant-tradeoff::before { content: "trade · "; opacity: 0.6; font-style: normal; }
     .variant-body {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 80px;
-      flex: 1;
+      display: block;
+      width: 100%;
+      overflow-x: auto;
+      padding-bottom: 0.25rem;
+    }
+    .variant-body > * {
+      max-width: 960px;
     }
     .site-preview {
       font-family: inherit;
@@ -90,6 +95,7 @@
       background: var(--paper, #ffffff);
     }
     .tune-panel {
+      max-width: 960px;
       margin-top: 1rem;
       padding: 0.75rem;
       border-top: 1px dashed #e5e2e2;
@@ -117,6 +123,7 @@
     .reset { background: transparent; color: #94a3b8; border: 0; cursor: pointer; font: inherit; }
     .reset:hover { color: #475569; }
     .snippet {
+      max-width: 960px;
       margin-top: 0.75rem;
       border-top: 1px dashed #e5e2e2;
       padding-top: 0.5rem;
@@ -156,7 +163,7 @@
   <div class="mockup-chrome">
     <h1 class="topic-h">{{TOPIC}}</h1>
     <p class="hint">Reload <code>Cmd+R</code> after Claude regenerates. Tune sliders &rarr; <code>Copy as prompt</code> &rarr; paste in TUI. Pick in TUI: type <code>B</code> or <code>B tighter padding</code> or <code>go with B</code> (paste copied prompt + <code>go with B</code> to bake tuned values into the handoff).</p>
-    <div class="variants-grid">
+    <div class="variants-stacked">
       {{VARIANTS_HTML}}
     </div>
   </div>

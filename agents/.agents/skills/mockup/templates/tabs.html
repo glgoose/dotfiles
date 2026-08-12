@@ -4,14 +4,25 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{TOPIC}} — variants</title>
-  <script src="https://cdn.tailwindcss.com"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <link rel="stylesheet" href="../_tokens.css">
+  <style id="live-site-css">
+{{LIVE_SITE_CSS}}
+  </style>
   <style>
     body {
-      font-family: system-ui, -apple-system, sans-serif;
       padding: 2rem;
       margin: 0;
+    }
+    .topic-h,
+    .hint,
+    .hint code,
+    .variant-tabs,
+    .section-label,
+    .variant-tradeoff,
+    .tune-panel,
+    .snippet {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     .topic-h {
       font-size: 1rem;
@@ -69,6 +80,11 @@
       line-height: 1.4;
     }
     .variant-tradeoff::before { content: "trade · "; opacity: 0.6; font-style: normal; }
+    .site-preview {
+      font-family: inherit;
+      color: var(--ink, #111111);
+      background: var(--paper, #ffffff);
+    }
     .tune-panel {
       margin-top: 1rem;
       padding: 0.75rem;
@@ -83,6 +99,11 @@
     .tune-row input[type=range] { width: 100%; accent-color: var(--primary); }
     .tune-val { text-align: right; color: #1e293b; font-weight: 600; }
     .tune-actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+    .tune-panel button,
+    .tune-panel input,
+    .snippet button {
+      font-family: inherit;
+    }
     .copy-prompt {
       background: var(--primary); color: #fff; border: 0;
       padding: 0.35rem 0.75rem; border-radius: 6px; cursor: pointer;
@@ -128,11 +149,13 @@
   </style>
 </head>
 <body x-data="{ active: 'a' }">
-  <h1 class="topic-h">{{TOPIC}}</h1>
-  <p class="hint">Reload <code>Cmd+R</code> after Claude regenerates. Tune sliders &rarr; <code>Copy as prompt</code> &rarr; paste in TUI. Pick in TUI: type <code>B</code> or <code>B tighter padding</code> or <code>go with B</code> (paste copied prompt + <code>go with B</code> to bake tuned values into the handoff).</p>
-  <div class="variant-tabs">
-    {{TABS_HTML}}
+  <div class="mockup-chrome">
+    <h1 class="topic-h">{{TOPIC}}</h1>
+    <p class="hint">Reload <code>Cmd+R</code> after Claude regenerates. Tune sliders &rarr; <code>Copy as prompt</code> &rarr; paste in TUI. Pick in TUI: type <code>B</code> or <code>B tighter padding</code> or <code>go with B</code> (paste copied prompt + <code>go with B</code> to bake tuned values into the handoff).</p>
+    <div class="variant-tabs">
+      {{TABS_HTML}}
+    </div>
+    {{VARIANTS_HTML}}
   </div>
-  {{VARIANTS_HTML}}
 </body>
 </html>

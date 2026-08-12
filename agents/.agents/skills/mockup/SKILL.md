@@ -2,7 +2,7 @@
 name: mockup
 user-invocable: true
 allowed-tools: Read, Write, Edit, Bash, AskUserQuestion, Skill
-description: Generate side-by-side UI variant mockups in browser for fast design iteration, AND resume implementation from a previously picked mockup winner. Use when user asks to "try designs for X", "compare layouts", "mockup 3 buttons", "iterate on UI", or invokes /mockup — skill produces a single HTML file with all variants visible at once (or tabs for full-page mockups), opens in browser, user picks winner via TUI, skill writes a self-contained HANDOFF.md (winner ID, embedded HTML, target file, recipe) plus a project-level LATEST_HANDOFF.md pointer, then stops — no worktree, no plan, no auto-implementation. ALSO use when user says "implement the latest mockup winner", "build the picked mockup", "implement the winner from <path>", "resume the mockup handoff" — skill reads the handoff file(s) and follows the embedded recipe to apply the winning design to the real codebase.
+description: Generate UI variant mockups in browser for fast design iteration, AND resume implementation from a previously picked mockup winner. Use when user asks to "try designs for X", "compare layouts", "mockup 3 buttons", "iterate on UI", or invokes /mockup — skill produces a single HTML file with variants in grid, stacked, or tabs layout, opens in browser, user picks winner via TUI, skill writes a self-contained HANDOFF.md (winner ID, embedded HTML, target file, recipe) plus a project-level LATEST_HANDOFF.md pointer, then stops — no worktree, no plan, no auto-implementation. ALSO use when user says "implement the latest mockup winner", "build the picked mockup", "implement the winner from <path>", "resume the mockup handoff" — skill reads the handoff file(s) and follows the embedded recipe to apply the winning design to the real codebase.
 ---
 
 # /mockup — UI variant iteration
@@ -24,7 +24,9 @@ Examples:
 | `tunable` / `with sliders` / `knobs` / `tune` | Force sliders on (§4b) | auto-detect |
 | `no sliders` / `static` | Force sliders off | auto-detect |
 | `with snippets` / `show code` / `with code` | Add collapsible code panel per variant (§4c) | off (auto-on if invocation mentions *port*, *port to React*, *port to Flask*, *for the real component*) |
-| `full page` / `full screen` | Use tabs layout (§3) | grid |
+| `stacked` / `below one another` / `vertical` | Use stacked layout (§3) | auto-detect |
+| `full page` / `full screen` | Use tabs layout (§3) | auto-detect |
+| `token-only` / `no live css` | Skip live project CSS and use only `_tokens.css` | off; live CSS is the default for existing websites |
 
 ## Purpose
 
@@ -101,25 +103,57 @@ To generate `_tokens.css`:
 
 Templates `<head>` already contains `<link rel="stylesheet" href="../_tokens.css">` — that's why the file must exist by render time.
 
+### 2a. Prepare live site CSS (default for existing websites)
+
+For any mockup of an existing website/app, make the preview inherit the real site styling instead of hand-approximating typography, spacing, layout, or Tailwind output. Skip this only when the user asks for `token-only` / `no live css`, the project has no buildable CSS, or the mockup is intentionally a greenfield concept.
+
+1. Build or reuse `dist/`:
+   - If `dist` contains current built CSS or built HTML with inline `<style>` blocks, reuse it.
+   - If user-visible CSS/classes/components changed or `dist` is missing/stale, run the project's build command (usually `npm run build`) before generating the mockup.
+2. Run the bundled helper from the skill directory:
+
+   ```bash
+   python3 <skill-dir>/scripts/live_site_css.py <project-root> > /tmp/mockup-live-site.css
+   ```
+
+   It concatenates built CSS from `dist/**/*.css`, falling back to unique inline `<style>` blocks from `dist/**/*.html`, and rewrites root-relative asset URLs such as `/fonts/...` to local `file://` URLs so standalone `mockup.html` loads self-hosted fonts. If the mockup targets one specific built page and the site only has inline styles, pass `--html <dist/page/index.html>` to avoid collecting unrelated page-specific CSS.
+3. When rendering `templates/grid.html`, `templates/stacked.html`, or `templates/tabs.html`, replace `{{LIVE_SITE_CSS}}` with the helper output. If live CSS is intentionally skipped, replace it with `/* live site CSS skipped: <reason> */`.
+4. Wrap every real website/page fragment inside `.site-preview`. Keep mockup labels, cards, tabs, sliders, and snippets inside `.mockup-chrome`; never let mockup chrome CSS set the font family or text scale for `.site-preview` content.
+5. For page-level mockups, start from a real rendered page or a close copy of the real layout shell (e.g. `BaseLayout`, real sidebar grid, real nav location). Do not recreate the page from memory with hand-picked font sizes.
+
 ### 3. Pick layout
 
-- **Default: grid** (`templates/grid.html`) — all variants visible on one page.
-- **Tabs only when**: user said "full page" / "full screen" / "view" / individual variants exceed ~400px height. Use `templates/tabs.html`.
+Pick the viewing layout before generating HTML. The layout must let the user judge the real design, not a compressed accident.
 
-The user has explicitly stated grid is preferred unless content can't fit. **Bias hard toward grid.**
+- **Grid** (`templates/grid.html`) — use only for small components where each variant remains meaningful at 280-420px wide.
+- **Stacked** (`templates/stacked.html`) — use for page sections, homepage areas, dashboards, settings screens, content pages, or any variant containing a framed page preview. Also use when the user says "stacked", "below one another", or "vertical".
+- **Tabs** (`templates/tabs.html`) — use for true full-page or full-screen mockups where one-at-a-time inspection is better, or when the user says "full page" / "full screen".
+
+**Width preflight:** estimate card width before writing the file. Use this conservative check:
+
+```
+available = 1440px - 64px page padding
+estimated_card = (available - (variant_count - 1) * 16px gap) / variant_count
+```
+
+If `estimated_card < intended_preview_width`, do **not** use grid. For page-like previews, set `intended_preview_width` to 720-960px and use stacked or tabs. If there are more than 3 page-level variants, default to stacked unless the user explicitly asked for side-by-side.
+
+**Generation check before showing the user:** if the rendered variants would clip navigation, overlap text, or squeeze a page frame below its intended width, regenerate with stacked or tabs first.
 
 ### 4. Generate variants
 
 **Design thinking phase** (principles from `frontend-design` skill — apply before writing any HTML):
 
+For existing websites, visual fidelity beats novelty. Preserve the live site's type scale, fonts, grid, colors, and component hierarchy by default. Variants should change only the component or state under discussion. Use bold aesthetic divergence only when the user explicitly asks for a redesign, greenfield direction, or broad visual exploration.
+
 For the mockup as a whole, anchor on:
 - **Purpose**: What problem does this component solve? Who uses it?
 - **Differentiation**: What makes each variant UNFORGETTABLE vs. the others?
 
-Each variant must commit to a **bold, distinct aesthetic pole** — not just a color swap. Think: "editorial hairline serif", "industrial monospace utility", "art deco geometric with a gold accent", "brutalist raw ink on paper". Use this vocabulary, not "pastel fill / ghost / solid".
+For greenfield or explicit redesign mockups, each variant must commit to a **bold, distinct aesthetic pole** — not just a color swap. Think: "editorial hairline serif", "industrial monospace utility", "art deco geometric with a gold accent", "brutalist raw ink on paper". Use this vocabulary, not "pastel fill / ghost / solid".
 
 **Aesthetic rules (apply to every variant's HTML):**
-- **Typography**: Import a distinctive Google Font per variant (`<link>` or `@import`). Never Arial, Inter, Roboto, Space Grotesk, or system-ui. Pair a display font with a refined body font when the variant has a hierarchy.
+- **Typography**: Existing site mockups use live site fonts from `{{LIVE_SITE_CSS}}`. Do not import Google Fonts or override `font-size`/`font-family` unless typography itself is the thing being compared. Greenfield mockups may import distinctive fonts; never default to Arial, Inter, Roboto, Space Grotesk, or system-ui inside the designed component.
 - **Color**: Dominant color + sharp accent, defined as CSS variables. Avoid purple-gradient-on-white. Dominant with one punch beats evenly distributed palette.
 - **Motion**: One well-timed CSS transition or hover state per variant beats scattered micro-interactions. CSS-only preferred.
 - **Spatial composition**: Lean into asymmetry, generous negative space, OR controlled density. Avoid the default "centered box with border-radius and drop shadow".
@@ -129,7 +163,8 @@ Each variant must commit to a **bold, distinct aesthetic pole** — not just a c
 - Same font family, just different weight
 - Same layout, different color
 - All variants = centered card + drop shadow + rounded corners
-- Any variant using Inter / Roboto / Arial / system-ui
+- Existing site variants that override site font scale/family without being asked to compare typography
+- Greenfield variants using Inter / Roboto / Arial / system-ui
 - **Variant without a stated tradeoff** — implies it dominates the others, which would mean the comparison is fake. Regenerate.
 
 For each variant (typically 3, range 2–6):
@@ -138,7 +173,7 @@ For each variant (typically 3, range 2–6):
 - Write a **two-line description**:
   - Line 1 (`{{DESCRIPTION}}`): one-line aesthetic direction (e.g. *"industrial mono utility — tight monospace, ink-on-paper"*).
   - Line 2 (`{{TRADEOFF}}`): the cost this variant accepts, framed as `<strength> / <cost>` (e.g. *"dense + fast / cramped on mobile"*, *"editorial gravitas / heavier visual weight"*, *"spacious + readable / takes more vertical real estate"*).
-- Produce HTML body (Tailwind classes + inline `<style>` for per-variant typography / Google Fonts imports). Project-wide tokens (`--primary`, `--primary-light`, body bg) come from `~/.claude/mockups/<project>/_tokens.css` linked in the template `<head>` — don't redeclare them inline.
+- Produce HTML body using real project classes where possible. For existing websites, place the previewed fragment inside `<div class="site-preview">...</div>` and rely on inlined live CSS for Tailwind/base/component styles. Add only small variant-scoped CSS for the actual difference being compared. Project-wide tokens (`--primary`, `--primary-light`, body bg) still come from `~/.claude/mockups/<project>/_tokens.css` as a fallback — don't redeclare them inline.
 - If interactive (button click, toggle), wrap in per-variant Alpine `x-data`.
 
 Match existing project tokens when known (look at recent CSS in repo). For uhasselt-stage: `--primary:#003D6B; --primary-light:#dce8f2; bg:#f5f4f2` — treat these as the base palette; each variant can extend or contrast against them but should not ignore them entirely.
@@ -237,7 +272,7 @@ When the invocation contains `with snippets` / `show code` / `with code`, OR the
 
 `{{ESCAPED_HTML}}` rules:
 - Includes the variant's rendered HTML body + any per-variant `<style>` block, HTML-escaped (`&amp;`, `&lt;`, `&gt;`).
-- **Strips** `.variant-card` wrapper, `data-variant`, `.variant-label`, `.variant-desc`, `.variant-tradeoff`, `.tune-panel`, Tailwind CDN script, and mockup-only Alpine `x-data`.
+- **Strips** `.variant-card` wrapper, `data-variant`, `.variant-label`, `.variant-desc`, `.variant-tradeoff`, `.site-preview`, `.tune-panel`, mockup template scripts/styles, and mockup-only Alpine `x-data`.
 - Keeps Tailwind utility classes inline on elements (they port directly to React `className=`).
 - Keeps whitespace/indentation untouched — readability matters for the port.
 - `<details>` defaults to closed; user expands per-variant when comparing code.
@@ -246,8 +281,9 @@ Full markup, escaping rules, worked example, anti-patterns: see [`templates/snip
 
 ### 5. Render template
 
-Read `templates/grid.html` or `templates/tabs.html`. Replace placeholders:
+Read `templates/grid.html`, `templates/stacked.html`, or `templates/tabs.html`. Replace placeholders:
 - `{{TOPIC}}` — human-readable topic
+- `{{LIVE_SITE_CSS}}` — CSS emitted by `scripts/live_site_css.py`, or a comment explaining why live CSS was skipped
 - `{{VARIANTS_HTML}}` — concatenated variant blocks
 
 Each variant block (grid):
@@ -256,10 +292,24 @@ Each variant block (grid):
   <div class="variant-label">{{ID}} — {{TITLE}}</div>
   <div class="variant-desc">{{DESCRIPTION}}</div>
   <div class="variant-tradeoff">{{TRADEOFF}}</div>
-  <div class="variant-body">{{HTML}}</div>
+  <div class="variant-body"><div class="site-preview">{{HTML}}</div></div>
   <!-- .tune-panel (if §4b applies) goes here -->
   <!-- <details class="snippet"> (if §4c applies) goes here -->
 </div>
+```
+
+Each variant block (stacked):
+```html
+<section class="stacked-variant" data-variant="{{ID}}" x-data='{{ALPINE_STATE}}'>
+  <div class="variant-meta">
+    <div class="variant-label">{{ID}} — {{TITLE}}</div>
+    <div class="variant-desc">{{DESCRIPTION}}</div>
+    <div class="variant-tradeoff">{{TRADEOFF}}</div>
+  </div>
+  <div class="variant-body"><div class="site-preview">{{HTML}}</div></div>
+  <!-- .tune-panel (if §4b applies) goes here -->
+  <!-- <details class="snippet"> (if §4c applies) goes here -->
+</section>
 ```
 
 Each variant block (tabs):
@@ -267,7 +317,7 @@ Each variant block (tabs):
 <div x-show="active === '{{id_lower}}'" data-variant="{{ID}}">
   <p class="section-label">{{ID}} — {{DESCRIPTION}}</p>
   <div class="variant-tradeoff">{{TRADEOFF}}</div>
-  {{HTML}}
+  <div class="site-preview">{{HTML}}</div>
 </div>
 ```
 
@@ -290,7 +340,8 @@ Reply format:
 Opened <topic> mockup with N variants.
 
 Path: ~/.claude/mockups/<project>/<topic>/mockup.html
-Layout: grid (or: tabs)
+Layout: grid (or: stacked / tabs)
+Live site CSS: yes (or: no — <reason>)
 
 Type:
   • `B`                       — pick variant B, write HANDOFF.md and stop
@@ -323,7 +374,7 @@ When user signals a winner (`B`, `go with B`, `B looks good`, `pick B`):
 
 Steps:
 
-1. **Parse winning variant.** Read `mockup.html`, locate `data-variant="<ID>"`, extract the full inner block (`.variant-label`, `.variant-desc`, `.variant-body` and any per-variant `<style>` / Alpine `x-data`). Capture the title and description text.
+1. **Parse winning variant.** Read `mockup.html`, locate `data-variant="<ID>"`, extract the full inner block (`.variant-label`, `.variant-desc`, `.variant-body` / `.site-preview` and any per-variant `<style>` / Alpine `x-data`). Capture the title and description text. Also record whether the template contains a non-empty `<style id="live-site-css">` block; this becomes the handoff's Live site CSS line.
 
    **Capture tuned values too.** If the winning variant has a `.tune-panel`, also extract the current `x-data` defaults (key + value for each slider/toggle). These become the `## Tuned values` block in the handoff. If the pick was triggered by a paste containing `apply variant <ID> tuned values to the real component:`, **prefer the pasted values** over the file's `x-data` defaults — the paste IS the user's final answer, the file may not have been rewritten yet.
 
@@ -341,6 +392,7 @@ Steps:
    - **Project**: <project-slug>
    - **Mockup file** (may be overwritten by future /mockup runs): `~/.claude/mockups/<project>/<topic>/mockup.html`
    - **Likely target file(s)**: `<path>` (or `TBD — confirm before implementing`)
+   - **Live site CSS**: yes (built CSS or inline built styles from `dist` inlined) / no (`<reason>`)
 
    ## What the winner is
 
@@ -352,14 +404,14 @@ Steps:
 
    ## Winning variant — embedded source
 
-   Copied verbatim from `mockup.html` at pick time. **This is the source of truth** even if `mockup.html` is later regenerated.
+   Copied verbatim from `mockup.html` at pick time. **This is the source of truth** even if `mockup.html` is later regenerated. The `.site-preview` wrapper is mockup chrome and should be stripped during implementation.
 
    ```html
    <!-- variant <ID> — <title> -->
    <div class="variant-card" data-variant="<ID>" x-data='<ALPINE_STATE>'>
      <div class="variant-label"><ID> — <title></div>
      <div class="variant-desc"><description></div>
-     <div class="variant-body"><FULL_HTML_BODY></div>
+     <div class="variant-body"><div class="site-preview"><FULL_HTML_BODY></div></div>
    </div>
    ```
 
@@ -377,8 +429,8 @@ Steps:
    ## How to implement (recipe for the next session)
 
    1. Read the **Winning variant — embedded source** section above. The fenced HTML block is the design to apply.
-   2. Open `<target file>` and replace the corresponding region with the variant body. Strip the `variant-card` wrapper, the `data-variant` attribute, the entire `.tune-panel` block, the `<details class="snippet">` block (if present), and any mockup-only Alpine `x-data` (unless the real component genuinely uses Alpine). **If a `## Tuned values` section is present above, those are the exact numbers to apply — slider defaults in the embedded HTML may be stale, the Tuned values block is authoritative.** If `with snippets` was used during iteration, the user has already vetted the markup in-browser; the port is mostly mechanical.
-   3. Reconcile design tokens with project tokens. The mockup pulled tokens from `~/.claude/mockups/<project>/_tokens.css` — confirm the values there still match the live project before substituting. For uhasselt-stage the canonical values are `--primary:#003D6B; --primary-light:#dce8f2; bg:#f5f4f2`. If the variant uses inline Tailwind classes, those work as-is; if it uses custom CSS, move declarations into the project stylesheet.
+   2. Open `<target file>` and replace the corresponding region with the variant body. Strip the `variant-card` wrapper, the `data-variant` attribute, the `.site-preview` wrapper, the entire `.tune-panel` block, the `<details class="snippet">` block (if present), and any mockup-only Alpine `x-data` (unless the real component genuinely uses Alpine). **If a `## Tuned values` section is present above, those are the exact numbers to apply — slider defaults in the embedded HTML may be stale, the Tuned values block is authoritative.** If `with snippets` was used during iteration, the user has already vetted the markup in-browser; the port is mostly mechanical.
+   3. Reconcile design tokens with project tokens. If `Live site CSS: yes`, the mockup already used the built project CSS and should not require new shared styles except for intentional variant-specific CSS. If the mockup fell back to tokens only, confirm `~/.claude/mockups/<project>/_tokens.css` still matches the live project before substituting. If the variant uses inline Tailwind classes, confirm those classes are present/generated by the real project; if it uses custom CSS, move declarations into the project stylesheet.
    4. **Rebuild Tailwind** if the project has a CSS build step (look for `tailwind.in.css` / `npm run build:css` in repo root) — `npm run build:css`.
    5. Verify on the dev server: `<dev-server-url-or-TBD>`. Restart needed only if Python/config changed (templates auto-reload).
 
@@ -464,6 +516,7 @@ These were all explicitly designed out. Adding them is a design change, not a ro
 ## Templates
 
 - `templates/grid.html` — default layout, all variants in CSS grid
+- `templates/stacked.html` — page/section layout, variants below one another at representative width
 - `templates/tabs.html` — fallback for full-page-sized variants
 - `templates/slider-panel.md` — reference for §4b tunable widget
 - `templates/snippet-preview.md` — reference for §4c code-snippet panel
