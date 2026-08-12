@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# ffcut — cut a media file (audio or video) without re-encoding
+# ffcut — cut a media file (audio or video) with correct duration metadata
 # Usage: ffcut [-b|--begin TIME] [-e|--end TIME] [-x|--exact] [-o|--output FILE] FILE
-# Wraps `ffmpeg -c copy`. Works on any container ffmpeg understands (mp4, mkv, mp3, flac, wav, m4a, ...).
+# Default = stream copy (`ffmpeg -c copy`). Per-format adjustments fix duration headers:
+#   flac        -> lossless re-encode (-c:a flac) so STREAMINFO total_samples is correct
+#   mp4|m4a|mov -> stream copy + -avoid_negative_ts make_zero (no edit-list)
+#   mp3         -> stream copy + -write_xing 1 (regenerate Xing header)
+#   wav|mkv|... -> plain stream copy
 # -x places -ss after -i for frame-accurate cuts (slower, decodes to seek point).
 set -euo pipefail
 
@@ -36,7 +40,7 @@ while [[ $# -gt 0 ]]; do
       [[ $# -lt 2 ]] && { echo "Error: --output requires a value" >&2; exit 1; }
       OUTPUT_FILE="$2"; shift 2 ;;
     -x|--exact) EXACT=true; shift ;;
-    -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
     --) shift; INPUT="${1:-}"; break ;;
     -*) echo "Error: unknown option: $1" >&2; exit 1 ;;
     *)  if [[ -z "$INPUT" ]]; then INPUT="$1"; else echo "Error: extra positional: $1" >&2; exit 1; fi
@@ -60,10 +64,21 @@ TO_ARGS=()
 [[ -n "$BEGIN_TIME" ]] && SS_ARGS=(-ss "$BEGIN_TIME")
 [[ -n "$END_TIME"   ]] && TO_ARGS=(-to "$END_TIME")
 
+# Per-format codec/extra args. Stream copy by default; FLAC re-encodes losslessly
+# so STREAMINFO total_samples is rewritten (Preview otherwise shows original duration).
+EXT_LOWER="$(printf '%s' "${INPUT##*.}" | tr '[:upper:]' '[:lower:]')"
+CODEC_ARGS=(-c copy)
+EXTRA_ARGS=()
+case "$EXT_LOWER" in
+  flac)         CODEC_ARGS=(-c:a flac) ;;
+  mp4|m4a|mov)  EXTRA_ARGS=(-avoid_negative_ts make_zero) ;;
+  mp3)          EXTRA_ARGS=(-write_xing 1) ;;
+esac
+
 if $EXACT; then
-  ffmpeg -i "$INPUT" ${SS_ARGS[@]+"${SS_ARGS[@]}"} ${TO_ARGS[@]+"${TO_ARGS[@]}"} -c copy -y "$OUTPUT_FILE"
+  ffmpeg -i "$INPUT" ${SS_ARGS[@]+"${SS_ARGS[@]}"} ${TO_ARGS[@]+"${TO_ARGS[@]}"} "${CODEC_ARGS[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} -y "$OUTPUT_FILE"
 else
-  ffmpeg ${SS_ARGS[@]+"${SS_ARGS[@]}"} ${TO_ARGS[@]+"${TO_ARGS[@]}"} -i "$INPUT" -c copy -y "$OUTPUT_FILE"
+  ffmpeg ${SS_ARGS[@]+"${SS_ARGS[@]}"} ${TO_ARGS[@]+"${TO_ARGS[@]}"} -i "$INPUT" "${CODEC_ARGS[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} -y "$OUTPUT_FILE"
 fi
 
 echo "$OUTPUT_FILE"
