@@ -1,0 +1,903 @@
+#!/usr/bin/env bash
+# lec-review — interactive TUI to walk a REVIEW.md queue and apply edits.
+# Usage: lec-review <base> [--review PATH] [--pad SECONDS] [--no-play] [--dry-run]
+#
+# Reads the latest pre-improve/v*/REVIEW.md (or the path given by --review),
+# extracts each cue's audio span from <base>.<audio-ext>, plays it via ffplay,
+# prompts for a decision, and applies the chosen edit to both <base>.srt
+# (or <base>.diarized.srt) and <base>.txt in place. Per-cue decisions are
+# appended to pre-improve/v*/REVIEW.applied.log; unresolved cues remain in
+# REVIEW.md so the queue can be resumed later.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: lec-review <base> [options]
+
+Interactive TUI (default):
+  lec-review <base>                      Walk REVIEW.md, play+ask+apply per cue
+
+One-shot subcommands (for scripted/Claude-driven use):
+  lec-review <base> --list-json          Print cues as JSON array, exit
+  lec-review <base> --play <cue_id>      Play one cue's audio, exit
+  lec-review <base> --apply <cue_id> --decision <kind> [--text "..."]
+                                         Apply one decision, rewrite REVIEW.md
+
+  Decision kinds: accept | keep | inaudible | custom | pick
+    accept       Apply the cue's After verbatim
+    keep         Drop cue from queue, no text change
+    inaudible    Drop cue from queue, no text change, log as inaudible
+    custom       Requires --text "..."; splices typed text into Before
+    pick         Requires --text "..."; for caller-pre-spliced candidate text
+
+Options:
+  --review PATH   Explicit REVIEW.md (default: newest pre-improve/v*/REVIEW.md)
+  --pad N         Audio padding in seconds (default: 1.0)
+  --no-play       In TUI mode: don't auto-play clips
+  --no-open       In TUI mode: don't open <base>.txt at end of run
+  --dry-run       Print what would change; don't touch files
+  -h, --help      Show this help
+
+TUI keys: [a]ccept [k]eep [i]naudible "<text>" [r]eplay [s]kip [q]uit
+ESC stops playback, or cancels the current prompt.
+EOF
+}
+
+BASE=""
+REVIEW_PATH=""
+PAD="1.0"
+PLAY=true
+OPEN_AT_END=true
+DRY_RUN=false
+MODE="tui"            # tui | list-json | play | apply
+ONESHOT_CUE=""
+ONESHOT_DECISION=""
+ONESHOT_TEXT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --review)
+      [[ $# -lt 2 ]] && { echo "Error: --review requires a path" >&2; exit 1; }
+      REVIEW_PATH="$2"; shift 2 ;;
+    --pad)
+      [[ $# -lt 2 ]] && { echo "Error: --pad requires a number" >&2; exit 1; }
+      PAD="$2"; shift 2 ;;
+    --no-play) PLAY=false; shift ;;
+    --no-open) OPEN_AT_END=false; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --list-json) MODE="list-json"; shift ;;
+    --play)
+      [[ $# -lt 2 ]] && { echo "Error: --play requires a cue id" >&2; exit 1; }
+      MODE="play"; ONESHOT_CUE="$2"; shift 2 ;;
+    --apply)
+      [[ $# -lt 2 ]] && { echo "Error: --apply requires a cue id" >&2; exit 1; }
+      MODE="apply"; ONESHOT_CUE="$2"; shift 2 ;;
+    --decision)
+      [[ $# -lt 2 ]] && { echo "Error: --decision requires a kind" >&2; exit 1; }
+      ONESHOT_DECISION="$2"; shift 2 ;;
+    --text)
+      [[ $# -lt 2 ]] && { echo "Error: --text requires a string" >&2; exit 1; }
+      ONESHOT_TEXT="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "Error: unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *)
+      if [[ -z "$BASE" ]]; then BASE="$1"
+      else echo "Error: extra positional argument: $1" >&2; exit 1
+      fi
+      shift ;;
+  esac
+done
+
+[[ -z "$BASE" ]] && { echo "Error: <base> required" >&2; usage >&2; exit 1; }
+
+# ── Locate SRT, TXT, audio, REVIEW.md ──────────────────────────────────
+SRT=""
+if [[ -f "${BASE}.diarized.srt" ]]; then SRT="${BASE}.diarized.srt"
+elif [[ -f "${BASE}.srt" ]]; then SRT="${BASE}.srt"
+else echo "Error: no SRT for base '$BASE'" >&2; exit 1
+fi
+
+TXT="${BASE}.txt"
+[[ -f "$TXT" ]] || { echo "Error: no .txt for base '$BASE'" >&2; exit 1; }
+
+AUDIO=""
+for ext in flac wav opus m4a mp3 mp4 aac ogg oga webm weba aiff aif mka amr; do
+  if [[ -f "${BASE}.${ext}" ]]; then AUDIO="${BASE}.${ext}"; break; fi
+done
+[[ -z "$AUDIO" ]] && { echo "Error: no audio file for base '$BASE'" >&2; exit 1; }
+
+if [[ -z "$REVIEW_PATH" ]]; then
+  # Walk pre-improve/v*/REVIEW.md from newest to oldest; pick the first whose
+  # header mentions the current base (skill writes `# Review needed -- <base> vN`).
+  if compgen -G "pre-improve/v*/REVIEW.md" >/dev/null; then
+    while IFS= read -r candidate; do
+      if head -1 "$candidate" 2>/dev/null | grep -qF -- "$BASE"; then
+        REVIEW_PATH="$candidate"
+        break
+      fi
+    done < <(ls -1 pre-improve/v*/REVIEW.md 2>/dev/null | sort -V -r)
+  fi
+fi
+if [[ -z "$REVIEW_PATH" || ! -f "$REVIEW_PATH" ]]; then
+  # Non-tui modes: short-circuit
+  if [[ "$MODE" == "list-json" ]]; then echo "[]"; exit 0; fi
+  if [[ "$MODE" == "play" || "$MODE" == "apply" ]]; then
+    echo "Error: no open REVIEW.md for base '$BASE' (queue empty or not found)" >&2
+    exit 1
+  fi
+  # tui: friendly already-resolved path
+  for done_file in pre-improve/v*/REVIEW.done.md; do
+    [[ -f "$done_file" ]] || continue
+    dir=$(dirname "$done_file")
+    if [[ -f "$dir/${BASE}.srt" || -f "$dir/${BASE}.txt" ]]; then
+      log_file="$dir/REVIEW.applied.log"
+      n_log=0
+      [[ -f "$log_file" ]] && n_log=$(grep -c "^" "$log_file" 2>/dev/null || echo 0)
+      echo "✓ Already resolved — see $done_file"
+      echo "  $n_log decision(s) logged in $log_file"
+      echo "  Transcript:  ${BASE}.txt"
+      if $OPEN_AT_END && [[ -f "${BASE}.txt" ]] && command -v open >/dev/null; then
+        open "${BASE}.txt" || true
+      fi
+      exit 0
+    fi
+  done
+  echo "Error: no REVIEW.md for base '$BASE' found under pre-improve/v*/" >&2
+  exit 1
+fi
+
+# ── Dep checks ─────────────────────────────────────────────────────────
+command -v ffmpeg >/dev/null || { echo "Error: ffmpeg not found" >&2; exit 1; }
+$PLAY && ! command -v ffplay >/dev/null && {
+  echo "Warning: ffplay not found — switching to --no-play" >&2
+  PLAY=false
+}
+
+REVIEW_DIR=$(dirname "$REVIEW_PATH")
+APPLIED_LOG="$REVIEW_DIR/REVIEW.applied.log"
+SESSION_START=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+if [[ "$MODE" == "tui" ]]; then
+  echo "Review queue: $REVIEW_PATH"
+  echo "SRT:          $SRT"
+  echo "TXT:          $TXT"
+  echo "Audio:        $AUDIO"
+  echo "Log:          $APPLIED_LOG"
+  $DRY_RUN && echo "(dry-run — no files will be modified)"
+  echo ""
+fi
+
+# ── Parse REVIEW.md into a tab-separated cue table ─────────────────────
+# Each row: cue_id \t ts_start \t ts_end \t before_b64 \t after_b64 \t llm_conf \t reason_b64
+CUE_TABLE=$(python3 - "$REVIEW_PATH" <<'PYEOF'
+import sys, re, base64
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+# Split on "## Cue " headers; first chunk is preamble
+chunks = re.split(r"^##\s+Cue\s+", content, flags=re.MULTILINE)[1:]
+
+def b64(s):
+    return base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+for chunk in chunks:
+    # Timestamps may be HH:MM:SS,mmm  or  MM:SS.mmm  or  HH:MM:SS.mmm
+    ts_re = r"\d{1,2}(?::\d{2}){1,2}[\.,]\d{3}"
+    head_match = re.match(
+        r"(\d+)\s*(?:--|—|->|→)\s*(" + ts_re + r")\s*(?:--|—|->|→)\s*(" + ts_re + r")",
+        chunk)
+    if not head_match:
+        continue
+    cue_id = head_match.group(1)
+    ts_start = head_match.group(2)
+    ts_end = head_match.group(3)
+
+    before_m = re.search(r"\*\*Before\*\*:\s*\x60([^\x60]*)\x60", chunk)
+    after_m  = re.search(r"\*\*After\*\*:\s*\x60([^\x60]*)\x60", chunk)
+    conf_m   = re.search(r"\*\*LLM conf\*\*:\s*([0-9.]+)", chunk) or \
+               re.search(r"LLM conf\*\*:\s*([0-9.]+)", chunk)
+    reason_m = re.search(r"\*\*Reason\*\*:\s*(.+?)(?=\n\*\*|\n\x60\x60\x60|\Z)", chunk, re.DOTALL)
+
+    if not before_m or not after_m:
+        continue
+
+    before = before_m.group(1)
+    after = after_m.group(1)
+    conf = conf_m.group(1) if conf_m else ""
+    reason = reason_m.group(1).strip() if reason_m else ""
+
+    print("\t".join([cue_id, ts_start, ts_end, b64(before), b64(after), conf, b64(reason)]))
+PYEOF
+)
+
+if [[ -z "$CUE_TABLE" ]]; then
+  echo "No reviewable cues in $REVIEW_PATH" >&2
+  exit 0
+fi
+
+TOTAL=$(printf '%s\n' "$CUE_TABLE" | wc -l | tr -d ' ')
+if [[ "$MODE" == "tui" ]]; then
+  echo "Found $TOTAL cue(s) to review."
+  echo ""
+fi
+
+# ── Helpers ────────────────────────────────────────────────────────────
+
+# Splice a candidate replacement into a Before string by aligning shared
+# words via difflib.SequenceMatcher. The candidate fills the span between
+# its first and last alignment in Before; words outside that span stay.
+# Falls back to candidate verbatim when there is no word-level overlap.
+splice_into_before() {
+  python3 - "$1" "$2" <<'PYEOF'
+import sys, difflib
+before, picked = sys.argv[1], sys.argv[2]
+def norm(w): return w.lower().strip(".,;:'\"!?()")
+bw, pw = before.split(), picked.split()
+bw_n = [norm(w) for w in bw]
+pw_n = [norm(w) for w in pw]
+sm = difflib.SequenceMatcher(None, bw_n, pw_n, autojunk=False)
+blocks = [b for b in sm.get_matching_blocks() if b.size > 0]
+if blocks:
+    first, last = blocks[0], blocks[-1]
+    rendered = " ".join(bw[:first.a] + pw + bw[last.a + last.size:])
+else:
+    rendered = picked
+print(rendered)
+PYEOF
+}
+
+ts_to_sec() {
+  # Accept HH:MM:SS,mmm or HH:MM:SS.mmm or MM:SS.mmm
+  python3 - "$1" <<'PYEOF'
+import sys, re
+ts = sys.argv[1].replace(",", ".")
+parts = ts.split(":")
+if len(parts) == 2: h, m, rest = "0", parts[0], parts[1]
+elif len(parts) == 3: h, m, rest = parts
+else: sys.exit("bad ts: " + ts)
+print("%.3f" % (int(h)*3600 + int(m)*60 + float(rest)))
+PYEOF
+}
+
+extract_clip() {
+  local start="$1" end="$2" out="$3"
+  ffmpeg -hide_banner -loglevel error -y \
+    -ss "$start" -to "$end" -i "$AUDIO" \
+    -ac 1 -ar 22050 -c:a pcm_s16le "$out"
+}
+
+play_clip() {
+  local clip="$1"
+  # No stdin redirect: lets ffplay see ESC/q from terminal to abort early.
+  ffplay -nodisp -autoexit -loglevel quiet "$clip"
+}
+
+# True if `read -t` accepts a fractional timeout (bash 4+). bash 3.2 errors out.
+_READ_FRAC_TIMEOUT=false
+if read -t 0.01 _ </dev/null 2>/dev/null; then _READ_FRAC_TIMEOUT=true; fi
+
+# Reads input. Returns:
+#   REPLY=""         on Enter alone
+#   REPLY="__ESC__"  if first key is ESC (drains any sequel bytes)
+#   REPLY="<line>"   otherwise (first keypress + rest of line)
+read_response() {
+  local first rest
+  if ! IFS= read -rsn1 first; then REPLY=""; return 0; fi
+  if [[ "$first" == $'\x1b' ]]; then
+    # Drain any residual bytes from an escape sequence (arrow keys etc).
+    # Bash 3.2 doesn't accept fractional -t, so skip the drain there;
+    # a stray byte at the next prompt is annoying but rare.
+    if $_READ_FRAC_TIMEOUT; then
+      while IFS= read -rsn1 -t 0.01 _; do :; done
+    fi
+    echo ""
+    REPLY="__ESC__"; return 0
+  fi
+  if [[ -z "$first" ]]; then echo ""; REPLY=""; return 0; fi
+  printf '%s' "$first"
+  if ! IFS= read -r rest; then rest=""; fi
+  REPLY="${first}${rest}"
+}
+
+# Apply edit. Args: cue_id, before_text, after_text. Returns 0 on success,
+# 1 on no-match, 2 on multi-match (ambiguous).
+apply_edit() {
+  local cue_id="$1" before="$2" after="$3"
+  python3 - "$SRT" "$TXT" "$cue_id" "$before" "$after" "$DRY_RUN" <<'PYEOF'
+import sys, re, os, tempfile
+srt_path, txt_path, cue_id_s, before, after, dry_s = sys.argv[1:7]
+cue_id = int(cue_id_s)
+dry = dry_s == "true"
+
+# Strip cross-cue annotations like "[cue 166]" and " / " cue-break markers
+def strip_markers(s):
+    s = re.sub(r"\s*\[cue\s+\d+\]\s*", " ", s)
+    s = re.sub(r"\s+/\s+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+needle_raw = strip_markers(before)
+replacement = strip_markers(after)
+
+def normspace(s):
+    return re.sub(r"\s+", " ", s).strip()
+
+def edit_srt(path):
+    with open(path) as f:
+        text = f.read()
+    blocks = re.split(r"(\n\s*\n)", text)  # keep separators
+    out = []
+    edited = False
+    i = 0
+    while i < len(blocks):
+        blk = blocks[i]
+        lines = blk.splitlines()
+        # First line is cue id (if numeric)
+        if lines and lines[0].strip().isdigit() and int(lines[0].strip()) == cue_id:
+            body_lines = lines[2:] if len(lines) > 2 else []
+            body = "\n".join(body_lines)
+            # Try literal then whitespace-normalized
+            if needle_raw in body:
+                new_body = body.replace(needle_raw, replacement, 1)
+                edited = True
+            else:
+                body_norm = normspace(body)
+                needle_norm = normspace(needle_raw)
+                if needle_norm in body_norm:
+                    # Replace via normalized intermediate: rebuild body with single-space match
+                    idx = body_norm.find(needle_norm)
+                    # Map back: easiest is to replace on normalized body and re-flow as single line
+                    new_norm = body_norm[:idx] + replacement + body_norm[idx+len(needle_norm):]
+                    new_body = new_norm
+                    edited = True
+                else:
+                    new_body = body
+            lines = lines[:2] + new_body.splitlines() if new_body else lines[:2]
+            blk = "\n".join(lines)
+        out.append(blk)
+        i += 1
+    new_text = "".join(out)
+    return new_text, edited
+
+def edit_txt(path):
+    with open(path) as f:
+        text = f.read()
+    # Whitespace-normalized search across whole file
+    norm_text = normspace(text)
+    norm_needle = normspace(needle_raw)
+    count = norm_text.count(norm_needle)
+    if count == 0:
+        return text, 0
+    if count > 1:
+        return text, count
+    # Find original-position match: walk char by char with a normalized window
+    # Simpler: replace on normalized, then preserve the rest by splitting once on needle in norm
+    idx = norm_text.find(norm_needle)
+    # Build new normalized text and re-flow. We lose original line breaks inside the matched
+    # segment, but preserve everything outside it.
+    # To preserve outside whitespace exactly: find span in original by walking pointers.
+    op = 0  # original pointer
+    np = 0  # normalized pointer
+    span_start_op = None
+    span_end_op = None
+    while np < idx and op < len(text):
+        if text[op].isspace():
+            # consume run of whitespace -> single space in norm
+            while op < len(text) and text[op].isspace():
+                op += 1
+            # corresponds to one char in norm (unless leading/trailing — but idx is within so fine)
+            np += 1
+        else:
+            op += 1; np += 1
+    span_start_op = op
+    # advance through the needle
+    consumed = 0
+    while consumed < len(norm_needle) and op < len(text):
+        if text[op].isspace():
+            while op < len(text) and text[op].isspace():
+                op += 1
+            consumed += 1
+        else:
+            op += 1; consumed += 1
+    span_end_op = op
+    new_text = text[:span_start_op] + replacement + text[span_end_op:]
+    return new_text, 1
+
+srt_new, srt_edited = edit_srt(srt_path)
+txt_new, txt_count = edit_txt(txt_path)
+
+result_lines = []
+if srt_edited:
+    result_lines.append("srt:ok")
+else:
+    result_lines.append("srt:miss")
+if txt_count == 1:
+    result_lines.append("txt:ok")
+elif txt_count == 0:
+    result_lines.append("txt:miss")
+else:
+    result_lines.append("txt:ambiguous(%d)" % txt_count)
+
+# Write whichever sides matched (so .txt edits land even when .srt body
+# spans multiple cues and can't be found inside one block).
+def atomic_write(path, content):
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".lec-review.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
+if not dry:
+    if srt_edited:
+        atomic_write(srt_path, srt_new)
+    if txt_count == 1:
+        atomic_write(txt_path, txt_new)
+
+# Success = at least the .txt landed (canonical reading surface).
+# .srt-only is also OK (rare). Both-miss is failure.
+some_ok = srt_edited or (txt_count == 1)
+print(" ".join(result_lines))
+sys.exit(0 if some_ok else 1)
+PYEOF
+}
+
+log_decision() {
+  local cue_id="$1" action="$2" detail="$3"
+  local stamp
+  stamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  printf '%s\tcue=%s\taction=%s\t%s\n' "$stamp" "$cue_id" "$action" "$detail" >>"$APPLIED_LOG"
+}
+
+# Rewrite REVIEW.md to drop a comma-separated list of resolved cue ids.
+# Renames to REVIEW.done.md when the queue is empty. Prints a one-line status.
+rewrite_review_md() {
+  local resolved_list="$1"
+  [[ -z "$resolved_list" ]] && return 0
+  python3 - "$REVIEW_PATH" "$resolved_list" <<'PYEOF'
+import sys, re, os
+path, resolved_s = sys.argv[1], sys.argv[2]
+resolved = set(int(x) for x in resolved_s.split(",") if x)
+
+with open(path) as f:
+    content = f.read()
+
+parts = re.split(r"(^##\s+Cue\s+)", content, flags=re.MULTILINE)
+out = [parts[0]]
+i = 1
+while i < len(parts):
+    hdr = parts[i]
+    body = parts[i+1] if i+1 < len(parts) else ""
+    m = re.match(r"(\d+)", body)
+    if m and int(m.group(1)) in resolved:
+        i += 2
+        continue
+    out.append(hdr)
+    out.append(body)
+    i += 2
+
+new_content = "".join(out).rstrip() + "\n"
+remaining = sum(1 for _ in re.finditer(r"^##\s+Cue\s+\d+", new_content, re.MULTILINE))
+if remaining == 0:
+    done_path = os.path.join(os.path.dirname(path), "REVIEW.done.md")
+    os.replace(path, done_path)
+    with open(done_path, "w") as f:
+        f.write("# Review queue — all resolved\n\nSee REVIEW.applied.log for per-cue decisions.\n")
+    print("All cues resolved — REVIEW.md → REVIEW.done.md")
+else:
+    with open(path, "w") as f:
+        f.write(new_content)
+    print("Rewrote REVIEW.md — %d cue(s) remaining" % remaining)
+PYEOF
+}
+
+# ── One-shot subcommands (--list-json / --play / --apply) ──────────────
+# Look up one row in CUE_TABLE by id; sets BEFORE/AFTER/TS_START/TS_END/LLM_CONF/REASON/CANDIDATES.
+oneshot_lookup() {
+  local want="$1" row
+  row=$(printf '%s\n' "$CUE_TABLE" | awk -F'\t' -v id="$want" '$1==id {print; exit}')
+  [[ -z "$row" ]] && { echo "Error: cue $want not in current REVIEW.md" >&2; return 1; }
+  IFS=$'\t' read -r CUE_ID TS_START TS_END BEFORE_B64 AFTER_B64 LLM_CONF REASON_B64 <<<"$row"
+  BEFORE=$(printf '%s' "$BEFORE_B64" | base64 -d)
+  AFTER=$(printf '%s' "$AFTER_B64" | base64 -d)
+  REASON=$(printf '%s' "$REASON_B64" | base64 -d)
+  return 0
+}
+
+case "$MODE" in
+  list-json)
+    python3 - "$REVIEW_PATH" <<'PYEOF'
+import sys, re, json
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+chunks = re.split(r"^##\s+Cue\s+", content, flags=re.MULTILINE)[1:]
+ts_re = r"\d{1,2}(?::\d{2}){1,2}[\.,]\d{3}"
+out = []
+for chunk in chunks:
+    head = re.match(
+        r"(\d+)\s*(?:--|—|->|→)\s*(" + ts_re + r")\s*(?:--|—|->|→)\s*(" + ts_re + r")",
+        chunk)
+    if not head: continue
+    bef = re.search(r"\*\*Before\*\*:\s*\x60([^\x60]*)\x60", chunk)
+    aft = re.search(r"\*\*After\*\*:\s*\x60([^\x60]*)\x60", chunk)
+    if not bef or not aft: continue
+    conf = re.search(r"\*\*LLM conf\*\*:\s*([0-9.]+)", chunk)
+    reason = re.search(r"\*\*Reason\*\*:\s*(.+?)(?=\n\*\*|\n\x60\x60\x60|\Z)", chunk, re.DOTALL)
+    after_text = aft.group(1)
+    cands = []
+    if "(unclear:" in after_text:
+        inner = re.search(r"\(unclear:\s*(.+?)\)\s*$", after_text)
+        if inner:
+            for raw in inner.group(1).split("/"):
+                c = raw.strip()
+                c = re.sub(r"^(possibly|maybe)\s+", "", c, flags=re.I)
+                c = c.strip("'\"")
+                if c: cands.append(c)
+    out.append({
+        "id": int(head.group(1)),
+        "start": head.group(2),
+        "end": head.group(3),
+        "before": bef.group(1),
+        "after": after_text,
+        "llm_conf": float(conf.group(1)) if conf else None,
+        "reason": reason.group(1).strip() if reason else "",
+        "candidates": cands,
+    })
+print(json.dumps(out, ensure_ascii=False))
+PYEOF
+    exit 0
+    ;;
+  play)
+    if ! oneshot_lookup "$ONESHOT_CUE"; then exit 1; fi
+    START_S=$(ts_to_sec "$TS_START")
+    END_S=$(ts_to_sec "$TS_END")
+    PAD_START=$(awk -v s="$START_S" -v p="$PAD" 'BEGIN{v=s-p; if(v<0)v=0; printf "%.3f",v}')
+    PAD_END=$(awk -v e="$END_S" -v p="$PAD" 'BEGIN{printf "%.3f",e+p}')
+    TMPDIR=$(mktemp -d)
+    trap "rm -rf '$TMPDIR'" EXIT
+    CLIP="$TMPDIR/cue_${CUE_ID}.wav"
+    if ! extract_clip "$PAD_START" "$PAD_END" "$CLIP" 2>/dev/null; then
+      echo "Error: ffmpeg failed to extract cue $CUE_ID audio" >&2
+      exit 1
+    fi
+    if ! command -v ffplay >/dev/null; then
+      echo "Error: ffplay not found" >&2; exit 1
+    fi
+    play_clip "$CLIP" || true
+    exit 0
+    ;;
+  apply)
+    if ! oneshot_lookup "$ONESHOT_CUE"; then exit 1; fi
+    case "$ONESHOT_DECISION" in
+      accept)
+        RESULT=$(apply_edit "$CUE_ID" "$BEFORE" "$AFTER") || RC=$?
+        RC=${RC:-0}
+        if [[ $RC -eq 0 ]]; then
+          log_decision "$CUE_ID" "accept" "$RESULT"
+          rewrite_review_md "$CUE_ID"
+          echo "applied accept cue=$CUE_ID $RESULT"
+          exit 0
+        else
+          log_decision "$CUE_ID" "accept-failed" "$RESULT"
+          echo "Error: could not apply accept on cue $CUE_ID ($RESULT)" >&2
+          exit 1
+        fi
+        ;;
+      keep)
+        log_decision "$CUE_ID" "keep" ""
+        rewrite_review_md "$CUE_ID"
+        echo "kept cue=$CUE_ID"
+        exit 0
+        ;;
+      inaudible)
+        log_decision "$CUE_ID" "inaudible" ""
+        rewrite_review_md "$CUE_ID"
+        echo "inaudible cue=$CUE_ID"
+        exit 0
+        ;;
+      custom)
+        [[ -z "$ONESHOT_TEXT" ]] && { echo "Error: --decision custom requires --text" >&2; exit 1; }
+        FINAL=$(splice_into_before "$BEFORE" "$ONESHOT_TEXT")
+        RESULT=$(apply_edit "$CUE_ID" "$BEFORE" "$FINAL") || RC=$?
+        RC=${RC:-0}
+        if [[ $RC -eq 0 ]]; then
+          log_decision "$CUE_ID" "custom" "$RESULT|text=$(printf '%s' "$FINAL" | tr '\t\n' '  ')"
+          rewrite_review_md "$CUE_ID"
+          echo "applied custom cue=$CUE_ID text=\"$FINAL\" $RESULT"
+          exit 0
+        else
+          log_decision "$CUE_ID" "custom-failed" "$RESULT"
+          echo "Error: could not apply custom on cue $CUE_ID ($RESULT)" >&2
+          exit 1
+        fi
+        ;;
+      pick)
+        [[ -z "$ONESHOT_TEXT" ]] && { echo "Error: --decision pick requires --text (the final spliced replacement)" >&2; exit 1; }
+        FINAL="$ONESHOT_TEXT"
+        RESULT=$(apply_edit "$CUE_ID" "$BEFORE" "$FINAL") || RC=$?
+        RC=${RC:-0}
+        if [[ $RC -eq 0 ]]; then
+          log_decision "$CUE_ID" "pick" "$RESULT|text=$(printf '%s' "$FINAL" | tr '\t\n' '  ')"
+          rewrite_review_md "$CUE_ID"
+          echo "applied pick cue=$CUE_ID text=\"$FINAL\" $RESULT"
+          exit 0
+        else
+          log_decision "$CUE_ID" "pick-failed" "$RESULT"
+          echo "Error: could not apply pick on cue $CUE_ID ($RESULT)" >&2
+          exit 1
+        fi
+        ;;
+      *)
+        echo "Error: --decision must be one of: accept | keep | inaudible | custom | pick" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+esac
+
+# Track which cue ids were resolved (any action other than skip/quit)
+declare -a RESOLVED=()
+
+# ── Main loop ──────────────────────────────────────────────────────────
+TMPDIR=$(mktemp -d)
+trap "rm -rf '$TMPDIR'" EXIT
+
+IDX=0
+QUIT=false
+while IFS=$'\t' read -r CUE_ID TS_START TS_END BEFORE_B64 AFTER_B64 LLM_CONF REASON_B64 <&3; do
+  IDX=$((IDX+1))
+  $QUIT && break
+
+  BEFORE=$(printf '%s' "$BEFORE_B64" | base64 -d)
+  AFTER=$(printf '%s' "$AFTER_B64" | base64 -d)
+  REASON=$(printf '%s' "$REASON_B64" | base64 -d)
+
+  START_S=$(ts_to_sec "$TS_START")
+  END_S=$(ts_to_sec "$TS_END")
+  PAD_START=$(awk -v s="$START_S" -v p="$PAD" 'BEGIN{v=s-p; if(v<0)v=0; printf "%.3f",v}')
+  PAD_END=$(awk -v e="$END_S" -v p="$PAD" 'BEGIN{printf "%.3f",e+p}')
+
+  echo ""
+  echo "──────────────────────────────────────────────────────────────────"
+  printf "Cue %s (%d/%d)  %s → %s" "$CUE_ID" "$IDX" "$TOTAL" "$TS_START" "$TS_END"
+  [[ -n "$LLM_CONF" ]] && printf "  LLM %s" "$LLM_CONF"
+  echo ""
+  printf "  before: %s\n" "$BEFORE"
+  printf "  after:  %s\n" "$AFTER"
+  if [[ -n "$REASON" ]]; then
+    printf "  reason: %s\n" "$(printf '%s' "$REASON" | tr '\n' ' ' | sed 's/  */ /g')"
+  fi
+
+  CLIP="$TMPDIR/cue_${CUE_ID}.wav"
+  if ! extract_clip "$PAD_START" "$PAD_END" "$CLIP" 2>/dev/null; then
+    echo "  (audio extraction failed — skipping playback)"
+    PLAY_THIS=false
+  else
+    PLAY_THIS=$PLAY
+  fi
+
+  if $PLAY_THIS; then
+    echo "  ▶ playing ${PAD_START}s → ${PAD_END}s ..."
+    play_clip "$CLIP" || true
+  fi
+
+  # Parse "(unclear: 'A' / 'B' / 'C')" alternatives into numbered options.
+  CANDIDATES=()
+  if [[ "$AFTER" == *"(unclear:"* ]]; then
+    INNER=$(printf '%s' "$AFTER" | sed -n "s/.*(unclear:[[:space:]]*\(.*\)).*/\1/p")
+    if [[ -n "$INNER" ]]; then
+      OLD_IFS="$IFS"
+      IFS='/' read -ra RAW_CANDS <<<"$INNER"
+      IFS="$OLD_IFS"
+      for raw in "${RAW_CANDS[@]}"; do
+        # Strip leading/trailing whitespace + surrounding quotes
+        cleaned=$(printf '%s' "$raw" | sed -E "s/^[[:space:]]*//; s/[[:space:]]*$//; s/^(possibly[[:space:]]+)//; s/^['\"]//; s/['\"]$//")
+        [[ -n "$cleaned" ]] && CANDIDATES+=("$cleaned")
+      done
+    fi
+  fi
+
+  if (( ${#CANDIDATES[@]} > 0 )); then
+    DEFAULT_KEY=""
+    echo "  candidates:"
+    for i in "${!CANDIDATES[@]}"; do
+      printf "    [%d] %s\n" $((i+1)) "${CANDIDATES[$i]}"
+    done
+  else
+    DEFAULT_KEY="a"
+  fi
+
+  while true; do
+    if (( ${#CANDIDATES[@]} > 0 )); then
+      printf '  [1-%d] pick / [k]eep / [i]naudible / "<text>" / [r]eplay / [s]kip / [q]uit> ' "${#CANDIDATES[@]}"
+    else
+      printf '  [a]ccept / [k]eep / [i]naudible / "<text>" / [r]eplay / [s]kip / [q]uit (default %s)> ' "$DEFAULT_KEY"
+    fi
+    read_response; LINE="$REPLY"
+    if [[ "$LINE" == "__ESC__" ]]; then echo "  (cancelled)"; continue
+    elif [[ -z "$LINE" ]]; then KEY="$DEFAULT_KEY"
+    elif [[ ${#LINE} -eq 1 ]]; then KEY="$LINE"
+    else KEY="__CUSTOM__"
+    fi
+    [[ -z "$KEY" ]] && continue
+    case "$KEY" in
+      [1-9])
+        IDX_PICK=$((KEY - 1))
+        if (( IDX_PICK >= ${#CANDIDATES[@]} )); then
+          echo "  ? no candidate $KEY"
+          continue
+        fi
+        PICKED="${CANDIDATES[$IDX_PICK]}"
+        RENDERED=$(splice_into_before "$BEFORE" "$PICKED")
+        echo "  → would apply: $RENDERED"
+        printf "  Enter=apply / type to edit / ESC or q=cancel> "
+        read_response; EDIT_LINE="$REPLY"
+        case "$EDIT_LINE" in
+          __ESC__|q|Q) echo "  (cancelled)"; continue ;;
+          "")          FINAL="$RENDERED" ;;
+          *)           FINAL="$EDIT_LINE" ;;
+        esac
+        RESULT=$(apply_edit "$CUE_ID" "$BEFORE" "$FINAL") || RC=$?
+        RC=${RC:-0}
+        if [[ $RC -eq 0 ]]; then
+          echo "  ✓ applied candidate $KEY ($RESULT)"
+          log_decision "$CUE_ID" "pick$KEY" "$RESULT|text=$(printf '%s' "$FINAL" | tr '\t\n' '  ')"
+          RESOLVED+=("$CUE_ID")
+        else
+          echo "  ✗ could not apply ($RESULT) — leaving cue in queue"
+          log_decision "$CUE_ID" "pick$KEY-failed" "$RESULT"
+        fi
+        unset RC
+        break ;;
+      a|A)
+        RESULT=$(apply_edit "$CUE_ID" "$BEFORE" "$AFTER") || RC=$?
+        RC=${RC:-0}
+        if [[ $RC -eq 0 ]]; then
+          echo "  ✓ applied ($RESULT)"
+          log_decision "$CUE_ID" "accept" "$RESULT"
+          RESOLVED+=("$CUE_ID")
+        else
+          echo "  ✗ could not apply ($RESULT) — leaving cue in queue"
+          log_decision "$CUE_ID" "accept-failed" "$RESULT"
+        fi
+        unset RC
+        break ;;
+      k|K)
+        echo "  ✓ kept original"
+        log_decision "$CUE_ID" "keep" ""
+        RESOLVED+=("$CUE_ID")
+        break ;;
+      i|I)
+        echo "  → marked inaudible (dropped from queue, original text untouched)"
+        log_decision "$CUE_ID" "inaudible" ""
+        RESOLVED+=("$CUE_ID")
+        break ;;
+      __CUSTOM__)
+        # Strip a single pair of surrounding quotes if present
+        CUSTOM="$LINE"
+        if [[ "$CUSTOM" == \"*\" || "$CUSTOM" == \'*\' ]]; then
+          CUSTOM="${CUSTOM:1:${#CUSTOM}-2}"
+        fi
+        # Splice typed text into Before so short replacements preserve
+        # the surrounding context they share words with.
+        RENDERED=$(splice_into_before "$BEFORE" "$CUSTOM")
+        if [[ "$RENDERED" != "$CUSTOM" ]]; then
+          echo "  → would apply (spliced): $RENDERED"
+          printf "  Enter=apply / v=verbatim / type to edit / ESC or q=cancel> "
+          read_response; EDIT_LINE="$REPLY"
+          case "$EDIT_LINE" in
+            __ESC__|q|Q) echo "  (cancelled)"; continue ;;
+            v|V)         FINAL="$CUSTOM" ;;
+            "")          FINAL="$RENDERED" ;;
+            *)           FINAL="$EDIT_LINE" ;;
+          esac
+        else
+          FINAL="$CUSTOM"
+        fi
+        RESULT=$(apply_edit "$CUE_ID" "$BEFORE" "$FINAL") || RC=$?
+        RC=${RC:-0}
+        if [[ $RC -eq 0 ]]; then
+          echo "  ✓ applied custom ($RESULT)"
+          log_decision "$CUE_ID" "custom" "$RESULT|text=$(printf '%s' "$FINAL" | tr '\t\n' '  ')"
+          RESOLVED+=("$CUE_ID")
+        else
+          echo "  ✗ could not apply ($RESULT)"
+          log_decision "$CUE_ID" "custom-failed" "$RESULT"
+        fi
+        unset RC
+        break ;;
+      r|R)
+        if [[ -f "$CLIP" ]]; then play_clip "$CLIP" || true
+        else echo "  (no clip available)"
+        fi
+        continue ;;
+      s|S)
+        echo "  → skipped (stays in queue)"
+        log_decision "$CUE_ID" "skip" ""
+        break ;;
+      q|Q)
+        echo "  → quit"
+        QUIT=true
+        break ;;
+      "")
+        continue ;;
+      *)
+        echo "  ? unknown key '$KEY'"
+        continue ;;
+    esac
+  done
+
+done 3<<<"$CUE_TABLE"
+
+# ── Rewrite REVIEW.md to drop resolved cues ────────────────────────────
+if [[ ${#RESOLVED[@]} -gt 0 ]] && ! $DRY_RUN; then
+  RESOLVED_LIST=$(IFS=,; echo "${RESOLVED[*]}")
+  rewrite_review_md "$RESOLVED_LIST"
+fi
+
+echo ""
+echo "Done. Resolved ${#RESOLVED[@]}/$TOTAL cue(s)."
+
+# ── Session summary (this run only) ────────────────────────────────────
+if [[ -f "$APPLIED_LOG" ]]; then
+  SUMMARY=$(awk -v since="$SESSION_START" -F'\t' '
+    $1 >= since {
+      match($0, /action=[^\t]+/)
+      if (RSTART > 0) {
+        a = substr($0, RSTART+7, RLENGTH-7)
+        counts[a]++
+        total++
+      }
+    }
+    END {
+      if (total == 0) exit 0
+      order[1]="accept"; order[2]="custom"; order[3]="pick1"; order[4]="pick2"
+      order[5]="pick3"; order[6]="keep"; order[7]="inaudible"; order[8]="skip"
+      out = ""
+      for (i=1; i<=8; i++) {
+        a = order[i]
+        if (counts[a]) {
+          if (out != "") out = out " / "
+          out = out counts[a] " " a
+          counts[a] = 0
+        }
+      }
+      for (a in counts) {
+        if (counts[a]) {
+          if (out != "") out = out " / "
+          out = out counts[a] " " a
+        }
+      }
+      print "This run: " out
+    }
+  ' "$APPLIED_LOG")
+  [[ -n "$SUMMARY" ]] && echo "$SUMMARY"
+  echo "Audit: $APPLIED_LOG"
+fi
+
+# ── What next ──────────────────────────────────────────────────────────
+echo ""
+if [[ -f "$REVIEW_DIR/REVIEW.done.md" && ! -f "$REVIEW_PATH" ]]; then
+  cat <<EOF
+✓ All cues resolved (REVIEW.md → REVIEW.done.md).
+
+Next steps:
+  - Read the final transcript:   open "${BASE}.txt"
+  - Import into Obsidian vault:  /schematic-notes  (or /obsidian-markdown)
+  - Rollback to pre-review:      cp "$REVIEW_DIR/${BASE}.srt" "$REVIEW_DIR/${BASE}.txt" .
+EOF
+  if $OPEN_AT_END && command -v open >/dev/null && [[ -f "${BASE}.txt" ]]; then
+    open "${BASE}.txt" || true
+  fi
+elif [[ -f "$REVIEW_PATH" ]]; then
+  REMAINING=$(grep -c "^## Cue" "$REVIEW_PATH" 2>/dev/null || echo 0)
+  cat <<EOF
+$REMAINING cue(s) remain in $REVIEW_PATH.
+Resume:  lec-review "$BASE"
+EOF
+fi

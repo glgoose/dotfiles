@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# lec-verify-cue — second-opinion ASR on one cue from a lecture transcript.
+# Usage: lec-verify-cue <base> <cue_id> [--pad SECONDS] [--play]
+#
+# Extracts the audio span for the named cue from <base>.{flac,wav,opus,m4a,...}
+# (with ±pad padding, default 1.0s), runs mlx-whisper with the non-quantized
+# whisper-large-v3 model, and prints original cue text + (if present) the
+# improve-transcript proposed correction + the second-opinion transcription.
+# --play prints an ffplay one-liner so the user can listen manually.
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage: lec-verify-cue <base> <cue_id> [--pad SECONDS] [--play]
+
+Arguments:
+  <base>      Transcript base name (matches <base>.srt and <base>.<audio-ext>)
+  <cue_id>    SRT cue number (1-indexed)
+
+Options:
+  --pad N     Audio padding in seconds (default: 1.0)
+  --play      Print an ffplay command to listen manually
+  -h, --help  Show this help
+EOF
+}
+
+BASE=""
+CUE_ID=""
+PAD="1.0"
+PLAY=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pad)
+      [[ $# -lt 2 ]] && { echo "Error: --pad requires a number"; exit 1; }
+      PAD="$2"; shift 2 ;;
+    --play)
+      PLAY=true; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    -*)
+      echo "Error: unknown option: $1"; usage; exit 1 ;;
+    *)
+      if [[ -z "$BASE" ]]; then BASE="$1"
+      elif [[ -z "$CUE_ID" ]]; then CUE_ID="$1"
+      else echo "Error: extra positional argument: $1"; exit 1
+      fi
+      shift ;;
+  esac
+done
+
+if [[ -z "$BASE" || -z "$CUE_ID" ]]; then
+  echo "Error: <base> and <cue_id> required"
+  usage
+  exit 1
+fi
+
+if ! [[ "$CUE_ID" =~ ^[0-9]+$ ]]; then
+  echo "Error: cue_id must be a positive integer, got: $CUE_ID"
+  exit 1
+fi
+
+# ── Locate SRT ─────────────────────────────────────────────────────────
+SRT=""
+if [[ -f "${BASE}.diarized.srt" ]]; then SRT="${BASE}.diarized.srt"
+elif [[ -f "${BASE}.srt" ]]; then SRT="${BASE}.srt"
+else
+  echo "Error: no SRT found for base: $BASE (looked for ${BASE}.srt, ${BASE}.diarized.srt)"
+  exit 1
+fi
+
+# ── Locate audio ───────────────────────────────────────────────────────
+AUDIO=""
+for ext in flac wav opus m4a mp3 mp4 aac ogg oga webm weba aiff aif mka amr; do
+  if [[ -f "${BASE}.${ext}" ]]; then AUDIO="${BASE}.${ext}"; break; fi
+done
+if [[ -z "$AUDIO" ]]; then
+  echo "Error: no audio file found for base: $BASE"
+  exit 1
+fi
+
+# ── Dependency checks ──────────────────────────────────────────────────
+if ! command -v ffmpeg &>/dev/null; then
+  echo "Error: ffmpeg not found"; exit 1
+fi
+if ! command -v uv &>/dev/null; then
+  echo "Error: uv not found (needed for uvx mlx_whisper)"; exit 1
+fi
+
+# ── Extract cue timestamps + text ──────────────────────────────────────
+EXTRACT_OUT=$(python3 - "$SRT" "$CUE_ID" "$PAD" <<'PYEOF'
+import sys, re
+srt_path, cue_id_s, pad_s = sys.argv[1], sys.argv[2], sys.argv[3]
+cue_id = int(cue_id_s)
+pad = float(pad_s)
+
+def ts_to_sec(ts):
+    h, m, rest = ts.split(":")
+    s, ms = rest.split(",")
+    return int(h)*3600 + int(m)*60 + int(s) + int(ms)/1000.0
+
+with open(srt_path) as f:
+    blocks = re.split(r"\n\s*\n", f.read().strip())
+
+found = None
+for blk in blocks:
+    lines = blk.strip().splitlines()
+    if not lines: continue
+    try:
+        idx = int(lines[0].strip())
+    except ValueError:
+        continue
+    if idx != cue_id: continue
+    if len(lines) < 2: continue
+    m = re.match(r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})", lines[1])
+    if not m:
+        sys.exit("Error: malformed timestamp line in cue %d" % cue_id)
+    start = ts_to_sec(m.group(1))
+    end = ts_to_sec(m.group(2))
+    text = "\n".join(lines[2:]).strip()
+    found = (start, end, text)
+    break
+
+if not found:
+    sys.exit("Error: cue id %d not found in %s" % (cue_id, srt_path))
+
+start, end, text = found
+ext_start = max(0.0, start - pad)
+ext_end = end + pad
+print("START=%.3f" % ext_start)
+print("END=%.3f" % ext_end)
+print("ORIG_START=%.3f" % start)
+print("ORIG_END=%.3f" % end)
+# Preserve newlines/spaces in text via base64 to avoid shell quoting hell
+import base64
+print("TEXT_B64=%s" % base64.b64encode(text.encode("utf-8")).decode("ascii"))
+PYEOF
+)
+
+eval "$EXTRACT_OUT"
+ORIG_TEXT=$(printf '%s' "$TEXT_B64" | base64 -d)
+
+# ── Look up proposed correction from latest REVIEW.md (best-effort) ────
+PROPOSED=""
+LATEST_REVIEW=""
+if compgen -G "pre-improve/v*/REVIEW.md" >/dev/null; then
+  LATEST_REVIEW=$(ls -1 pre-improve/v*/REVIEW.md 2>/dev/null | sort -V | tail -1)
+fi
+BEFORE_B64=""
+AFTER_B64=""
+if [[ -n "$LATEST_REVIEW" ]]; then
+  PROPOSED=$(python3 - "$LATEST_REVIEW" "$CUE_ID" <<'PYEOF'
+import sys, re, base64
+path, cue_id = sys.argv[1], int(sys.argv[2])
+with open(path) as f:
+    content = f.read()
+matches = re.findall(
+    r"^##\s+Cue\s+%d\b.*?\*\*Before\*\*:\s*`([^`]*)`.*?\*\*After\*\*:\s*`([^`]*)`" % cue_id,
+    content, re.DOTALL | re.MULTILINE)
+if matches:
+    befores = "\n".join(m[0] for m in matches)
+    afters = "\n".join(m[1] for m in matches)
+    print("BEFORE_B64=%s" % base64.b64encode(befores.encode("utf-8")).decode("ascii"))
+    print("AFTER_B64=%s" % base64.b64encode(afters.encode("utf-8")).decode("ascii"))
+PYEOF
+)
+  eval "$PROPOSED"
+fi
+
+# ── Extract audio span ─────────────────────────────────────────────────
+TMPDIR=$(mktemp -d)
+trap "rm -rf '$TMPDIR'" EXIT
+CLIP="$TMPDIR/verify_${CUE_ID}.wav"
+
+ffmpeg -hide_banner -loglevel error -y \
+  -ss "$START" -to "$END" -i "$AUDIO" \
+  -ac 1 -ar 16000 -c:a pcm_s16le "$CLIP"
+
+if [[ ! -f "$CLIP" ]]; then
+  echo "Error: ffmpeg failed to extract span ${START}s..${END}s from $AUDIO"
+  exit 1
+fi
+
+# ── Run second-opinion ASR (non-quantized whisper-large-v3) ────────────
+MLX_MODEL_VERIFY="mlx-community/whisper-large-v3-mlx"
+VERIFY_OUT="$TMPDIR/verify_${CUE_ID}"
+
+# Detect lecture language from existing transcript if possible — fall back to English
+LANG_CODE="en"
+if [[ -f "${BASE}.txt" ]]; then
+  # very rough hint: if first 200 chars contain common dutch tokens
+  if head -c 200 "${BASE}.txt" | grep -qiE '\b(het|een|niet|maar|omdat|zijn|hebben)\b'; then
+    LANG_CODE="nl"
+  fi
+fi
+
+uvx --from mlx-whisper mlx_whisper "$CLIP" \
+  --model "$MLX_MODEL_VERIFY" \
+  --language "$LANG_CODE" \
+  --output-format txt \
+  --output-name "verify_${CUE_ID}" \
+  --output-dir "$TMPDIR" \
+  --condition-on-previous-text False \
+  --verbose False \
+  >"$TMPDIR/mlx.log" 2>&1 || {
+    echo "Error: mlx_whisper failed on extracted clip — log:"
+    cat "$TMPDIR/mlx.log" >&2
+    exit 1
+  }
+
+VERIFY_TEXT=$(tr -s '[:space:]' ' ' < "${VERIFY_OUT}.txt" | sed 's/^ //;s/ $//')
+
+# ── Report ─────────────────────────────────────────────────────────────
+echo ""
+echo "── Verify cue $CUE_ID — $BASE ──────────────────────────────────────"
+printf "  %-22s %s\n" "Audio:" "$AUDIO"
+printf "  %-22s %.3fs → %.3fs (cue %.3fs..%.3fs + pad ${PAD}s)\n" "Span:" "$START" "$END" "$ORIG_START" "$ORIG_END"
+printf "  %-22s %s\n" "Verify model:" "$MLX_MODEL_VERIFY"
+echo ""
+printf "  Original (turbo-4bit):\n    %s\n" "$ORIG_TEXT"
+if [[ -n "$BEFORE_B64" ]]; then
+  BEFORE=$(printf '%s' "$BEFORE_B64" | base64 -d)
+  AFTER=$(printf '%s' "$AFTER_B64" | base64 -d)
+  echo ""
+  printf "  Skill proposed change (from %s):\n" "$LATEST_REVIEW"
+  printf "    before: %s\n" "$BEFORE"
+  printf "    after:  %s\n" "$AFTER"
+else
+  echo ""
+  echo "  Skill proposed: (no entry for cue $CUE_ID in latest REVIEW.md)"
+fi
+echo ""
+printf "  Verify (large-v3):\n    %s\n" "$VERIFY_TEXT"
+
+if [[ "$PLAY" == true ]]; then
+  echo ""
+  DUR=$(awk -v s="$START" -v e="$END" 'BEGIN{printf "%.3f", e-s}')
+  echo "  Listen:  ffplay -nodisp -autoexit -ss $START -t $DUR \"$AUDIO\""
+fi
+echo ""
