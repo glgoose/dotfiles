@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+# lec-review-html — generate a self-contained HTML review UI from a
+# pre-improve/v<N>/REVIEW.md queue.
+#
+# Output:
+#   pre-improve/v<N>/REVIEW.html              single-file UI
+#   pre-improve/v<N>/clips/<cue>.pad{0,1,3}.wav  per-cue audio at 3 padding levels
+#
+# Decisions made in the browser are exported as
+# pre-improve/v<N>/REVIEW.decisions.json (download button); apply them
+# with `lec-apply-log <base>`.
+
+import argparse
+import base64
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+AUDIO_EXTS = ("flac", "wav", "opus", "m4a", "mp3", "mp4", "aac", "ogg", "oga", "webm", "weba", "aiff", "aif", "mka", "amr")
+PAD_LEVELS = (0.0, 1.0, 3.0)
+TS_RE = r"\d{1,2}(?::\d{2}){1,2}[\.,]\d{3}"
+
+
+def die(msg, code=1):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def find_base():
+    """Auto-detect lecture base from cwd if not given."""
+    cands = set()
+    for ext in ("srt", "diarized.srt"):
+        for p in Path(".").glob(f"*.{ext}"):
+            name = p.name
+            if name.endswith(".diarized.srt"):
+                cands.add(name[:-len(".diarized.srt")])
+            else:
+                cands.add(name[:-len(".srt")])
+    if len(cands) == 1:
+        return cands.pop()
+    if len(cands) == 0:
+        die("no .srt found in cwd; pass <base> explicitly")
+    die(f"multiple bases found ({sorted(cands)}); pass one explicitly")
+
+
+def find_srt(base):
+    for cand in (f"{base}.diarized.srt", f"{base}.srt"):
+        if Path(cand).is_file():
+            return cand
+    die(f"no SRT for base '{base}'")
+
+
+def find_audio(base):
+    for ext in AUDIO_EXTS:
+        p = Path(f"{base}.{ext}")
+        if p.is_file():
+            return str(p)
+    die(f"no audio file for base '{base}'")
+
+
+def find_review_md(base, explicit=None):
+    if explicit:
+        if not Path(explicit).is_file():
+            die(f"--review path not found: {explicit}")
+        return explicit
+    candidates = sorted(Path(".").glob("pre-improve/v*/REVIEW.md"), reverse=True)
+    for c in candidates:
+        try:
+            first = c.read_text().splitlines()[0]
+        except Exception:
+            continue
+        if base in first:
+            return str(c)
+    die(f"no open REVIEW.md for base '{base}' under pre-improve/v*/")
+
+
+def ts_to_sec(ts):
+    ts = ts.replace(",", ".")
+    parts = ts.split(":")
+    if len(parts) == 2:
+        h, m, rest = "0", parts[0], parts[1]
+    elif len(parts) == 3:
+        h, m, rest = parts
+    else:
+        die(f"bad timestamp: {ts}")
+    return int(h) * 3600 + int(m) * 60 + float(rest)
+
+
+def parse_review_md(path):
+    """Parse REVIEW.md into a list of cue dicts. Mirrors lec-review parser."""
+    content = Path(path).read_text()
+    chunks = re.split(r"^##\s+Cue\s+", content, flags=re.MULTILINE)[1:]
+    out = []
+    for chunk in chunks:
+        head = re.match(
+            rf"(\d+)\s*(?:--|—|->|→)\s*({TS_RE})\s*(?:--|—|->|→)\s*({TS_RE})",
+            chunk,
+        )
+        if not head:
+            continue
+        bef = re.search(r"\*\*Before\*\*:\s*`([^`]*)`", chunk)
+        aft = re.search(r"\*\*After\*\*:\s*`([^`]*)`", chunk)
+        if not bef or not aft:
+            continue
+        llm = re.search(r"\*\*LLM conf\*\*:\s*([0-9.]+)", chunk)
+        asr = re.search(r"\*\*ASR conf\*\*:\s*(\w+)", chunk)
+        reason = re.search(r"\*\*Reason\*\*:\s*(.+?)(?=\n\*\*|\n```|\n~~~|\Z)", chunk, re.DOTALL)
+        after_text = aft.group(1)
+        cands = []
+        if "(unclear:" in after_text:
+            inner = re.search(r"\(unclear:\s*(.+?)\)\s*$", after_text)
+            if inner:
+                for raw in inner.group(1).split("/"):
+                    c = raw.strip()
+                    c = re.sub(r"^(possibly|maybe)\s+", "", c, flags=re.I)
+                    c = c.strip("'\"")
+                    if c:
+                        cands.append(c)
+        out.append({
+            "id": int(head.group(1)),
+            "start": head.group(2),
+            "end": head.group(3),
+            "start_sec": ts_to_sec(head.group(2)),
+            "end_sec": ts_to_sec(head.group(3)),
+            "before": bef.group(1),
+            "after": after_text,
+            "llm_conf": float(llm.group(1)) if llm else None,
+            "asr_conf": asr.group(1) if asr else None,
+            "reason": (reason.group(1).strip() if reason else "").replace("\n", " "),
+            "candidates": cands,
+        })
+    return out
+
+
+def parse_srt_for_context(srt_path):
+    """Return {cue_id: cue_text} so we can show prev/next context."""
+    text = Path(srt_path).read_text()
+    blocks = re.split(r"\n\s*\n", text)
+    out = {}
+    for blk in blocks:
+        lines = blk.splitlines()
+        if not lines or not lines[0].strip().isdigit():
+            continue
+        cue_id = int(lines[0].strip())
+        body = " ".join(lines[2:]).strip() if len(lines) > 2 else ""
+        body = re.sub(r"^\[SPEAKER_\d+\]\s*", "", body)
+        out[cue_id] = body
+    return out
+
+
+def extract_clip(audio, start, end, pad, out_path):
+    """ffmpeg-extract a single padded clip."""
+    s = max(0.0, start - pad)
+    e = end + pad
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{s:.3f}",
+        "-to", f"{e:.3f}",
+        "-i", audio,
+        "-ac", "1", "-ar", "22050",
+        "-c:a", "pcm_s16le",
+        str(out_path),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def extract_all_clips(audio, cues, clips_dir):
+    """Extract pad0/pad1/pad3 clips for each cue. Skip existing files."""
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    total = len(cues) * len(PAD_LEVELS)
+    done = 0
+    for cue in cues:
+        for pad in PAD_LEVELS:
+            tag = f"pad{int(pad)}"
+            out = clips_dir / f"{cue['id']}.{tag}.wav"
+            if not out.exists():
+                extract_clip(audio, cue["start_sec"], cue["end_sec"], pad, out)
+            done += 1
+            print(f"  clip {done}/{total} ({cue['id']} {tag})", end="\r", file=sys.stderr)
+    print(" " * 60, end="\r", file=sys.stderr)
+
+
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Review — __BASE__ v__VERSION__</title>
+<style>
+  :root {
+    --bg: #fafaf7;
+    --fg: #1c1c1a;
+    --muted: #6b6b66;
+    --line: #d8d6cf;
+    --card: #fff;
+    --accent: #2c5f4e;
+    --warn: #b45309;
+    --del: #b91c1c;
+    --add: #15803d;
+    --highlight: #fef3c7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1a18;
+      --fg: #e5e4dc;
+      --muted: #8e8e84;
+      --line: #353530;
+      --card: #232320;
+      --accent: #6ba391;
+      --warn: #e0a050;
+      --del: #ef6464;
+      --add: #6fc785;
+      --highlight: #4a3f1e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--fg);
+    margin: 0; padding: 0;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+    padding: 12px 24px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+  }
+  header h1 {
+    margin: 0; font-size: 16px; font-weight: 600;
+    flex: 1 1 auto;
+  }
+  header .meta { color: var(--muted); font-size: 13px; }
+  header button, header select {
+    background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 12px; font: inherit; cursor: pointer;
+  }
+  header button:hover { border-color: var(--accent); }
+  header button.primary {
+    background: var(--accent); color: #fff; border-color: var(--accent);
+  }
+  header button.primary:hover { filter: brightness(1.1); }
+  main { max-width: 900px; margin: 0 auto; padding: 24px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 20px;
+    scroll-margin-top: 80px;
+  }
+  .card.decided { opacity: 0.65; }
+  .card.current {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
+  }
+  .cue-head {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px;
+    margin-bottom: 10px;
+  }
+  .cue-id { font-weight: 600; font-size: 15px; }
+  .cue-ts { color: var(--muted); font-family: ui-monospace, monospace; font-size: 13px; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 12px; border: 1px solid var(--line);
+  }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .reason {
+    font-size: 13px; color: var(--muted);
+    margin-bottom: 12px;
+  }
+  .context {
+    font-size: 13px; color: var(--muted);
+    border-left: 2px solid var(--line);
+    padding: 6px 12px; margin: 8px 0;
+  }
+  .context .ctx-label {
+    text-transform: uppercase; font-size: 11px;
+    letter-spacing: 0.05em; font-weight: 600;
+    color: var(--muted);
+  }
+  .diff {
+    background: color-mix(in srgb, var(--highlight) 30%, transparent);
+    border-radius: 6px; padding: 10px 14px; margin: 10px 0;
+    font-size: 14px; line-height: 1.6;
+  }
+  .diff .label {
+    text-transform: uppercase; font-size: 11px;
+    letter-spacing: 0.05em; font-weight: 600;
+    color: var(--muted); display: block; margin-bottom: 4px;
+  }
+  .diff .row { font-family: ui-monospace, monospace; font-size: 13px; }
+  del { color: var(--del); text-decoration: line-through; }
+  ins { color: var(--add); text-decoration: none; font-weight: 600; }
+  .audio-row {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+    margin: 12px 0;
+  }
+  .audio-row audio { flex: 1 1 300px; min-width: 200px; }
+  .pad-toggle {
+    display: inline-flex; border: 1px solid var(--line); border-radius: 6px;
+    overflow: hidden;
+  }
+  .pad-toggle button {
+    background: transparent; color: var(--fg);
+    border: none; border-right: 1px solid var(--line);
+    padding: 6px 10px; font: inherit; cursor: pointer;
+    font-size: 13px;
+  }
+  .pad-toggle button:last-child { border-right: none; }
+  .pad-toggle button.active {
+    background: var(--accent); color: #fff;
+  }
+  .decision {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    margin-top: 14px;
+  }
+  .decision label {
+    display: inline-flex; align-items: center; gap: 6px;
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 12px; cursor: pointer;
+    background: var(--card);
+  }
+  .decision label.checked {
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border-color: var(--accent);
+  }
+  .decision label.checked.k { background: color-mix(in srgb, var(--muted) 15%, transparent); border-color: var(--muted); }
+  .decision label.checked.i { background: color-mix(in srgb, var(--warn) 15%, transparent); border-color: var(--warn); }
+  .decision input[type=radio] { accent-color: var(--accent); }
+  .candidates { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .candidates button {
+    background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 12px; font: inherit; cursor: pointer;
+    text-align: left;
+  }
+  .candidates button.picked {
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border-color: var(--accent);
+  }
+  .candidates button:hover { border-color: var(--accent); }
+  .custom-area {
+    display: none; margin-top: 12px;
+  }
+  .custom-area.show { display: block; }
+  .custom-area textarea {
+    width: 100%; min-height: 60px;
+    background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px; font: inherit; resize: vertical;
+  }
+  .note-row { margin-top: 10px; }
+  .note-row input {
+    width: 100%; background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 10px; font: inherit; font-size: 13px;
+  }
+  .note-row label {
+    display: block; font-size: 12px; color: var(--muted);
+    margin-bottom: 4px;
+  }
+  kbd {
+    font-family: ui-monospace, monospace; font-size: 11px;
+    background: var(--bg); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 5px;
+  }
+  .help-bar {
+    color: var(--muted); font-size: 12px;
+    padding: 8px 24px; border-bottom: 1px solid var(--line);
+    background: var(--bg);
+  }
+  .empty {
+    text-align: center; padding: 60px 24px; color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>__BASE__ <span class="meta">v__VERSION__</span></h1>
+  <span class="meta" id="progress">0 / __TOTAL__ decided</span>
+  <select id="filter">
+    <option value="all">All</option>
+    <option value="undecided">Undecided</option>
+    <option value="lowconf">LLM conf &lt; 0.85</option>
+  </select>
+  <button id="reset" title="Clear all decisions in this browser">Reset</button>
+  <button id="download" class="primary">Download decisions</button>
+</header>
+<div class="help-bar">
+  <kbd>j</kbd>/<kbd>p</kbd> next/prev ·
+  <kbd>space</kbd> play ·
+  <kbd>a</kbd> accept · <kbd>k</kbd> keep · <kbd>i</kbd> inaudible · <kbd>c</kbd> custom ·
+  <kbd>1</kbd>–<kbd>9</kbd> pick · <kbd>0</kbd>/<kbd>1</kbd>/<kbd>3</kbd> padding
+</div>
+<main id="cards"></main>
+<script>
+const CUES = __CUES_JSON__;
+const BASE = __BASE_JSON__;
+const VERSION = __VERSION_JSON__;
+const STORAGE_KEY = `lec-review:${BASE}:v${VERSION}`;
+
+let state = loadState();
+let currentIdx = 0;
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return {};
+}
+function saveState() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  refreshProgress();
+}
+function refreshProgress() {
+  const decided = CUES.filter(c => state[c.id]?.action).length;
+  document.getElementById("progress").textContent = `${decided} / ${CUES.length} decided`;
+}
+
+function diffWords(before, after) {
+  const bw = before.split(/(\s+)/);
+  const aw = after.split(/(\s+)/);
+  let i = 0, j = 0;
+  let prefix = 0, suffix = 0;
+  while (prefix < bw.length && prefix < aw.length && bw[prefix] === aw[prefix]) prefix++;
+  while (suffix < bw.length - prefix && suffix < aw.length - prefix
+         && bw[bw.length - 1 - suffix] === aw[aw.length - 1 - suffix]) suffix++;
+  const beforeMid = bw.slice(prefix, bw.length - suffix).join("");
+  const afterMid = aw.slice(prefix, aw.length - suffix).join("");
+  const head = bw.slice(0, prefix).join("");
+  const tail = bw.slice(bw.length - suffix).join("");
+  return {
+    beforeHtml: escapeHtml(head) + (beforeMid ? `<del>${escapeHtml(beforeMid)}</del>` : "") + escapeHtml(tail),
+    afterHtml: escapeHtml(head) + (afterMid ? `<ins>${escapeHtml(afterMid)}</ins>` : "") + escapeHtml(tail),
+  };
+}
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, ch => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[ch]));
+}
+
+function renderCard(cue, idx) {
+  const cur = state[cue.id] || {};
+  const d = diffWords(cue.before, cue.after);
+  const conf = cue.llm_conf == null ? "?" : cue.llm_conf.toFixed(2);
+  const lowConf = cue.llm_conf != null && cue.llm_conf < 0.85;
+  const pad = cur.pad ?? 1;
+  const action = cur.action ?? "";
+  const customText = cur.text ?? cue.after;
+  const note = cur.note ?? "";
+  const decidedCls = action ? " decided" : "";
+
+  const cands = cue.candidates.map((c, n) => {
+    const picked = action === `pick${n+1}` ? " picked" : "";
+    return `<button class="cand${picked}" data-pick="${n+1}">${n+1}. ${escapeHtml(c)}</button>`;
+  }).join("");
+
+  const ctxHtml = (cue.prev_text || cue.next_text)
+    ? `<div class="context">
+         ${cue.prev_text ? `<span class="ctx-label">prev cue</span> ${escapeHtml(cue.prev_text)}<br>` : ""}
+         ${cue.next_text ? `<span class="ctx-label">next cue</span> ${escapeHtml(cue.next_text)}` : ""}
+       </div>` : "";
+
+  return `
+    <div class="card${decidedCls}" data-idx="${idx}" data-cue="${cue.id}" id="cue-${cue.id}">
+      <div class="cue-head">
+        <span class="cue-id">Cue ${cue.id}</span>
+        <span class="cue-ts">${cue.start} → ${cue.end}</span>
+        <span class="badge${cue.asr_conf === 'low' ? ' warn' : ''}">ASR ${cue.asr_conf || '?'}</span>
+        <span class="badge${lowConf ? ' warn' : ''}">LLM ${conf}</span>
+      </div>
+      ${cue.reason ? `<div class="reason">${escapeHtml(cue.reason)}</div>` : ""}
+      ${ctxHtml}
+      <div class="diff">
+        <span class="label">before</span>
+        <div class="row">${d.beforeHtml}</div>
+      </div>
+      <div class="diff">
+        <span class="label">after</span>
+        <div class="row">${d.afterHtml}</div>
+      </div>
+      <div class="audio-row">
+        <audio controls preload="none" src="clips/${cue.id}.pad${pad}.wav"></audio>
+        <div class="pad-toggle" data-pad-toggle>
+          <button data-pad="0"${pad===0?' class="active"':''}>±0s</button>
+          <button data-pad="1"${pad===1?' class="active"':''}>±1s</button>
+          <button data-pad="3"${pad===3?' class="active"':''}>±3s</button>
+        </div>
+      </div>
+      ${cands ? `<div class="candidates">${cands}</div>` : ""}
+      <div class="decision">
+        <label class="${action==='accept'?'checked':''}"><input type="radio" name="d-${cue.id}" value="accept"${action==='accept'?' checked':''}> accept</label>
+        <label class="k ${action==='keep'?'checked':''}"><input type="radio" name="d-${cue.id}" value="keep"${action==='keep'?' checked':''}> keep original</label>
+        <label class="i ${action==='inaudible'?'checked':''}"><input type="radio" name="d-${cue.id}" value="inaudible"${action==='inaudible'?' checked':''}> inaudible</label>
+        <label class="${action==='custom'?'checked':''}"><input type="radio" name="d-${cue.id}" value="custom"${action==='custom'?' checked':''}> custom</label>
+      </div>
+      <div class="custom-area${action==='custom'?' show':''}">
+        <textarea data-custom>${escapeHtml(customText)}</textarea>
+      </div>
+      <div class="note-row">
+        <label>note (optional)</label>
+        <input type="text" data-note value="${escapeHtml(note)}" placeholder="why this decision">
+      </div>
+    </div>
+  `;
+}
+
+function renderAll() {
+  const filter = document.getElementById("filter").value;
+  const visible = CUES.filter(c => {
+    if (filter === "undecided") return !state[c.id]?.action;
+    if (filter === "lowconf") return c.llm_conf != null && c.llm_conf < 0.85;
+    return true;
+  });
+  if (visible.length === 0) {
+    document.getElementById("cards").innerHTML = '<div class="empty">No cues match filter.</div>';
+    return;
+  }
+  document.getElementById("cards").innerHTML = visible.map((c, i) => renderCard(c, i)).join("");
+  attachHandlers();
+  markCurrent();
+  refreshProgress();
+}
+
+function attachHandlers() {
+  document.querySelectorAll(".card").forEach(card => {
+    const cueId = parseInt(card.dataset.cue);
+    card.querySelectorAll('input[type=radio]').forEach(r => {
+      r.addEventListener("change", () => {
+        const cur = state[cueId] || {};
+        cur.action = r.value;
+        state[cueId] = cur;
+        saveState();
+        // Update label classes
+        card.querySelectorAll('.decision label').forEach(l => l.classList.remove("checked"));
+        r.closest("label").classList.add("checked");
+        // Show/hide custom
+        card.querySelector(".custom-area").classList.toggle("show", r.value === "custom");
+        card.classList.toggle("decided", true);
+      });
+    });
+    card.querySelectorAll('[data-pad]').forEach(btn => {
+      btn.addEventListener("click", () => {
+        const pad = parseInt(btn.dataset.pad);
+        const cur = state[cueId] || {};
+        cur.pad = pad;
+        state[cueId] = cur;
+        saveState();
+        card.querySelectorAll('[data-pad]').forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        const audio = card.querySelector("audio");
+        const wasPlaying = !audio.paused;
+        audio.src = `clips/${cueId}.pad${pad}.wav`;
+        if (wasPlaying) audio.play();
+      });
+    });
+    card.querySelectorAll('[data-pick]').forEach(btn => {
+      btn.addEventListener("click", () => {
+        const n = parseInt(btn.dataset.pick);
+        const cur = state[cueId] || {};
+        cur.action = `pick${n}`;
+        cur.text = btn.textContent.replace(/^\d+\.\s*/, "");
+        state[cueId] = cur;
+        saveState();
+        card.querySelectorAll('.cand').forEach(b => b.classList.remove("picked"));
+        btn.classList.add("picked");
+        // Uncheck radios
+        card.querySelectorAll('input[type=radio]').forEach(r => r.checked = false);
+        card.querySelectorAll('.decision label').forEach(l => l.classList.remove("checked"));
+        card.classList.add("decided");
+      });
+    });
+    const ta = card.querySelector("[data-custom]");
+    if (ta) {
+      ta.addEventListener("input", () => {
+        const cur = state[cueId] || {};
+        cur.text = ta.value;
+        state[cueId] = cur;
+        saveState();
+      });
+    }
+    const noteInput = card.querySelector("[data-note]");
+    noteInput.addEventListener("input", () => {
+      const cur = state[cueId] || {};
+      cur.note = noteInput.value;
+      state[cueId] = cur;
+      saveState();
+    });
+  });
+}
+
+function markCurrent() {
+  document.querySelectorAll(".card").forEach(c => c.classList.remove("current"));
+  const cards = document.querySelectorAll(".card");
+  if (cards[currentIdx]) cards[currentIdx].classList.add("current");
+}
+
+function jumpTo(idx) {
+  const cards = document.querySelectorAll(".card");
+  if (idx < 0) idx = 0;
+  if (idx >= cards.length) idx = cards.length - 1;
+  currentIdx = idx;
+  markCurrent();
+  cards[idx].scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+document.addEventListener("keydown", e => {
+  if (["TEXTAREA", "INPUT"].includes(e.target.tagName)) return;
+  const cards = document.querySelectorAll(".card");
+  const curCard = cards[currentIdx];
+  if (!curCard) return;
+  const cueId = parseInt(curCard.dataset.cue);
+  const cue = CUES.find(c => c.id === cueId);
+
+  if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); jumpTo(currentIdx + 1); }
+  else if (e.key === "p" || e.key === "ArrowUp") { e.preventDefault(); jumpTo(currentIdx - 1); }
+  else if (e.key === " ") {
+    e.preventDefault();
+    const audio = curCard.querySelector("audio");
+    if (audio.paused) audio.play(); else audio.pause();
+  }
+  else if (["a", "k", "i", "c"].includes(e.key)) {
+    const map = { a: "accept", k: "keep", i: "inaudible", c: "custom" };
+    const action = map[e.key];
+    const radio = curCard.querySelector(`input[value="${action}"]`);
+    if (radio) { radio.checked = true; radio.dispatchEvent(new Event("change")); }
+  }
+  else if (e.key >= "1" && e.key <= "9") {
+    const btn = curCard.querySelector(`[data-pick="${e.key}"]`);
+    if (btn) btn.click();
+    else {
+      const padBtn = curCard.querySelector(`[data-pad="${e.key}"]`);
+      if (padBtn) padBtn.click();
+    }
+  }
+  else if (e.key === "0") {
+    const padBtn = curCard.querySelector(`[data-pad="0"]`);
+    if (padBtn) padBtn.click();
+  }
+});
+
+document.getElementById("filter").addEventListener("change", renderAll);
+document.getElementById("reset").addEventListener("click", () => {
+  if (!confirm("Clear all decisions for this review queue?")) return;
+  state = {};
+  saveState();
+  renderAll();
+});
+document.getElementById("download").addEventListener("click", () => {
+  const decisions = CUES
+    .filter(c => state[c.id]?.action)
+    .map(c => {
+      const s = state[c.id];
+      const out = { cue_id: c.id, action: s.action };
+      if (s.action === "custom") out.text = s.text ?? c.after;
+      if (s.action.startsWith("pick")) out.text = s.text;
+      if (s.note) out.note = s.note;
+      return out;
+    });
+  const payload = {
+    base: BASE,
+    version: VERSION,
+    generated_at: new Date().toISOString(),
+    decisions,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "REVIEW.decisions.json";
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+renderAll();
+</script>
+</body>
+</html>
+"""
+
+
+def build_html(base, version, cues, srt_lookup):
+    """Inject prev/next cue context, then template-substitute into HTML."""
+    enriched = []
+    for cue in cues:
+        c = dict(cue)
+        c["prev_text"] = srt_lookup.get(cue["id"] - 1, "")[:200]
+        c["next_text"] = srt_lookup.get(cue["id"] + 1, "")[:200]
+        enriched.append(c)
+
+    cues_json = json.dumps(enriched, ensure_ascii=False)
+    return (HTML_TEMPLATE
+            .replace("__BASE__", html.escape(base))
+            .replace("__VERSION__", str(version))
+            .replace("__TOTAL__", str(len(cues)))
+            .replace("__CUES_JSON__", cues_json)
+            .replace("__BASE_JSON__", json.dumps(base))
+            .replace("__VERSION_JSON__", json.dumps(str(version))))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Generate a self-contained HTML review UI from REVIEW.md.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("base", nargs="?", help="lecture base name (auto-detected if omitted)")
+    ap.add_argument("-r", "--review", help="explicit REVIEW.md path (default: latest matching)")
+    ap.add_argument("-v", "--version", type=int, help="pre-improve/v<N>/ version to read")
+    ap.add_argument("-n", "--no-open", action="store_true", help="don't auto-open browser")
+    ap.add_argument("-f", "--force", action="store_true", help="re-extract clips even if cached")
+    args = ap.parse_args()
+
+    if not shutil.which("ffmpeg"):
+        die("ffmpeg not found")
+
+    base = args.base or find_base()
+    srt = find_srt(base)
+    audio = find_audio(base)
+
+    review_md = args.review
+    if not review_md and args.version is not None:
+        review_md = f"pre-improve/v{args.version}/REVIEW.md"
+        if not Path(review_md).is_file():
+            die(f"--version {args.version}: {review_md} not found")
+    if not review_md:
+        review_md = find_review_md(base)
+
+    review_dir = Path(review_md).parent
+    version_match = re.search(r"v(\d+)", review_dir.name)
+    version = version_match.group(1) if version_match else "?"
+
+    cues = parse_review_md(review_md)
+    if not cues:
+        die(f"no reviewable cues in {review_md}")
+    print(f"Base:     {base}", file=sys.stderr)
+    print(f"Review:   {review_md}  ({len(cues)} cue{'s' if len(cues)!=1 else ''})", file=sys.stderr)
+    print(f"Audio:    {audio}", file=sys.stderr)
+
+    clips_dir = review_dir / "clips"
+    if args.force and clips_dir.exists():
+        shutil.rmtree(clips_dir)
+    print(f"Clips:    extracting → {clips_dir}/", file=sys.stderr)
+    extract_all_clips(audio, cues, clips_dir)
+
+    srt_lookup = parse_srt_for_context(srt)
+    html_out = review_dir / "REVIEW.html"
+    html_out.write_text(build_html(base, version, cues, srt_lookup))
+    print(f"HTML:     {html_out}", file=sys.stderr)
+
+    if not args.no_open and sys.platform == "darwin":
+        subprocess.run(["open", str(html_out)], check=False)
+
+
+if __name__ == "__main__":
+    main()

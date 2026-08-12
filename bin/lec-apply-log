@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# lec-apply-log — apply decisions from REVIEW.decisions.json (produced by the
+# REVIEW.html review UI) to the SRT + txt in cwd. Delegates per-cue edits to
+# `lec-review --apply`, so splice logic and applied.log schema stay shared.
+#
+# Usage: lec-apply-log <base> [--decisions PATH] [--dry-run] [--no-open]
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: lec-apply-log <base> [options]
+
+Reads pre-improve/v<N>/REVIEW.decisions.json (downloaded from REVIEW.html),
+applies each decision via `lec-review --apply`. Rewrites REVIEW.md to drop
+resolved cues; renames to REVIEW.done.md when the queue is empty.
+
+Options:
+  --decisions, -d PATH   Explicit decisions JSON path (default: latest
+                         pre-improve/v*/REVIEW.decisions.json)
+  --dry-run, -n          Print what would be applied; don't touch files
+  --no-open, -N          Don't open <base>.txt at the end
+  --help, -h             Show this help
+EOF
+}
+
+BASE=""
+DECISIONS=""
+DRY_RUN=false
+OPEN_AT_END=true
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--decisions)
+      [[ $# -lt 2 ]] && { echo "Error: $1 requires a path" >&2; exit 1; }
+      DECISIONS="$2"; shift 2 ;;
+    -n|--dry-run) DRY_RUN=true; shift ;;
+    -N|--no-open) OPEN_AT_END=false; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "Error: unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *)
+      if [[ -z "$BASE" ]]; then BASE="$1"
+      else echo "Error: extra positional argument: $1" >&2; exit 1
+      fi
+      shift ;;
+  esac
+done
+
+[[ -z "$BASE" ]] && { echo "Error: <base> required" >&2; usage >&2; exit 1; }
+
+command -v lec-review >/dev/null || { echo "Error: lec-review not in PATH" >&2; exit 1; }
+
+# ── Locate decisions JSON ──────────────────────────────────────────────
+if [[ -z "$DECISIONS" ]]; then
+  if compgen -G "pre-improve/v*/REVIEW.decisions.json" >/dev/null; then
+    DECISIONS=$(ls -1 pre-improve/v*/REVIEW.decisions.json | sort -V -r | head -1)
+  fi
+fi
+[[ -z "$DECISIONS" || ! -f "$DECISIONS" ]] && {
+  echo "Error: no REVIEW.decisions.json found (looked in pre-improve/v*/)" >&2
+  exit 1
+}
+
+REVIEW_DIR=$(dirname "$DECISIONS")
+echo "Decisions: $DECISIONS"
+echo "Review dir: $REVIEW_DIR"
+$DRY_RUN && echo "(dry-run — no edits will be applied)"
+echo ""
+
+# ── Parse JSON, apply each decision ────────────────────────────────────
+APPLIED=0
+SKIPPED=0
+FAILED=0
+
+# Drive a loop over decisions: emit one TSV row per decision, then read it.
+# Format: cue_id<TAB>action<TAB>text_b64
+ROWS=$(python3 - "$DECISIONS" <<'PYEOF'
+import sys, json, base64
+data = json.loads(open(sys.argv[1]).read())
+for d in data.get("decisions", []):
+    cid = d.get("cue_id")
+    act = d.get("action", "")
+    text = d.get("text", "")
+    text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    print(f"{cid}\t{act}\t{text_b64}")
+PYEOF
+)
+
+if [[ -z "$ROWS" ]]; then
+  echo "No decisions in $DECISIONS"
+  exit 0
+fi
+
+TOTAL=$(printf '%s\n' "$ROWS" | wc -l | tr -d ' ')
+IDX=0
+
+while IFS=$'\t' read -r CUE_ID ACTION TEXT_B64; do
+  IDX=$((IDX + 1))
+  TEXT=$(printf '%s' "$TEXT_B64" | base64 -d)
+
+  # Map HTML actions to lec-review --decision values.
+  # pickN from HTML carries the raw candidate text; we apply it via --decision
+  # custom so lec-review's splice_into_before lifts the candidate into the
+  # cue's Before-context, producing identical output to a TUI pick.
+  case "$ACTION" in
+    accept|keep|inaudible)
+      DEC="$ACTION"
+      TEXT_ARGS=()
+      ;;
+    custom)
+      DEC="custom"
+      TEXT_ARGS=(--text "$TEXT")
+      ;;
+    pick*)
+      DEC="custom"
+      TEXT_ARGS=(--text "$TEXT")
+      ;;
+    *)
+      echo "  [$IDX/$TOTAL] cue $CUE_ID: unknown action '$ACTION' — skipping" >&2
+      SKIPPED=$((SKIPPED + 1))
+      continue
+      ;;
+  esac
+
+  printf "  [%d/%d] cue %s → %s" "$IDX" "$TOTAL" "$CUE_ID" "$ACTION"
+  [[ -n "$TEXT" ]] && printf " (text=\"%s\")" "$TEXT"
+  echo ""
+
+  if $DRY_RUN; then
+    APPLIED=$((APPLIED + 1))
+    continue
+  fi
+
+  if lec-review "$BASE" --apply "$CUE_ID" --decision "$DEC" "${TEXT_ARGS[@]}" >/dev/null 2>&1; then
+    APPLIED=$((APPLIED + 1))
+  else
+    echo "    ✗ failed" >&2
+    FAILED=$((FAILED + 1))
+  fi
+done <<<"$ROWS"
+
+# ── Summary ────────────────────────────────────────────────────────────
+echo ""
+echo "Applied: $APPLIED · Skipped: $SKIPPED · Failed: $FAILED · Total: $TOTAL"
+
+# Show where the audit trail landed.
+LOG="$REVIEW_DIR/REVIEW.applied.log"
+[[ -f "$LOG" ]] && echo "Audit:   $LOG"
+
+if [[ -f "$REVIEW_DIR/REVIEW.done.md" && ! -f "$REVIEW_DIR/REVIEW.md" ]]; then
+  echo "✓ All cues resolved (REVIEW.md → REVIEW.done.md)"
+  if $OPEN_AT_END && command -v open >/dev/null && [[ -f "${BASE}.txt" ]]; then
+    open "${BASE}.txt" || true
+  fi
+elif [[ -f "$REVIEW_DIR/REVIEW.md" ]]; then
+  REMAINING=$(grep -c "^## Cue" "$REVIEW_DIR/REVIEW.md" 2>/dev/null || echo 0)
+  echo "$REMAINING cue(s) remain in $REVIEW_DIR/REVIEW.md"
+fi
