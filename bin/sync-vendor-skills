@@ -14,7 +14,7 @@ VENDOR="$DOT/agents/.agents/skills-vendor"
 configs=(
   "mattpocock-skills:skills/engineering:"
   "mattpocock-skills:skills/productivity:"
-  "obsidian-skills:skills:obsidian-cli,obsidian-markdown"
+  "obsidian-skills:skills:obsidian-cli,obsidian-markdown,defuddle"
 )
 
 if [ ! -d "$SKILLS" ]; then
