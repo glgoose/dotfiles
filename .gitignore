@@ -28,3 +28,9 @@ claude/.claude/stats-cache.json
 claude/.claude/.caveman-active
 claude/.claude/settings.json.bak
 claude/.claude/.settings.json.swp
+
+# Local checkouts / generated venvs
+.venv/
+
+# Cline auto-creates this at repo root; RTK rules belong in a stow package
+.clinerules
