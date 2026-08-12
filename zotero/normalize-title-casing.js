@@ -158,20 +158,59 @@ function sentenceCase(s) {
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
+function applyToField(field, mode) {
+    let value;
+    try {
+        value = item.getField(field);
+    } catch (_) {
+        return null;
+    }
+    if (!value || !value.trim()) return null;
+
+    const cased = (mode === 'title') ? titleCase(value) : sentenceCase(value);
+    if (cased === value) return null;
+
+    try {
+        item.setField(field, cased);
+    } catch (_) {
+        return null;
+    }
+    return { field, old: value, new: cased };
+}
+
+async function readLanguageWithRetry() {
+    // Plugin (zotero-format-metadata) may populate `language` asynchronously
+    // after our Create-event trigger fires. Poll for up to ~5s.
+    for (let i = 0; i < 10; i++) {
+        const raw = item.getField('language');
+        if (raw && raw.trim()) return raw;
+        if (i < 9) await new Promise(r => setTimeout(r, 500));
+    }
+    return '';
+}
+
 try {
-    const mode = LANG_MAP[normalizeLang(item.getField('language'))];
+    const rawLang = await readLanguageWithRetry();
+    const mode = LANG_MAP[normalizeLang(rawLang)];
     if (!mode || mode === 'skip') return;
 
-    const title = item.getField('title');
-    if (!title || !title.trim()) return;
+    const changes = [];
+    for (const f of ['title', 'shortTitle']) {
+        const c = applyToField(f, mode);
+        if (c) changes.push(c);
+    }
+    if (changes.length === 0) return;
 
-    const newTitle = (mode === 'title') ? titleCase(title) : sentenceCase(title);
-    if (newTitle === title) return;
-
-    Zotero.log(`[normalize-title-casing] (${mode}) "${title}" -> "${newTitle}"`);
-    item.setField('title', newTitle);
     await item.saveTx();
-    toast('Title normalized', newTitle);
+
+    for (const c of changes) {
+        Zotero.log(`[normalize-title-casing] (${mode}) ${c.field}: "${c.old}" -> "${c.new}"`);
+    }
+
+    const headline = changes.length === 1
+        ? (changes[0].field === 'title' ? 'Title normalized' : 'Short title normalized')
+        : 'Title + short title normalized';
+    toast(headline, changes.map(c => c.new).join(' / '));
 } catch (e) {
     const msg = e && e.message ? e.message : String(e);
     Zotero.log(`[normalize-title-casing] error: ${msg}`);
