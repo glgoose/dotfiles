@@ -39,6 +39,7 @@ Scripts are on `PATH` via `~/dotfiles/bin` (set in `.zshrc`).
 | `lec-normalize` | Two-pass loudnorm a single WAV (called by lec-archive) |
 | `lec-correct` | Post-process transcripts via Anthropic API |
 | `lec-benchmark` | Compare mlx-whisper vs lightning-whisper-mlx speed |
+| `isbn-download` | Fetch PDF+EPUB from Anna's Archive, attach to Zotero items (see [docs](docs/isbn-download.md)) |
 | `sync-codex-skills` | Import shared agent skills into `~/.codex/skills` as per-skill symlinks |
 
 ### Extra dependencies for scripts

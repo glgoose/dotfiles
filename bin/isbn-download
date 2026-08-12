@@ -1,0 +1,564 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["requests", "beautifulsoup4"]
+# ///
+"""
+isbn-download - Download books from Anna's Archive into ~/Downloads/.
+
+Prerequisite: ISBNs must already exist in Zotero (without attachments).
+Reads ISBNs from a file, finds the matching Zotero item, picks the best
+PDF + EPUB from Anna's Archive, and saves them to ~/Downloads/ with the
+filename pattern  {safe_title}_{isbn}.{pdf,epub}.
+
+Attaching to Zotero is done by the JS Action "Attach ISBN downloads"
+(see ~/dotfiles/zotero/attach-isbn-downloads.js). That runs inside Zotero
+so it avoids the DELETE-mode SQLite lock contention.
+
+Usage: isbn-download <isbn_file> [--dry-run|-n] [--keep-reserve|-r N]
+
+Then in Zotero: Tools menu, "Attach ISBN downloads" (or its hotkey).
+See ~/dotfiles/docs/isbn-download.md for the full rationale.
+"""
+
+import argparse
+import http.cookiejar
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import unquote
+
+import requests
+from bs4 import BeautifulSoup
+
+AA_BASE = "https://annas-archive.gl"
+ZOTERO_API = "http://localhost:23119/api/users/0"
+ZOTERO_DB = Path.home() / "Zotero" / "zotero.sqlite"
+DOWNLOADS = Path.home() / "Downloads"
+
+SESSION_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+
+def check_zotero_db():
+    if not ZOTERO_DB.exists():
+        print(f"Error: Zotero database not found at {ZOTERO_DB}")
+        print("Run Zotero at least once to create the database.")
+        sys.exit(1)
+
+
+_zotero_api_cache = None
+
+def zotero_api_running():
+    """True if Zotero local API (port 23119) responds. Cached after first call."""
+    global _zotero_api_cache
+    if _zotero_api_cache is None:
+        try:
+            r = requests.get("http://localhost:23119/connector/ping", timeout=2)
+            _zotero_api_cache = r.status_code == 200
+        except Exception:
+            _zotero_api_cache = False
+    return _zotero_api_cache
+
+
+def extract_cookies():
+    print("Extracting Chrome cookies via yt-dlp...")
+    tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w")
+    tmp.write("# Netscape HTTP Cookie File\n")
+    cookie_path = tmp.name
+    tmp.close()
+    subprocess.run(
+        ["yt-dlp", "--cookies-from-browser", "chrome",
+         "--cookies", cookie_path,
+         "--skip-download", AA_BASE + "/"],
+        capture_output=True, text=True,
+    )
+    cookie_file = Path(cookie_path)
+    if not cookie_file.exists() or cookie_file.stat().st_size < 50:
+        print("Cookie extraction failed. Is Chrome running?")
+        sys.exit(1)
+    jar = http.cookiejar.MozillaCookieJar(cookie_path)
+    jar.load(ignore_discard=True, ignore_expires=True)
+    os.unlink(cookie_path)
+    return jar
+
+
+def make_session(jar):
+    s = requests.Session()
+    s.cookies = jar
+    s.headers.update(SESSION_HEADERS)
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Zotero helpers (read-only)
+# ---------------------------------------------------------------------------
+
+def normalize_isbn(isbn):
+    return re.sub(r"[-\s]", "", isbn.strip())
+
+
+def _build_isbn_index_sqlite():
+    index = {}
+    with sqlite3.connect(str(ZOTERO_DB), timeout=30) as conn:
+        rows = conn.execute("""
+            SELECT i.key, isbn_val.value, title_val.value
+            FROM items i
+            JOIN itemData isbn_d      ON i.itemID = isbn_d.itemID
+            JOIN fields isbn_f        ON isbn_d.fieldID = isbn_f.fieldID
+                                      AND isbn_f.fieldName = 'ISBN'
+            JOIN itemDataValues isbn_val ON isbn_d.valueID = isbn_val.valueID
+            LEFT JOIN itemData title_d   ON i.itemID = title_d.itemID
+            LEFT JOIN fields title_f     ON title_d.fieldID = title_f.fieldID
+                                         AND title_f.fieldName = 'title'
+            LEFT JOIN itemDataValues title_val ON title_d.valueID = title_val.valueID
+            WHERE i.itemID NOT IN (SELECT itemID FROM deletedItems)
+        """).fetchall()
+    for item_key, raw_isbn, title in rows:
+        item = {"key": item_key, "data": {"title": title or "", "ISBN": raw_isbn}}
+        for part in raw_isbn.split():
+            norm = normalize_isbn(part)
+            if norm:
+                index[norm] = item
+    return index
+
+
+def _build_isbn_index_http():
+    index = {}
+    start = 0
+    while True:
+        r = requests.get(
+            f"{ZOTERO_API}/items",
+            params={"limit": 500, "start": start, "itemType": "book"},
+        )
+        if not r.ok or not r.json():
+            break
+        batch = r.json()
+        for item in batch:
+            raw_isbn = item["data"].get("ISBN", "")
+            for part in raw_isbn.split():
+                norm = normalize_isbn(part)
+                if norm:
+                    index[norm] = item
+        if len(batch) < 500:
+            break
+        start += 500
+    return index
+
+
+def build_isbn_index():
+    """Index Zotero items by normalized ISBN.
+
+    Prefer HTTP API when Zotero is running (avoids DELETE-mode DB locks);
+    fall back to SQLite reads otherwise.
+    """
+    print("Building Zotero ISBN index...", end=" ", flush=True)
+    if zotero_api_running():
+        index = _build_isbn_index_http()
+        print(f"{len(index)} ISBNs indexed (via API).")
+    else:
+        index = _build_isbn_index_sqlite()
+        print(f"{len(index)} ISBNs indexed (via SQLite).")
+    return index
+
+
+def find_zotero_item(isbn, index):
+    return index.get(normalize_isbn(isbn))
+
+
+def get_attached_formats(item_key):
+    if zotero_api_running():
+        r = requests.get(f"{ZOTERO_API}/items/{item_key}/children")
+        if not r.ok:
+            return set()
+        formats = set()
+        for child in r.json():
+            if child["data"].get("itemType") == "attachment":
+                ct = child["data"].get("contentType", "")
+                if "pdf" in ct:
+                    formats.add("pdf")
+                elif "epub" in ct:
+                    formats.add("epub")
+        return formats
+
+    with sqlite3.connect(str(ZOTERO_DB), timeout=30) as conn:
+        rows = conn.execute("""
+            SELECT ia.contentType
+            FROM itemAttachments ia
+            JOIN items parent ON ia.parentItemID = parent.itemID
+            WHERE parent.key = ?
+              AND ia.itemID NOT IN (SELECT itemID FROM deletedItems)
+        """, (item_key,)).fetchall()
+    formats = set()
+    for (ct,) in rows:
+        ct = ct or ""
+        if "pdf" in ct:
+            formats.add("pdf")
+        elif "epub" in ct:
+            formats.add("epub")
+    return formats
+
+
+# ---------------------------------------------------------------------------
+# Filesystem helpers
+# ---------------------------------------------------------------------------
+
+def already_downloaded(isbn, fmt):
+    """True if any file containing the ISBN already sits in ~/Downloads/.
+
+    Matches both our `{title}_{isbn}.{fmt}` shape and Anna's Archive's raw
+    `... -- {isbn} -- ... .{fmt}` filenames.
+    """
+    for p in DOWNLOADS.glob(f"*{isbn}*.{fmt}"):
+        if p.is_file():
+            return p
+    return None
+
+
+def safe_basename(title, isbn, fmt):
+    safe = re.sub(r"[^\w\s-]", "", title)[:80].strip().replace(" ", "_")
+    if not safe:
+        safe = "book"
+    return f"{safe}_{isbn}.{fmt}"
+
+
+# ---------------------------------------------------------------------------
+# Anna's Archive scraping
+# ---------------------------------------------------------------------------
+
+def parse_size_mb(text):
+    m = re.search(r"([\d.]+)\s*(MB|KB|GB)", text, re.IGNORECASE)
+    if not m:
+        return 999.0
+    val, unit = float(m.group(1)), m.group(2).upper()
+    return {"KB": val / 1024, "GB": val * 1024}.get(unit, val)
+
+
+def fetch_downloads(session, md5):
+    # AA loads download count async via /dyn/md5/inline_info/<md5>.
+    try:
+        r = session.get(f"{AA_BASE}/dyn/md5/inline_info/{md5}",
+                        headers={"Accept": "application/json"}, timeout=10)
+        if r.ok:
+            return int(r.json().get("downloads_total", 0))
+    except (ValueError, requests.RequestException):
+        pass
+    return 0
+
+
+def score(candidate):
+    # Higher download count = more trusted copy; smaller size as tiebreaker.
+    return candidate["downloads"] + 1 / (candidate["size_mb"] + 0.01)
+
+
+def search_aa(session, isbn):
+    r = session.get(
+        f"{AA_BASE}/search",
+        params={"index": "", "page": "1", "sort": "",
+                "ext": ["pdf", "epub"], "display": "", "q": isbn},
+    )
+    if not r.ok:
+        print(f"  AA search failed: HTTP {r.status_code}")
+        return []
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    candidates = []
+    seen_md5 = set()
+
+    for a in soup.find_all("a", href=True):
+        if not a["href"].startswith("/md5/"):
+            continue
+        title = a.get_text(strip=True)
+        if len(title) < 20:
+            continue
+
+        md5 = a["href"].split("/md5/")[-1].split("?")[0].strip("/")
+        if not md5 or md5 in seen_md5:
+            continue
+        seen_md5.add(md5)
+
+        try:
+            block_text = a.parent.parent.get_text(" ", strip=True)
+        except AttributeError:
+            block_text = title
+
+        fmt = None
+        if re.search(r"\bEPUB\b", block_text):
+            fmt = "epub"
+        elif re.search(r"\bPDF\b", block_text):
+            fmt = "pdf"
+        if not fmt:
+            continue
+
+        candidates.append({
+            "md5": md5,
+            "title": title,
+            "format": fmt,
+            "size_mb": parse_size_mb(block_text),
+            "downloads": fetch_downloads(session, md5),
+        })
+
+    if not candidates:
+        print(f"  No results parsed. Response snippet:\n  {r.text[:400]}")
+
+    return candidates
+
+
+def get_fast_link_and_remaining(session, md5):
+    r = session.get(f"{AA_BASE}/md5/{md5}")
+    if not r.ok:
+        return None, None
+
+    remaining = None
+    m = re.search(r"You have (\d+) left today", r.text)
+    if m:
+        remaining = int(m.group(1))
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    for tag in soup.find_all(string=re.compile(r"Fast downloads?", re.IGNORECASE)):
+        container = tag.find_parent()
+        for _ in range(5):
+            if not container:
+                break
+            container = container.parent
+            no_redir = container.find("a", string=re.compile(r"no redirect", re.IGNORECASE))
+            if no_redir:
+                href = no_redir["href"]
+                return (AA_BASE + href if href.startswith("/") else href), remaining
+
+    for a in soup.find_all("a", string=re.compile(r"no redirect", re.IGNORECASE)):
+        href = a["href"]
+        return (AA_BASE + href if href.startswith("/") else href), remaining
+
+    for a in soup.find_all("a", href=re.compile(r"fast_download")):
+        href = a["href"]
+        return (AA_BASE + href if href.startswith("/") else href), remaining
+
+    print(f"  No fast download link found. Page snippet:\n  {r.text[:400]}")
+    return None, remaining
+
+
+def download_file(session, fast_link):
+    r = session.get(fast_link, allow_redirects=True, stream=True, timeout=60)
+    if not r.ok:
+        print(f"  Download failed: HTTP {r.status_code}")
+        return None, None
+
+    # Anna's Archive "no redirect" links land on an intermediate HTML page
+    # ("Download from partner website") that embeds the real CDN URL.
+    content_type = r.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        soup = BeautifulSoup(r.text, "html.parser")
+        cdn_link = None
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if (re.search(r'\.(pdf|epub|djvu|mobi)$', href, re.IGNORECASE)
+                    and href.startswith("http")
+                    and "annas-archive" not in href):
+                cdn_link = href
+                break
+        if not cdn_link:
+            print("  No CDN link found in intermediate page")
+            return None, None
+        print("  Following CDN link...")
+        r = session.get(cdn_link, allow_redirects=True, stream=True, timeout=120)
+        if not r.ok:
+            print(f"  CDN download failed: HTTP {r.status_code}")
+            return None, None
+
+    cd = r.headers.get("Content-Disposition", "")
+    if "filename=" in cd:
+        parts = re.findall(r'filename[^;=\n]*=["\s]*([^";\n]+)', cd)
+        filename = parts[0].strip().strip('"') if parts else None
+    else:
+        filename = None
+
+    if not filename:
+        tail = r.url.split("/")[-1].split("?")[0]
+        filename = unquote(tail) if tail and "." in tail else None
+
+    content = b"".join(r.iter_content(chunk_size=65536))
+    return content, filename
+
+
+# ---------------------------------------------------------------------------
+# Per-ISBN processing
+# ---------------------------------------------------------------------------
+
+def process_isbn(isbn, session, formats_needed, dry_run, keep_reserve):
+    candidates = search_aa(session, isbn)
+    if not candidates:
+        return "not_on_aa", {}
+
+    downloads = {}
+
+    for fmt in sorted(formats_needed):
+        pool = [c for c in candidates if c["format"] == fmt]
+        if not pool:
+            print(f"  No {fmt.upper()} found on AA")
+            continue
+
+        best = max(pool, key=score)
+        print(f"  Best {fmt.upper()}: \"{best['title'][:55]}\" "
+              f"({best['size_mb']:.1f} MB, {best['downloads']} downloads)")
+
+        if dry_run:
+            continue
+
+        fast_link, remaining = get_fast_link_and_remaining(session, best["md5"])
+        if fast_link is None:
+            continue
+
+        if remaining is not None:
+            print(f"  Fast downloads remaining today: {remaining}")
+            if remaining <= keep_reserve:
+                print(f"  Reserve threshold ({keep_reserve}) reached. Stopping.")
+                return "limit_reached", {}
+
+        print(f"  Downloading {fmt.upper()}...")
+        content, aa_filename = download_file(session, fast_link)
+        if content is None:
+            continue
+
+        # Use our own basename so the SEARCHED ISBN is in the filename. AA's
+        # Content-Disposition may carry a different edition's ISBN, which would
+        # make the JS Action miss the Zotero match and create a duplicate.
+        _ = aa_filename
+        filename = safe_basename(best["title"], isbn, fmt)
+        downloads[fmt] = {"filename": filename, "content": content}
+        time.sleep(1)
+
+    return "ok", downloads
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download books from Anna's Archive into ~/Downloads/"
+    )
+    parser.add_argument("isbn_file", help="File with one ISBN per line")
+    parser.add_argument("--keep-reserve", "-r", type=int, default=5, metavar="N",
+                        help="Stop when N fast downloads remain (default: 5)")
+    parser.add_argument("--dry-run", "-n", action="store_true",
+                        help="Search and score only; no downloads written")
+    args = parser.parse_args()
+
+    check_zotero_db()
+    DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+    isbn_file = Path(args.isbn_file)
+    if not isbn_file.exists():
+        print(f"Error: {isbn_file} not found")
+        sys.exit(1)
+
+    isbns = [
+        line.strip() for line in isbn_file.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+    isbn_index = build_isbn_index()
+    tally = {"saved": [], "skipped": [], "not_in_zotero": [],
+             "not_on_aa": [], "errors": []}
+
+    print(f"Processing {len(isbns)} ISBNs" + (" (dry run)" if args.dry_run else "") + "...")
+    jar = extract_cookies()
+    session = make_session(jar)
+
+    for isbn in isbns:
+        isbn = normalize_isbn(isbn)
+        if not isbn:
+            continue
+
+        print(f"\n[{isbn}]")
+
+        item = find_zotero_item(isbn, isbn_index)
+        if item is None:
+            print("  Not in Zotero. Add it via ISBN lookup first.")
+            tally["not_in_zotero"].append(isbn)
+            continue
+
+        item_key = item["key"]
+        print(f"  Zotero: \"{item['data'].get('title', isbn)[:60]}\"")
+
+        attached = get_attached_formats(item_key)
+        formats_needed = {"pdf", "epub"} - attached
+
+        # Also skip formats already sitting in ~/Downloads/ waiting for the JS Action.
+        pending = set()
+        for fmt in list(formats_needed):
+            if already_downloaded(isbn, fmt):
+                pending.add(fmt)
+        formats_needed -= pending
+
+        if not formats_needed:
+            if pending:
+                print(f"  Already in ~/Downloads/ ({', '.join(sorted(pending))}). Skipping.")
+            else:
+                print("  Already has PDF and EPUB. Skipping.")
+            tally["skipped"].append(isbn)
+            continue
+        if attached or pending:
+            have = sorted(attached | pending)
+            print(f"  Has {', '.join(have)}; need {', '.join(sorted(formats_needed))}")
+
+        status, file_downloads = process_isbn(
+            isbn, session, formats_needed, args.dry_run, args.keep_reserve
+        )
+
+        if status == "limit_reached":
+            break
+        if status == "not_on_aa":
+            tally["not_on_aa"].append(isbn)
+            continue
+        if args.dry_run:
+            continue
+
+        for fmt, data in file_downloads.items():
+            target = DOWNLOADS / data["filename"]
+            try:
+                target.write_bytes(data["content"])
+            except OSError as e:
+                print(f"  Save failed: {e}")
+                tally["errors"].append(isbn)
+                continue
+            print(f"  Saved: {target}")
+            tally["saved"].append(f"{isbn} ({fmt.upper()})")
+
+    print(f"\n{'=' * 50}")
+    print(f"Saved:         {len(tally['saved'])}")
+    print(f"Skipped:       {len(tally['skipped'])}")
+    print(f"Not in Zotero: {len(tally['not_in_zotero'])}")
+    print(f"Not on AA:     {len(tally['not_on_aa'])}")
+    print(f"Errors:        {len(tally['errors'])}")
+
+    if tally["not_in_zotero"]:
+        print("\nNot in Zotero (add first):")
+        for i in tally["not_in_zotero"]:
+            print(f"  {i}")
+
+    if tally["saved"]:
+        print(f"\nFiles saved to {DOWNLOADS}.")
+        print("In Zotero: Tools menu, \"Attach ISBN downloads\" (or its hotkey).")
+
+
+if __name__ == "__main__":
+    main()
