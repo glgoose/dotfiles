@@ -1,0 +1,122 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["pymupdf", "pyobjc-framework-Cocoa"]
+# ///
+"""pdfocr-qa — flag likely OCR misreads in a PDF's text layer for manual review.
+
+Usage:
+  pdfocr-qa FILE.pdf [--lang nl] [--pages 1-13]
+
+Extracts every word with its page + on-page position via PyMuPDF, then spellchecks
+each one against macOS's built-in NSSpellChecker (same engine as TextEdit/Mail — no
+extra dictionaries to install, works for any language already available in
+System Settings > Keyboard > Text Input > Language, e.g. 'nl', 'en', 'fr', 'de').
+
+Report-only: does NOT touch the PDF. OCR text-layer glyphs are positioned under the
+scanned image, so rewriting them safely requires redoing the OCR, not a find/replace.
+This just tells you WHERE to look — proper nouns and rare words will show up too
+(macOS's dictionary doesn't know "Hammarskjöld"), so skim the list rather than trusting
+it blindly.
+
+--lang accepts a comma-separated list (e.g. "nl,en" for a mixed-language document) — a
+word is only flagged if misspelled in EVERY listed language, cutting false positives
+from loanwords/quotes in the other language.
+"""
+import argparse
+import sys
+from pathlib import Path
+
+import pymupdf as fitz
+from Foundation import NSRange
+from AppKit import NSSpellChecker
+
+MIN_WORD_LEN = 3
+NSNotFound = 2**63 - 1
+
+
+def error(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_page_range(spec, page_count):
+    """'1-13' / '5' / '' -> 0-based inclusive range of page indices."""
+    if not spec:
+        return range(page_count)
+    if "-" in spec:
+        start, end = spec.split("-", 1)
+        start, end = int(start), int(end)
+    else:
+        start = end = int(spec)
+    if not (1 <= start <= end <= page_count):
+        error(f"--pages {spec} out of range (1-{page_count})")
+    return range(start - 1, end)
+
+
+def clean_word(raw):
+    """Strip surrounding punctuation; drop tokens too short or with no letters."""
+    word = raw.strip("\"'“”‘’.,;:!?()[]{}—–-")
+    if len(word) < MIN_WORD_LEN or not any(c.isalpha() for c in word):
+        return None
+    return word
+
+
+def is_misspelled(checker, word, langs):
+    for lang in langs:
+        rng = checker.checkSpellingOfString_startingAt_language_wrap_inSpellDocumentWithTag_wordCount_(
+            word, 0, lang, False, 0, None
+        )[0]
+        if rng.location == NSNotFound:
+            return False  # correct in at least one language -> not flagged
+    return True
+
+
+def suggest(checker, word, lang):
+    rng = NSRange(0, len(word))
+    guesses = checker.guessesForWordRange_inString_language_inSpellDocumentWithTag_(rng, word, lang, 0)
+    return list(guesses)[:3] if guesses else []
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="pdfocr-qa",
+        description="Flag likely OCR misreads in a PDF's text layer for manual review.",
+    )
+    ap.add_argument("pdf", help="PDF file to check")
+    ap.add_argument("--lang", default="nl", help="comma-separated language codes (default: nl)")
+    ap.add_argument("--pages", default="", help="page range to check, e.g. 5-8 (default: whole document)")
+    args = ap.parse_args()
+
+    pdf_path = Path(args.pdf)
+    if not pdf_path.is_file():
+        error(f"not a file: {pdf_path}")
+
+    langs = [l.strip() for l in args.lang.split(",") if l.strip()]
+    checker = NSSpellChecker.sharedSpellChecker()
+    available = set(checker.availableLanguages())
+    for lang in langs:
+        if lang not in available:
+            error(f"language '{lang}' not available (installed: {', '.join(sorted(available))})")
+
+    doc = fitz.open(pdf_path)
+    page_indices = parse_page_range(args.pages, len(doc))
+
+    flagged = 0
+    for page_idx in page_indices:
+        page = doc[page_idx]
+        for x0, y0, x1, y1, raw, *_ in page.get_text("words"):
+            word = clean_word(raw)
+            if word is None:
+                continue
+            if is_misspelled(checker, word, langs):
+                flagged += 1
+                guesses = suggest(checker, word, langs[0])
+                hint = f"  -> {', '.join(guesses)}" if guesses else ""
+                print(f"page {page_idx + 1:3d}  y={y0:7.1f}  {word}{hint}")
+
+    print(f"\n{flagged} flagged word(s) across {len(page_indices)} page(s)", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

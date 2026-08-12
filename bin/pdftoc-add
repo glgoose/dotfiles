@@ -1,0 +1,208 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["pymupdf"]
+# ///
+"""pdftoc-add — add a table of contents (PDF outline) to a PDF, with headings located
+anywhere on the page (not just page-top) via text search.
+
+Usage:
+  pdftoc-add FILE.pdf ENTRIES.tsv [-o OUTPUT] [--margin PT]
+  pdftoc-add FILE.pdf --dump PAGE
+
+ENTRIES.tsv: tab-separated, one heading per line, no header row. Blank lines and lines
+starting with '#' are skipped.
+
+  page<TAB>search_text<TAB>title
+
+  page:        physical page number (1-based), or 'L<label>' for a printed page label
+                (e.g. 'L28') resolved via the PDF's /PageLabels.
+  search_text: substring to locate on that page. Empty -> plain page-top destination
+               (use for a title page, or any heading that already sits at the top).
+  title:       TOC label shown in the sidebar. Empty -> falls back to search_text.
+
+Front-matter label standard (Chicago Manual of Style order) — use these labels for
+front-matter entries so TOCs stay consistent across books:
+
+  Cover -> Half Title -> Title Page -> Imprint -> Table of Contents
+  -> Foreword/Preface -> Introduction
+
+Use "Imprint", not "Copyright page" (user preference).
+
+When search_text is given, the destination lands a small margin above the matched
+heading (not on the heading's exact top edge, and not on the previous paragraph's last
+line). The margin scales with the heading's own line height by default; override with
+--margin for the whole run if that under/overshoots.
+
+Rebuilds the whole outline from scratch every run (not additive) — safe to re-run after
+editing the entries file. Writes in place with a .bak backup unless -o is given.
+
+Run with --dump PAGE first to see each line's text and y-position, so you can copy exact
+heading text into the entries file instead of guessing.
+"""
+import argparse
+import shutil
+import sys
+from pathlib import Path
+
+import pymupdf as fitz
+
+
+def error(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def resolve_page(doc, spec, lineno):
+    """'N' (1-based physical page) or 'L<label>' (printed label) -> 0-based index."""
+    spec = spec.strip()
+    if spec[:1] in ("L", "l"):
+        label = spec[1:]
+        matches = doc.get_page_numbers(label)
+        if not matches:
+            error(f"entries line {lineno}: no page has label '{label}'")
+        return matches[0]
+    try:
+        n = int(spec)
+    except ValueError:
+        error(f"entries line {lineno}: bad page spec '{spec}'")
+    if not 1 <= n <= len(doc):
+        error(f"entries line {lineno}: page {n} out of range (1-{len(doc)})")
+    return n - 1
+
+
+def find_heading_rect(page, text):
+    """Locate `text` on `page`, preferring the shortest line that contains it — an
+    isolated heading line, not `text` embedded inside a longer sentence."""
+    hits = page.search_for(text)
+    if not hits:
+        return None
+    lines = []
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        for line in block["lines"]:
+            span_text = "".join(s["text"] for s in line["spans"])
+            lines.append((fitz.Rect(line["bbox"]), span_text))
+    best_len, best_rect = None, None
+    for hit in hits:
+        containing_lens = [len(t) for bbox, t in lines if bbox.intersects(hit)]
+        line_len = min(containing_lens) if containing_lens else len(text)
+        if best_len is None or line_len < best_len:
+            best_len, best_rect = line_len, hit
+    return best_rect
+
+
+def load_entries(path):
+    entries = []
+    with open(path, encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            cols = line.split("\t")
+            if len(cols) < 2:
+                error(f"entries line {lineno}: expected at least 2 tab-separated columns, got {len(cols)}")
+            page_spec = cols[0].strip()
+            search_text = cols[1].strip()
+            title = cols[2].strip() if len(cols) > 2 and cols[2].strip() else search_text
+            if not title:
+                error(f"entries line {lineno}: no title and no search_text to fall back to")
+            entries.append((lineno, page_spec, search_text, title))
+    if not entries:
+        error(f"{path}: no entries found")
+    return entries
+
+
+def dump_page(doc, page_num):
+    if not 1 <= page_num <= len(doc):
+        error(f"page {page_num} out of range (1-{len(doc)})")
+    page = doc[page_num - 1]
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        for line in block["lines"]:
+            text = "".join(s["text"] for s in line["spans"]).strip()
+            if text:
+                print(f"y={line['bbox'][1]:7.2f}  {text}")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="pdftoc-add",
+        description="Add a table of contents (PDF outline) to a PDF.",
+    )
+    ap.add_argument("pdf", help="PDF file to add a TOC to")
+    ap.add_argument("entries", nargs="?", help="TSV file of TOC entries")
+    ap.add_argument("-o", "--output", help="write to this file instead of editing in place")
+    ap.add_argument(
+        "--margin",
+        type=float,
+        help="fixed top margin in points above each matched heading "
+        "(default: scales with the heading's own line height)",
+    )
+    ap.add_argument(
+        "--dump",
+        type=int,
+        metavar="PAGE",
+        help="print PAGE's text lines with y-positions, to help write the entries file, then exit",
+    )
+    args = ap.parse_args()
+
+    pdf_path = Path(args.pdf)
+    if not pdf_path.is_file():
+        error(f"not a file: {pdf_path}")
+
+    doc = fitz.open(pdf_path)
+
+    if args.dump is not None:
+        dump_page(doc, args.dump)
+        return
+
+    if not args.entries:
+        error("ENTRIES.tsv required unless --dump is given")
+
+    entries_path = Path(args.entries)
+    if not entries_path.is_file():
+        error(f"not a file: {entries_path}")
+
+    toc = []
+    for lineno, page_spec, search_text, title in load_entries(entries_path):
+        page_idx = resolve_page(doc, page_spec, lineno)
+        page = doc[page_idx]
+        if search_text:
+            rect = find_heading_rect(page, search_text)
+            if rect is None:
+                print(
+                    f"Warning: entries line {lineno}: '{search_text}' not found on "
+                    f"page {page_idx + 1}, using page top",
+                    file=sys.stderr,
+                )
+                y = 0.0
+            else:
+                margin = args.margin if args.margin is not None else max(rect.height * 1.2, 6.0)
+                y = max(0.0, rect.y0 - margin)
+        else:
+            y = 0.0
+        toc.append([1, title, page_idx + 1, {"kind": fitz.LINK_GOTO, "to": fitz.Point(0, y)}])
+        print(f"  {title}  -> page {page_idx + 1}, y={y:.1f}")
+
+    doc.set_toc(toc)
+
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        out_path = pdf_path
+        backup = pdf_path.with_suffix(pdf_path.suffix + ".bak")
+        shutil.copy2(pdf_path, backup)
+        print(f"Backup: {backup}")
+
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    doc.save(tmp_path)
+    doc.close()
+    tmp_path.replace(out_path)
+    print(f"Wrote: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
