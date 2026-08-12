@@ -22,8 +22,10 @@ Synthesised from kepano (Steph Ango), Andy Matuschak, Sönke Ahrens, Nick Milo (
 Adopt Ahrens's split, mapped to the user's Zotero workflow.
 
 1. **Daily / fleeting** — capture surface, no permanence assumed. Lives wherever daily notes already live.
-2. **Literature notes** — one note per Zotero source. Filename: `@Citekey.md` (Better BibTeX, with `@` prefix). Frontmatter: `aliases: ["Human Title"]`, `source: "[[@Citekey]]"`-not-needed-since-self, `author`, `year`. Body summarises the source and quotes load-bearing passages. Single-source notes use bare page numbers `(p. 42)` per `schematic-notes`.
-3. **Concept / permanent notes** — one note per idea, drawing across sources. Filename: lowercase short noun phrase, e.g. `real abstraction.md`, `epistemic injustice.md`. Written in your own voice. Cites multiple literature notes by `[[@Citekey]]` and other concept notes by `[[concept name]]`.
+2. **Literature notes** — one note per Zotero source. Filename: `Citekey.md` (Better BibTeX, no `@` prefix — avoids collision w/ pandoc cite syntax `[@Citekey]`). Frontmatter: `aliases: ["Human Title"]`, `author`, `year`. Body summarises the source and quotes load-bearing passages. Single-source notes use bare page numbers `(p. 42)` per `schematic-notes`.
+   - **Default thin, not exhaustive.** A literature note is an overview + a map into the concept notes: what the source argues, its structure, its distinctive moves, and pointer links. Do **not** author a full doctrinal exposition inside a `Citekey.md` note by default — only when the user explicitly asks for a detailed single-source note.
+   - **Themes belong in concept notes.** When a source's idea recurs across the cluster (a signature doctrine, a named distinction, a term of art), that idea gets its own concept note and the literature note links to it. The paper note then reads as an overview, not the home of the doctrine. This prevents the same idea scattering across several paper notes.
+3. **Concept / permanent notes** — one note per idea, drawing across sources. Filename: lowercase short noun phrase, e.g. `real abstraction.md`, `epistemic injustice.md`. Written in your own voice. Cites literature notes by `[[Citekey]]` and other concept notes by `[[concept name]]`.
 
 Project notes (e.g. thesis-chapter scratch) are transient and do not get the permanent-note treatment.
 
@@ -40,7 +42,7 @@ Do **not** split for hygiene alone. Atomicity is a means; coherence is the end.
 
 ## Filenames
 
-- **Source notes**: `@Citekey.md` — Better BibTeX citekey, prefix `@` so they sort and visually segregate from concept notes. Add `aliases: ["Author Year — Short Title"]` for human-readable display.
+- **Source notes**: `Citekey.md` — Better BibTeX citekey, no `@` prefix. Reason: filename `@Foo.md` makes wikilink `[[@Foo]]`, which collides visually w/ pandoc citation syntax `[@Foo]` used in prose. Bare citekey keeps wikilink form (`[[Foo]]`) distinct from pandoc-cite form (`[@Foo]`). Add `aliases: ["Author Year - Short Title"]` for human-readable display.
 - **Concept notes**: lowercase noun phrase, no date, no author. Examples: `real abstraction.md`, `hinge epistemology.md`, `epistemic injustice.md`.
 - **Working drafts** (no citekey, no canonical concept): `Author - Topic.md` is the schematic-notes fallback. Use only when neither source-bound nor a settled concept.
 
