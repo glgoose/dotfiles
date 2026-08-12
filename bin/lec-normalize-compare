@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# lec-normalize-compare — compare 2-pass linear vs 1-pass dynamic loudnorm
+# Usage: lec-normalize-compare <file.wav>
+# Optional: NOISE_RANGE="HH:MM:SS-HH:MM:SS" lec-normalize-compare <file.wav>
+#   (segment used for noise-floor RMS; default = first 2 seconds)
+# Targets: -16 LUFS integrated, -1 dBTP true peak, LRA 9
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: lec-normalize-compare <file.wav>"
+  echo "  Optional env: NOISE_RANGE=\"00:00:01-00:00:03\""
+  exit 1
+fi
+
+FILE="$1"
+
+if [[ ! -f "$FILE" ]]; then
+  echo "Error: file not found: $FILE"
+  exit 1
+fi
+
+for cmd in ffmpeg jq; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Error: $cmd not found. Install with: brew install $cmd"
+    exit 1
+  fi
+done
+
+BASE="${FILE%.wav}"
+OUTDIR="${BASE}_normcompare"
+mkdir -p "$OUTDIR"
+
+V1="$OUTDIR/v1_2pass_linear.wav"
+V2="$OUTDIR/v2_1pass_dynamic.wav"
+STATS="$OUTDIR/stats.txt"
+
+# ---------- Variant 1: 2-pass linear (current lec-normalize approach) ----------
+echo "[1/4] V1: 2-pass linear — measuring..."
+PASS1=$(ffmpeg -hide_banner -nostats -i "$FILE" \
+  -af "loudnorm=I=-16:TP=-1:LRA=9:print_format=json" \
+  -f null - 2>&1)
+
+JSON=$(echo "$PASS1" | sed -n '/Parsed_loudnorm/,/^}/p' | sed -n '/^{/,/^}/p')
+input_i=$(     echo "$JSON" | jq -r '.input_i')
+input_tp=$(    echo "$JSON" | jq -r '.input_tp')
+input_lra=$(   echo "$JSON" | jq -r '.input_lra')
+input_thresh=$(echo "$JSON" | jq -r '.input_thresh')
+target_offset=$(echo "$JSON" | jq -r '.target_offset')
+
+echo "[2/4] V1: 2-pass linear — applying..."
+ffmpeg -y -hide_banner -loglevel error -i "$FILE" \
+  -af "loudnorm=I=-16:TP=-1:LRA=9:\
+measured_I=${input_i}:measured_TP=${input_tp}:measured_LRA=${input_lra}:\
+measured_thresh=${input_thresh}:offset=${target_offset}:\
+linear=true:print_format=summary" \
+  "$V1"
+
+# ---------- Variant 2: 1-pass dynamic ----------
+echo "[3/4] V2: 1-pass dynamic..."
+ffmpeg -y -hide_banner -loglevel error -i "$FILE" \
+  -af "loudnorm=I=-16:TP=-1:LRA=9" \
+  "$V2"
+
+# ---------- Stats ----------
+echo "[4/4] Measuring stats + spectrograms..."
+
+# Pull integrated LUFS, true peak, LRA from ebur128 summary
+measure_ebur128() {
+  local path="$1"
+  ffmpeg -hide_banner -nostats -i "$path" \
+    -af "ebur128=peak=true" -f null - 2>&1 \
+    | awk '
+        /Integrated loudness:/  {flag="i"; next}
+        /Loudness range:/        {flag="r"; next}
+        /True peak:/             {flag="t"; next}
+        flag=="i" && /I:/        {print "  Integrated LUFS: " $2 " " $3; flag=""}
+        flag=="r" && /LRA:/      {print "  LRA:             " $2 " " $3; flag=""}
+        flag=="t" && /Peak:/     {print "  True peak:       " $2 " " $3; flag=""}
+      '
+}
+
+# Overall RMS via astats
+measure_rms_overall() {
+  local path="$1"
+  ffmpeg -hide_banner -nostats -i "$path" \
+    -af "astats=measure_perchannel=0:measure_overall=RMS_level+Peak_level" \
+    -f null - 2>&1 \
+    | awk '
+        /RMS level dB:/  {print "  RMS overall:     " $7 " dB"}
+        /Peak level dB:/ {print "  Peak sample:     " $7 " dB"}
+      '
+}
+
+# Noise-floor proxy: RMS of a quiet segment
+measure_noisefloor() {
+  local path="$1"
+  local ss to
+  if [[ -n "${NOISE_RANGE:-}" ]]; then
+    ss="${NOISE_RANGE%-*}"
+    to="${NOISE_RANGE#*-}"
+  else
+    ss="00:00:00"
+    to="00:00:02"
+  fi
+  ffmpeg -hide_banner -nostats -ss "$ss" -to "$to" -i "$path" \
+    -af "astats=measure_perchannel=0:measure_overall=RMS_level" \
+    -f null - 2>&1 \
+    | awk -v range="${ss}-${to}" '
+        /RMS level dB:/ {print "  Noise floor RMS: " $7 " dB  (segment " range ")"}
+      '
+}
+
+report() {
+  local label="$1" path="$2"
+  echo "=== $label ==="
+  echo "  File: $path"
+  measure_ebur128   "$path"
+  measure_rms_overall "$path"
+  measure_noisefloor "$path"
+  echo ""
+}
+
+{
+  echo "lec-normalize-compare report"
+  echo "Generated: $(date)"
+  echo "Source:    $FILE"
+  echo ""
+  report "INPUT (original)"        "$FILE"
+  report "V1: 2-pass linear"       "$V1"
+  report "V2: 1-pass dynamic"      "$V2"
+} > "$STATS"
+
+# ---------- Spectrograms ----------
+spec() {
+  local path="$1" out="$2"
+  ffmpeg -y -hide_banner -loglevel error -i "$path" \
+    -lavfi "showspectrumpic=s=1600x800:legend=1" "$out"
+}
+
+spec "$FILE" "$OUTDIR/spec_input.png"
+spec "$V1"   "$OUTDIR/spec_v1.png"
+spec "$V2"   "$OUTDIR/spec_v2.png"
+
+# ---------- README ----------
+cat > "$OUTDIR/README.txt" <<'EOF'
+lec-normalize-compare output
+============================
+
+Files:
+  v1_2pass_linear.wav   — current lec-normalize approach (loudnorm with linear=true)
+  v2_1pass_dynamic.wav  — single-pass dynamic loudnorm (no linear flag)
+  stats.txt             — LUFS, true peak, LRA, overall RMS, noise-floor RMS
+  spec_*.png            — spectrograms (input vs v1 vs v2)
+
+Theory:
+  - linear=true applies a single gain factor across the whole file. SNR is
+    preserved; noise rises by exactly the same dB as the signal.
+  - Without linear, loudnorm dynamically compresses: quiet sections are
+    pushed up more than loud ones. During speech pauses this raises the
+    noise floor and can cause audible pumping.
+
+How to interpret:
+  1. stats.txt: compare "Noise floor RMS" between V1 and V2. If V2 is
+     several dB higher than V1, the dynamic mode is amplifying silence
+     (i.e. noise) more than V1.
+  2. Spectrograms: look at silent passages between speech. Bright
+     low-frequency hum (50/60 Hz) or broadband hiss in V2 but not V1
+     confirms the same.
+  3. A/B listen: open both WAVs in an audio editor, solo a pause between
+     sentences, switch back and forth.
+
+Override the silence sample window:
+  NOISE_RANGE="00:00:14-00:00:16" lec-normalize-compare file.wav
+EOF
+
+echo "Done. Output: $OUTDIR/"
+echo "  open $OUTDIR/"
