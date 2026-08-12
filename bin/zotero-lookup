@@ -1,0 +1,344 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""zotero-lookup — resolve between Zotero citekeys and attachment filepaths.
+
+Usage:
+  zotero-lookup <citekey>               citekey -> path(s)
+  zotero-lookup -r <path-or-8charkey>   path/key -> citekey
+  zotero-lookup -h                      show help
+
+Forward (citekey -> path) prefers Better BibTeX JSON-RPC at localhost:23119
+when Zotero is running, falls back to direct read-only SQLite.
+Reverse (path -> citekey) always uses read-only SQLite, so it works whether
+Zotero is open or closed.
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+import urllib.error
+import urllib.request
+from urllib.parse import unquote
+
+DB = os.path.expanduser("~/Zotero/zotero.sqlite")
+STORAGE = os.path.expanduser("~/Zotero/storage")
+ZOTERO_HOST = "http://localhost:23119"
+TIMEOUT = 5.0
+
+
+# ── Forward: citekey -> path(s) ───────────────────────────────────────────────
+
+
+def _http_get(url: str) -> str | None:
+    try:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as r:
+            return r.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return None
+
+
+def _http_post_json(url: str, payload: dict) -> str | None:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            return r.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return None
+
+
+def _zotero_running() -> bool:
+    return _http_get(f"{ZOTERO_HOST}/connector/ping") is not None
+
+
+def _forward_via_api(key: str) -> list[str]:
+    raw = _http_post_json(
+        f"{ZOTERO_HOST}/better-bibtex/json-rpc",
+        {"jsonrpc": "2.0", "method": "item.search", "params": {"terms": key}, "id": 1},
+    )
+    if not raw:
+        raise RuntimeError("BBT search returned empty response")
+    resp = json.loads(raw)
+    if "error" in resp:
+        raise RuntimeError(f"BBT error: {resp['error']}")
+
+    items = resp.get("result", [])
+    match = next(
+        (i for i in items if i.get("citekey") == key or i.get("citation-key") == key),
+        None,
+    )
+    if not match:
+        return []
+
+    item_uri = match["id"]
+    local_url = item_uri.replace("http://zotero.org", f"{ZOTERO_HOST}/api") + "/children"
+    children_raw = _http_get(local_url)
+    if not children_raw:
+        return []
+
+    paths: list[str] = []
+    for child in json.loads(children_raw):
+        enclosure = child.get("links", {}).get("enclosure", {})
+        href = enclosure.get("href", "")
+        ctype = enclosure.get("type", "")
+        if href.startswith("file://") and ctype in (
+            "application/pdf",
+            "application/epub+zip",
+        ):
+            paths.append(unquote(href[7:]))
+    return paths
+
+
+def _forward_via_sqlite(key: str) -> list[str]:
+    conn = sqlite3.connect(f"file:{DB}?mode=ro&immutable=1", uri=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT i.key, ia.path
+            FROM items i
+            JOIN itemData cid        ON cid.itemID = i.itemID
+            JOIN itemDataValues cidv ON cidv.valueID = cid.valueID
+            JOIN fields cf           ON cf.fieldID = cid.fieldID
+                                    AND cf.fieldName = 'citationKey'
+            JOIN itemAttachments ia  ON ia.parentItemID = i.itemID
+            WHERE cidv.value = ?
+              AND ia.contentType IN ('application/pdf', 'application/epub+zip')
+            """,
+            (key,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    paths: list[str] = []
+    for att_key, path in rows:
+        if path is None:
+            continue
+        if path.startswith("storage:"):
+            paths.append(os.path.join(STORAGE, att_key, path[len("storage:") :]))
+        else:
+            paths.append(path)
+    return paths
+
+
+def _forward_via_duplicate_title(key: str) -> list[str]:
+    """Fallback: citekey is pinned to an attachment-less item, but a title-
+    duplicate item holds the PDF/EPUB. Zotero dedups identical strings in
+    itemDataValues, so duplicate items share one title valueID -- join on it.
+    """
+    conn = sqlite3.connect(f"file:{DB}?mode=ro&immutable=1", uri=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT att.key, ia.path
+            FROM itemData ck
+            JOIN fields fck          ON fck.fieldID = ck.fieldID
+                                    AND fck.fieldName = 'citationKey'
+            JOIN itemDataValues ckv  ON ckv.valueID = ck.valueID
+                                    AND ckv.value = ?
+            JOIN itemData td         ON td.itemID = ck.itemID
+            JOIN fields ft           ON ft.fieldID = td.fieldID
+                                    AND ft.fieldName = 'title'
+            JOIN itemData td2        ON td2.valueID = td.valueID
+            JOIN fields ft2          ON ft2.fieldID = td2.fieldID
+                                    AND ft2.fieldName = 'title'
+            JOIN itemAttachments ia  ON ia.parentItemID = td2.itemID
+            JOIN items att           ON att.itemID = ia.itemID
+            WHERE ia.contentType IN ('application/pdf', 'application/epub+zip')
+            """,
+            (key,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    paths: list[str] = []
+    for att_key, path in rows:
+        if path is None:
+            continue
+        if path.startswith("storage:"):
+            paths.append(os.path.join(STORAGE, att_key, path[len("storage:") :]))
+        else:
+            paths.append(path)
+    return paths
+
+
+def resolve_forward(citekey: str) -> list[str]:
+    key = citekey.lstrip("@").strip()
+    if not key:
+        raise ValueError("empty citekey")
+    paths = _forward_via_api(key) if _zotero_running() else _forward_via_sqlite(key)
+    if paths:
+        return paths
+    # citekey may be pinned to an attachment-less duplicate while a title-twin
+    # holds the file. surface it instead of reporting a false miss (post-mortem).
+    dup = _forward_via_duplicate_title(key)
+    if dup:
+        print(
+            f"Note: @{key} item has no attachment; resolved via title-duplicate "
+            "item. Consider merging duplicates in Zotero.",
+            file=sys.stderr,
+        )
+    return dup
+
+
+# ── Reverse: path or 8-char key -> citekey ────────────────────────────────────
+
+
+_KEY_RE = re.compile(r"/Zotero/storage/([A-Z0-9]{8})(?:/|$)")
+_BARE_KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
+
+
+def _bbt_citationkey(item_key: str) -> str | None:
+    """Live citekey for a regular item key via BBT JSON-RPC. Returns the
+    pinned OR dynamically-computed key (the Zotero citationKey field in SQLite
+    only stores pinned keys). Attachment keys return null here.
+    """
+    raw = _http_post_json(
+        f"{ZOTERO_HOST}/better-bibtex/json-rpc",
+        {"jsonrpc": "2.0", "method": "item.citationkey", "params": [[item_key]], "id": 1},
+    )
+    if not raw:
+        return None
+    try:
+        return (json.loads(raw).get("result") or {}).get(item_key)
+    except (json.JSONDecodeError, AttributeError):
+        return None
+
+
+def resolve_reverse(input_str: str) -> str | None:
+    arg = os.path.expanduser(input_str.strip())
+
+    att_key: str | None = None
+    m = _KEY_RE.search(arg)
+    if m:
+        att_key = m.group(1)
+    elif _BARE_KEY_RE.match(arg):
+        att_key = arg
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro&immutable=1", uri=True)
+    try:
+        if att_key:
+            row = conn.execute(
+                """
+                SELECT v.value
+                FROM items a
+                JOIN itemAttachments ia ON ia.itemID = a.itemID
+                JOIN itemData d         ON d.itemID = ia.parentItemID
+                JOIN fields f           ON f.fieldID = d.fieldID
+                                       AND f.fieldName = 'citationKey'
+                JOIN itemDataValues v   ON v.valueID = d.valueID
+                WHERE a.key = ?
+                LIMIT 1
+                """,
+                (att_key,),
+            ).fetchone()
+            if row:
+                return row[0]
+
+            # not an attachment key (or its parent is unpinned): the 8-char key
+            # may be a regular ITEM key. prefer the live BBT key (catches
+            # dynamic, unpinned-but-computed keys), fall back to pinned SQLite.
+            if _zotero_running():
+                live = _bbt_citationkey(att_key)
+                if live:
+                    return live
+            row = conn.execute(
+                """
+                SELECT v.value
+                FROM items i
+                JOIN itemData d       ON d.itemID = i.itemID
+                JOIN fields f         ON f.fieldID = d.fieldID
+                                     AND f.fieldName = 'citationKey'
+                JOIN itemDataValues v ON v.valueID = d.valueID
+                WHERE i.key = ?
+                LIMIT 1
+                """,
+                (att_key,),
+            ).fetchone()
+            if row:
+                return row[0]
+
+        base = os.path.basename(arg) if os.path.sep in arg else arg
+        row = conn.execute(
+            """
+            SELECT v.value
+            FROM itemAttachments ia
+            JOIN itemData d       ON d.itemID = ia.parentItemID
+            JOIN fields f         ON f.fieldID = d.fieldID
+                                 AND f.fieldName = 'citationKey'
+            JOIN itemDataValues v ON v.valueID = d.valueID
+            WHERE ia.path = ? OR ia.path = ?
+            LIMIT 1
+            """,
+            (arg, f"attachments:{base}"),
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="zotero-lookup",
+        description="Resolve between Zotero citekeys and attachment filepaths.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  zotero-lookup smith2020\n"
+            "  zotero-lookup @smith2020\n"
+            "  zotero-lookup -r ~/Zotero/storage/IV4X7GRL/file.pdf\n"
+            "  zotero-lookup -r IV4X7GRL\n"
+        ),
+    )
+    parser.add_argument(
+        "input",
+        help="citekey (forward) or path/8-char attachment key (with --reverse)",
+    )
+    parser.add_argument(
+        "-r",
+        "--reverse",
+        action="store_true",
+        help="reverse direction: path or 8-char key -> citekey",
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists(DB):
+        print(f"Error: Zotero DB not found at {DB}", file=sys.stderr)
+        return 1
+
+    try:
+        if args.reverse:
+            result = resolve_reverse(args.input)
+            if result is None:
+                print(f"Not found: {args.input}", file=sys.stderr)
+                return 1
+            print(result)
+            return 0
+
+        paths = resolve_forward(args.input)
+        if not paths:
+            print(f"Not found: {args.input}", file=sys.stderr)
+            return 1
+        for p in paths:
+            print(p)
+        return 0
+    except (RuntimeError, ValueError, sqlite3.Error) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
