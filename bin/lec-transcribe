@@ -2,22 +2,22 @@
 # lec-transcribe — transcribe lecture audio, optionally correct/diarize, always paragraph
 # Usage: lec-transcribe [-e|--engine whisper|parakeet] [-l|--lang LANGCODE]
 #                       [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]
-#                       [-s|--smooth | --no-smooth] [--gap SECONDS] <files...>
+#                       [--gap SECONDS] <files...>
 # Audio files are required (paths relative to cwd). Accepted: any container/codec
 # ffmpeg can decode (mlx-whisper and parakeet-mlx both pipe through ffmpeg).
 # Auto-discovery from cwd is not supported — pass the file(s) explicitly.
 #
 # Pipeline: transcribe → (correct: rewrites .srt) → (diarize: rewrites .srt)
-#         → paragraph (always; reads final .srt, writes .txt). The paragraph
-#           step is the single writer of .txt. Smooth (LLM topic breaks) is on
-#           by default; falls back to pause-based when no API key is set.
+#         → paragraph (always; reads final .srt, writes .txt). lec-paragraph is
+#           the single writer of .txt and uses LLM topic-based breaks by default;
+#           run lec-paragraph --no-llm afterward for free pause-based paragraphs.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 USAGE="Usage: lec-transcribe [-e|--engine whisper|parakeet] [-l|--lang LANGCODE]
                      [-c|--correct] [-d|--diarize] [-p|--provider openai|anthropic]
-                     [-s|--smooth | --no-smooth] [--gap SECONDS] <files...>
+                     [--gap SECONDS] <files...>
        LANGCODE examples: nl (Dutch), fr (French), de (German), es (Spanish), it (Italian),
                           zh (Chinese), ko (Korean), ja (Japanese)
        Accepted audio extensions: wav, flac, mp3, m4a, mp4, aac, ogg, oga, opus,
@@ -36,12 +36,11 @@ PROVIDER=""
 PROVIDER_SET=false
 LANG_SET=false
 ENGINE="whisper"
-SMOOTH=true
 PARAGRAPH_GAP=1.5
 INPUT_FILES=()
 
 # Background job tracking for per-file post-processing pipeline.
-# BG_MAX caps concurrent LLM jobs (lec-correct + lec-paragraph --smooth) to
+# BG_MAX caps concurrent LLM jobs (lec-correct + lec-paragraph) to
 # avoid rate limits and memory pressure.
 BG_PIDS=()
 BG_LOGS=()
@@ -80,14 +79,6 @@ while [[ $# -gt 0 ]]; do
         echo "Error: --engine must be 'whisper' or 'parakeet'"; exit 1; }
       shift 2
       ;;
-    --smooth|-s)
-      SMOOTH=true
-      shift
-      ;;
-    --no-smooth)
-      SMOOTH=false
-      shift
-      ;;
     --gap)
       [[ $# -lt 2 ]] && { echo "Error: --gap requires a number (seconds)"; exit 1; }
       PARAGRAPH_GAP="$2"
@@ -117,9 +108,9 @@ if [[ "$ENGINE" == "parakeet" && "$LANG_SET" == true ]]; then
   exit 1
 fi
 
-# ── Provider resolution (correct + smooth share one provider) ─────────────────
+# ── Provider resolution (correct + paragraph share one provider) ─────────────
 # When --provider is not given, auto-detect from env: prefer OPENAI_API_KEY,
-# else ANTHROPIC_API_KEY. --correct requires a key (hard error). --smooth
+# else ANTHROPIC_API_KEY. --correct requires a key (hard error). lec-paragraph
 # without a key falls back silently to pause-based paragraphs.
 if [[ "$PROVIDER_SET" == false ]]; then
   if [[ -n "${OPENAI_API_KEY:-}" ]]; then
@@ -144,13 +135,6 @@ if [[ "$CORRECT" == true ]]; then
     echo "Error: --correct requires OPENAI_API_KEY or ANTHROPIC_API_KEY in env"
     echo "Hint: export OPENAI_API_KEY=\$(security find-generic-password -a \"\$USER\" -s \"openai-api-key\" -w)"
     exit 1
-  fi
-fi
-
-if [[ "$SMOOTH" == true ]]; then
-  if [[ -z "$PROVIDER" ]] || ! provider_key_present "$PROVIDER"; then
-    echo "Warning: no API key for --smooth; falling back to pause-based paragraphs."
-    SMOOTH=false
   fi
 fi
 
@@ -348,9 +332,7 @@ PYEOF
       fi
       if [[ "$DIARIZE" == false ]]; then
         PARA_ARGS=(--gap "$PARAGRAPH_GAP")
-        if [[ "$SMOOTH" == true ]]; then
-          PARA_ARGS+=(--smooth --provider "$PROVIDER")
-        fi
+        [[ "$PROVIDER_SET" == true ]] && PARA_ARGS+=(--provider "$PROVIDER")
         "$SCRIPT_DIR/lec-paragraph" "${PARA_ARGS[@]}" "$SRT"
       fi
     ) > "$BG_LOG" 2>&1 &
@@ -400,9 +382,7 @@ for FILE in "${AUDIO_FILES[@]}"; do
   fi
 done
 PARA_ARGS=(--gap "$PARAGRAPH_GAP")
-if [[ "$SMOOTH" == true ]]; then
-  PARA_ARGS+=(--smooth --provider "$PROVIDER")
-fi
+[[ "$PROVIDER_SET" == true ]] && PARA_ARGS+=(--provider "$PROVIDER")
 "$SCRIPT_DIR/lec-paragraph" "${PARA_ARGS[@]}" "${SRT_INPUTS[@]}"
 fi
 
@@ -415,11 +395,7 @@ POSTPROCESS_TIME=$((SCRIPT_END - TRANSCRIBE_END))
 STEPS="transcribe"
 [[ "$CORRECT" == true ]] && STEPS="$STEPS, correct"
 [[ "$DIARIZE" == true ]] && STEPS="$STEPS, diarize"
-if [[ "$SMOOTH" == true ]]; then
-  STEPS="$STEPS, paragraph (smooth, $PROVIDER)"
-else
-  STEPS="$STEPS, paragraph (pause)"
-fi
+STEPS="$STEPS, paragraph"
 
 echo ""
 echo "── Summary ─────────────────────────────────────────────────────────────────"
