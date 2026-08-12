@@ -1,7 +1,49 @@
 ---
 name: zotero-scripting
-description: Write or edit Zotero Actions & Tags custom scripts (.js). Covers the script skeleton, environment gotchas (PATH, bindings, silent swallowing), data model, ProgressWindow API, and subprocess patterns. Use whenever writing or modifying any Zotero A&T script in zotero/*.js.
+description: Write or edit Zotero Actions & Tags custom scripts (.js), or run one-off JS against the Zotero library via the Run JavaScript console. Covers the script skeleton, environment gotchas (PATH, bindings, silent swallowing), data model, ProgressWindow API, and subprocess patterns. Use whenever writing or modifying any Zotero A&T script in zotero/*.js, or when a task needs a quick script run against Zotero without installing an Action.
 ---
+
+## Two execution contexts — don't mix up the bindings
+
+- **Actions & Tags scripts** (installed as an Action, triggered from a selected item):
+  get `item`/`items` bound automatically by the plugin. Everything below this section
+  assumes this context.
+- **Tools → Developer → Run JavaScript console**: a plain sandbox. There is **no
+  implicit `item`/`items` binding** — referencing `item` throws `item is not defined`
+  (or silently no-ops if guarded with `if (!item) return`, which looks like success but
+  isn't). Fetch items explicitly instead:
+
+  ```js
+  const libraryID = Zotero.Libraries.userLibraryID;
+  const item = await Zotero.Items.getByLibraryAndKeyAsync(libraryID, 'ABCD1234');
+  ```
+
+  Wrap the whole thing in `try/catch` and `return` a short status string (e.g.
+  `'OK: set 3 fields'` / `'EXCEPTION: ' + e.message`) — that's what shows up in the
+  console's Result pane. Check "Run as async function" if the script uses top-level
+  `await`/`return`.
+
+  To run one of these non-interactively (e.g. from Claude Code) instead of pasting it
+  into the console by hand, use `~/dotfiles/bin/zotero-run-js <script.js>` — it drives
+  the console via AppleScript and prints the Result pane back. It activates Zotero and
+  pops the console window each time, so use it deliberately for one-off fixes, not in a
+  loop — it will steal window focus from whatever else you're doing.
+
+  **`zotero-run-js` may silently run your script twice.** If the AppleScript reads the
+  Result pane before Zotero has populated it (a timing race, not a Zotero failure), the
+  runner can't tell "nothing ran yet" apart from "it ran but the pane isn't updated," so
+  it retries by clicking Run again. This is harmless for read-only scripts and safe for
+  mutations keyed by an existing item (setting a field, trashing by key), but **any
+  script that creates a new item must check for an existing match first**, or a flaky
+  read turns into a real duplicate:
+
+  ```js
+  const s = new Zotero.Search();
+  s.libraryID = Zotero.Libraries.userLibraryID;
+  s.addCondition('ISBN', 'is', isbn);
+  const ids = await s.search();
+  if (ids.length) return 'OK: already exists, key=' + Zotero.Items.get(ids[0]).key;
+  ```
 
 ## Script skeleton
 
