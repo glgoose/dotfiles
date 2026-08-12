@@ -35,7 +35,10 @@
     ],
     "defaultMode": "auto"
   },
-  "model": "opus",
+  "model": "opus[1m]",
+  "skillOverrides": {
+    "research-deep": "off"
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -70,9 +73,6 @@
     "caveman@caveman": true,
     "pyright-lsp@claude-plugins-official": true
   },
-  "skillOverrides": {
-    "research-deep": "off"
-  },
   "extraKnownMarketplaces": {
     "caveman": {
       "source": {
@@ -81,9 +81,11 @@
       }
     }
   },
-  "effortLevel": "xhigh",
+  "syntaxHighlightingDisabled": false,
+  "effortLevel": "medium",
+  "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
-  "theme": "light",
+  "theme": "auto",
   "editorMode": "vim",
   "verbose": true,
   "autoCompactEnabled": true,
