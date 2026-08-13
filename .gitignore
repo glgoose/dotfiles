@@ -34,3 +34,6 @@ claude/.claude/.settings.json.swp
 
 # Cline auto-creates this at repo root; RTK rules belong in a stow package
 .clinerules
+
+# Written by Claude Code itself (mode 600, mutates on its own); not config
+claude/.claude/policy-limits.json
