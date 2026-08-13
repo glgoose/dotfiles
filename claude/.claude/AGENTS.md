@@ -28,7 +28,7 @@ Per-agent config:
 
 Full-stack developer, primary background in TypeScript/React. Did a data science course last year, now knows Python. Team has 2 data scientists proficient in Python but no web dev background.
 
-Currently taking over a Flask/SQLAlchemy demo app (rivnox-stage-allocatie) from a departing team member. Project is in pre-sales/demo phase for UHasselt. When explaining Python/Flask concepts, draw analogies to React/TS equivalents where helpful.
+When explaining Python/Flask concepts, draw analogies to React/TS equivalents where helpful.
 
 ## Feedback
 
