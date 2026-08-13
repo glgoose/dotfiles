@@ -1,33 +1,49 @@
 #!/usr/bin/env bash
 # ua-mount — mount a UAntwerpen network share over the Cisco AnyConnect VPN
-# Usage: ua-mount [--unmount|-u] [--force|-f] [--status|-i] [--share|-s NAME] [--timeout|-t SEC] [SHARE]
-# Run with the VPN connected. Mounts through NetFS so the password comes from
-# Keychain instead of a prompt. Default share Data is the N: drive; ggoossens is H:.
+# Usage: ua-mount [--unmount|-u] [--force|-f] [--status|-i] [--share|-s NAME]
+#                 [--timeout|-t SEC] [--wait|-w SEC] [--no-connect|-N] [SHARE]
+# Mounts through NetFS so the password comes from Keychain instead of a prompt.
+# Default share Data is the N: drive; ggoossens is H:.
+#
+# The VPN does not become usable the moment the Cisco GUI says "connected":
+# AnyConnect keeps ac_pf_initial.conf loaded, which blocks traffic, until routes
+# and ac_pf_filt.conf are in place. That window is around a minute. So preflight
+# polls for up to --wait seconds instead of probing once, and brings the tunnel
+# up itself when it is down.
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 SERVER="fileserver.uantwerpen.be"
+VPN_HOST="vpn.uantwerpen.be"
+VPN_CLI="/opt/cisco/secureclient/bin/vpn"
 SHARE="Data"
 TIMEOUT=20
+WAIT=45
 UNMOUNT=false
 STATUS=false
 FORCE=false
+CONNECT=true
 
-USAGE="Usage: ua-mount [--unmount|-u] [--force|-f] [--status|-i] [--share|-s NAME] [--timeout|-t SEC] [SHARE]"
+USAGE="Usage: ua-mount [--unmount|-u] [--force|-f] [--status|-i] [--share|-s NAME]
+                [--timeout|-t SEC] [--wait|-w SEC] [--no-connect|-N] [SHARE]"
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --unmount|-u) UNMOUNT=true; shift ;;
-    --force|-f)   FORCE=true; shift ;;
-    --status|-i)  STATUS=true; shift ;;
-    --help|-h)    echo "$USAGE"; exit 0 ;;
+    --unmount|-u)    UNMOUNT=true; shift ;;
+    --force|-f)      FORCE=true; shift ;;
+    --status|-i)     STATUS=true; shift ;;
+    --no-connect|-N) CONNECT=false; shift ;;
+    --help|-h)       echo "$USAGE"; exit 0 ;;
     --share|-s)
       [[ $# -lt 2 ]] && { echo "Error: --share requires a value"; exit 1; }
       SHARE="$2"; shift 2 ;;
     --timeout|-t)
       [[ $# -lt 2 ]] && { echo "Error: --timeout requires a value"; exit 1; }
       TIMEOUT="$2"; shift 2 ;;
+    --wait|-w)
+      [[ $# -lt 2 ]] && { echo "Error: --wait requires a value"; exit 1; }
+      WAIT="$2"; shift 2 ;;
     --) shift; [[ $# -gt 0 ]] && { SHARE="$1"; shift; } ;;
     -*) echo "Error: unknown option: $1"; echo "$USAGE"; exit 1 ;;
     *)  SHARE="$1"; shift ;;
@@ -38,8 +54,13 @@ case "$TIMEOUT" in
   ''|*[!0-9]*) echo "Error: --timeout must be a whole number of seconds"; exit 1 ;;
 esac
 
+case "$WAIT" in
+  ''|*[!0-9]*) echo "Error: --wait must be a whole number of seconds"; exit 1 ;;
+esac
+
 # ── Dependency check ──────────────────────────────────────────────────────────
-REQUIRED_CMDS=(dscacheutil nc open)
+# The Cisco vpn CLI is deliberately absent here: it is optional, probed at use.
+REQUIRED_CMDS=(dscacheutil nc open route)
 for cmd in "${REQUIRED_CMDS[@]}"; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "Error: $cmd not found"; exit 1; }
@@ -87,6 +108,40 @@ resolve_host() {
     | awk -F': ' '/^ip_address/ { print $2; exit }'
 }
 
+# Raw output of the Cisco CLI's state query, empty if the CLI is not installed.
+# -s reads commands from stdin, so close stdin or it sits at its VPN> prompt.
+vpn_status_raw() {
+  [[ -x "$VPN_CLI" ]] || return 0
+  "$VPN_CLI" -s state </dev/null 2>/dev/null || true
+}
+
+# Connected | Connecting | Disconnected | Unknown, empty when there is no CLI.
+# The output carries several ">> state:" lines, the last one is current.
+vpn_state() {
+  local raw
+  raw=$(vpn_status_raw)
+  [[ -z "$raw" ]] && return 0
+  printf '%s\n' "$raw" \
+    | awk -F'state:[[:space:]]*' '/>> state:/ { s = $2 } END { if (s != "") print s }' \
+    | tr -d '\r'
+}
+
+# Host the CLI last connected to, so a reconnect targets the same gateway.
+vpn_last_host() {
+  vpn_status_raw \
+    | awk -F'Connected to[[:space:]]*' '/>> notice: Connected to/ { h = $2 } END {
+        if (h != "") { sub(/\.$/, "", h); print h }
+      }'
+}
+
+# True when the route to $1 leaves over a tunnel interface. Only used to tell a
+# routing problem apart from a share that is simply not answering.
+tunnel_route_ok() {
+  route -n get "$1" 2>/dev/null \
+    | awk '/interface:/ { print $2 }' \
+    | grep -q '^utun'
+}
+
 # ── Status ────────────────────────────────────────────────────────────────────
 if [[ "$STATUS" == true ]]; then
   mounted=$(list_mounted_shares)
@@ -126,24 +181,83 @@ if [[ -n "$existing" ]]; then
   exit 0
 fi
 
-# ── Preflight: DNS, then reachability ─────────────────────────────────────────
-server_ip=$(resolve_host "$SERVER")
-if [[ -z "$server_ip" ]]; then
-  if command -v dig >/dev/null 2>&1 && [[ -n "$(dig +short +time=2 "$SERVER" 2>/dev/null | head -1)" ]]; then
-    echo "Error: $SERVER resolves over DNS but not through getaddrinfo"
-    echo "Cause: a non-tunnel resolver answers NXDOMAIN for internal names and it gets cached"
-    echo "Durable fix: add to /etc/hosts:"
-    echo "  $(dig +short +time=2 "$SERVER" 2>/dev/null | head -1) $SERVER"
-    echo "Stopgap: sudo killall -9 mDNSResponder"
-  else
-    echo "Error: cannot resolve $SERVER. Is the VPN connected?"
-  fi
-  exit 1
+# ── Bring the tunnel up if it is down ─────────────────────────────────────────
+# The gateway may use browser-based SSO, which a headless connect cannot satisfy.
+# So this is attempted, bounded, and falls back to telling you what to run.
+connect_pid=""
+if [[ "$CONNECT" == true && "$WAIT" -gt 0 && "$(vpn_state)" == "Disconnected" ]]; then
+  host=$(vpn_last_host)
+  [[ -z "$host" ]] && host="$VPN_HOST"
+  echo "VPN disconnected, connecting to $host..."
+  "$VPN_CLI" connect "$host" </dev/null >/dev/null 2>&1 &
+  connect_pid=$!
 fi
 
-nc -z -G 3 "$server_ip" 445 >/dev/null 2>&1 || {
-  echo "Error: $SERVER ($server_ip) unreachable on port 445. Is the VPN connected?"
-  exit 1; }
+# ── Preflight: poll DNS, then reachability, until the wait budget runs out ─────
+# Both can fail transiently while AnyConnect is still installing routes and pf
+# rules, so a single probe cannot tell "still coming up" from "VPN is off".
+server_ip=""
+announced=false
+waited_pre=0
+while :; do
+  [[ -z "$server_ip" ]] && server_ip=$(resolve_host "$SERVER")
+  if [[ -n "$server_ip" ]] && nc -z -G 2 "$server_ip" 445 >/dev/null 2>&1; then
+    break
+  fi
+  [[ "$waited_pre" -ge "$WAIT" ]] && break
+  if [[ "$announced" == false ]]; then
+    state=$(vpn_state)
+    echo "Waiting up to ${WAIT}s for the VPN${state:+ (state: $state)}..."
+    announced=true
+  fi
+  sleep 1
+  waited_pre=$((waited_pre + 1))
+done
+
+# Reap the connect attempt: either it worked, or it is stuck on interactive auth.
+if [[ -n "$connect_pid" ]]; then
+  kill "$connect_pid" 2>/dev/null || true
+  wait "$connect_pid" 2>/dev/null || true
+fi
+
+if [[ -z "$server_ip" ]] || ! nc -z -G 2 "$server_ip" 445 >/dev/null 2>&1; then
+  state=$(vpn_state)
+  case "$state" in
+    Disconnected|Unknown)
+      echo "Error: VPN is disconnected."
+      echo "Connect it with:"
+      echo "  $VPN_CLI connect $VPN_HOST"
+      echo "Or, if the gateway needs browser SSO:"
+      echo "  open -a 'Cisco Secure Client'"
+      ;;
+    Connecting)
+      echo "Error: VPN still connecting after ${WAIT}s"
+      echo "Retry, or allow longer: ua-mount --wait 120"
+      ;;
+    *)
+      if [[ -z "$server_ip" ]]; then
+        if command -v dig >/dev/null 2>&1 && [[ -n "$(dig +short +time=2 "$SERVER" 2>/dev/null | head -1)" ]]; then
+          echo "Error: $SERVER resolves over DNS but not through getaddrinfo"
+          echo "Cause: a non-tunnel resolver answers NXDOMAIN for internal names and it gets cached"
+          echo "Durable fix: add to /etc/hosts:"
+          echo "  $(dig +short +time=2 "$SERVER" 2>/dev/null | head -1) $SERVER"
+          echo "Stopgap: sudo killall -9 mDNSResponder"
+        else
+          echo "Error: cannot resolve $SERVER after ${WAIT}s. Is the VPN connected?"
+        fi
+      else
+        echo "Error: $SERVER ($server_ip) unreachable on port 445 after ${WAIT}s"
+        if tunnel_route_ok "$server_ip"; then
+          echo "The route to $server_ip does go over the tunnel, so the VPN is up"
+          echo "but the share is not answering. Check with UAntwerpen ICT."
+        else
+          echo "No tunnel route to $server_ip. Reconnect the VPN, or check split tunnelling."
+        fi
+      fi
+      ;;
+  esac
+  exit 1
+fi
 
 # ── Mount ─────────────────────────────────────────────────────────────────────
 # NetFS rather than mount_smbfs: mount_smbfs does not read the Keychain and would
